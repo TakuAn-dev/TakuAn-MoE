@@ -24,6 +24,8 @@ static_assert(sizeof(GateMulQuantArgs) == 20, "GateMulQuantArgs");
 static_assert(sizeof(MultiGemvArgs) == 136, "MultiGemvArgs");
 static_assert(sizeof(DownReduceConvArgs) == 32, "DownReduceConvArgs");
 static_assert(sizeof(MixFusedArgs) == 32, "MixFusedArgs");
+static_assert(sizeof(MoeGateUpQ4KF32Args) == 48, "MoeGateUpQ4KF32Args");
+static_assert(sizeof(MoeDownQ5F32Args) == 48, "MoeDownQ5F32Args");
 
 #define M64_NE    2304u
 #define M64_EXT   1024u
@@ -1509,4 +1511,193 @@ kernel void k_ctrl_up(device float * SCR [[buffer(0)]],
     float c = SCR[A.in[cg] + row];
     float m = SCR[A.msg[cg] + row];
     SCR[A.out[cg] + row] = (c - fg * c) + g * m;
+}
+
+// ============================ Milestone 4B: decode Q4_K / Q5_0 / Q5_1 ============================
+// FP32-input MoE decode GEMVs (no k_quant pass). Bit layouts verified against
+// engine/src/dequant.hpp dequantize_row_q4_K_ref / q5_0_ref / q5_1_ref:
+//  * BlockQ4_K (144 B): d f16 @0, dmin f16 @2, scales[12] @4, qs[128] @16.
+//    get_scale_min_k4(j in 0..7) over the scales; 64-elem chunk c uses
+//    (2c, 2c+1): elems 0..31 = low nibbles of qs bytes [c*32 .. c*32+31],
+//    elems 32..63 = high nibbles of the SAME bytes (dequant.hpp:102-104).
+//  * BlockQ5_0 (22 B): d f16 @0, qh[4] @2, qs[16] @6. elem j (0..15):
+//    (qs[j]&0xF | bit j of qh <<4) - 16; elem 16+j: (qs[j]>>4 | bit 16+j <<4)
+//    - 16 (dequant.hpp:117-124). BlockQ5_1 (24 B): d @0, m f16 @2, qh @4,
+//    qs @8; x in 0..31, y = x*d + m (dequant.hpp:137-144).
+// All Q5 reads are byte / ushort little-endian loads: Q5_0 blocks are 22 B so
+// their 4-byte members are NOT reliably aligned — never cast them to uint.
+// Q4_K qs words load as device uint: block offsets 16+32c+4t stay 4-byte
+// aligned iff (woff | stride) % 4 == 0 (guaranteed by pack 4 KiB alignment).
+
+static inline ushort m64_ld16(const device uchar * p) { return ushort(p[0]) | (ushort(p[1]) << 8); }
+static inline uint   m64_ld32(const device uchar * p) {
+    return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
+}
+
+// ggml get_scale_min_k4 word-packed: q = scales[0..3] (lo byte = scales[0]),
+// q2 = scales[4..7], q3 = scales[8..11]; j in 0..7. Byte-for-byte port of
+// dequant.hpp:80-87:
+//   j < 4 : d = scales[j] & 63        ; m = scales[j + 4] & 63
+//   j >= 4: d = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
+//           m = (scales[j+4] >> 4)  | ((scales[j]   >> 6) << 4)
+static inline void m64_scale_min_k4(uint j, uint q, uint q2, uint q3, float & d, float & m) {
+    if (j < 4u) {
+        d = float((q  >> (8u * j)) & 63u);
+        m = float((q2 >> (8u * j)) & 63u);
+    } else {
+        uint b_jm4 = (q  >> (8u * (j - 4u))) & 255u;   // scales[j - 4]
+        uint b_j   = (q2 >> (8u * (j - 4u))) & 255u;   // scales[j]
+        uint b_jp4 = (q3 >> (8u * (j - 4u))) & 255u;   // scales[j + 4]
+        d = float((b_jp4 & 0xFu) | ((b_jm4 >> 6) << 4));
+        m = float((b_jp4 >> 4)   | ((b_j   >> 6) << 4));
+    }
+}
+
+// Batch-8 MoE gate|up over FP32 activations, Q4_K weights. Warp per row,
+// warp-w iteration order identical to k_gemv_gateup_batch8 (bitwise layout
+// swap-compatible); inside a row the 36 64-elem sub-blocks map lane->sub-block
+// (x float4 loads coalesce warp-wide, weights read once). Cross-lane simd_sum
+// tree: tolerance class (1024-ulp fp64-gated test), not bitwise vs scalar.
+kernel void k_gemv_gateup_batch8_q4k_f32in(device float * SCR [[buffer(0)]],
+                                           constant MoeGateUpQ4KF32Args & A [[buffer(1)]],
+                                           const device uchar * PACK [[buffer(2)]],
+                                           uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                           uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    uint tid = M64_TITG.x;
+    uint rr = M64_TGPG.x * 8u + (tid >> 5);
+    if (rr >= 8u * 2u * A.nout) return;
+    uint lane = tid & 31u;
+    uint e = rr / (2u * A.nout);
+    uint r2 = rr - e * (2u * A.nout);
+    bool up = r2 >= A.nout;
+    uint r = up ? r2 - A.nout : r2;
+    const uint exp_id = ((const device uint *)(SCR + A.seloff))[e];
+    const uint slot = A.wtab_off != 0u ? ((const device uint *)(SCR + A.wtab_off))[exp_id] : exp_id;
+    const device uchar * row = PACK + (up ? A.woff2 : A.woff) + (size_t)slot * A.stride
+                             + (size_t)r * ((A.k >> 8) * 144u);
+    const device float * x = SCR + A.xoff;
+    float a = 0.0f;
+    for (uint u = lane; u < A.k / 64u; u += 32u) {   // 64-elem sub-chunks (k = 2304 -> 36)
+        const device uchar * b = row + (u >> 2) * 144u;
+        const uint q = m64_ld32(b + 4u), q2 = m64_ld32(b + 8u), q3 = m64_ld32(b + 12u);
+        float d1, m1, d2, m2;
+        m64_scale_min_k4(2u * (u & 3u), q, q2, q3, d1, m1);
+        m64_scale_min_k4(2u * (u & 3u) + 1u, q, q2, q3, d2, m2);
+        const float vd1 = f16b(m64_ld16(b)) * d1, vm1 = f16b(m64_ld16(b + 2u)) * m1;
+        const float vd2 = f16b(m64_ld16(b)) * d2, vm2 = f16b(m64_ld16(b + 2u)) * m2;
+        const device uint * qs = (const device uint *)(b + 16u + (u & 3u) * 32u);
+        const device float4 * xv = (const device float4 *)(x + u * 64u);
+        // uint t holds qs bytes 4t..4t+3 (LE): byte u low nibble = elem 4t+u
+        // -> xv[t]; byte u high nibble = elem 32+4t+u -> xv[8+t] (dequant.hpp:102-104).
+        // Element value w = vd*q - vm, dot term fma(w, x): two chained fmas keep
+        // every product multiplied by x (no d*q term without x — that was wrong).
+        #pragma unroll
+        for (uint t = 0u; t < 8u; t++) {
+            const uint v = qs[t];
+            const float4 xlo = xv[t], xhi = xv[8u + t];
+            a = fma(fma(vd1, float(v & 0xFu), -vm1), xlo.x, a);
+            a = fma(fma(vd1, float((v >> 8) & 0xFu), -vm1), xlo.y, a);
+            a = fma(fma(vd1, float((v >> 16) & 0xFu), -vm1), xlo.z, a);
+            a = fma(fma(vd1, float((v >> 24) & 0xFu), -vm1), xlo.w, a);
+            a = fma(fma(vd2, float((v >> 4) & 0xFu), -vm2), xhi.x, a);
+            a = fma(fma(vd2, float((v >> 12) & 0xFu), -vm2), xhi.y, a);
+            a = fma(fma(vd2, float((v >> 20) & 0xFu), -vm2), xhi.z, a);
+            a = fma(fma(vd2, float(v >> 28), -vm2), xhi.w, a);
+        }
+    }
+    a = simd_sum(a);
+    if (lane == 0u) SCR[(up ? A.yoff2 : A.yoff) + e * A.nout + r] = a;
+}
+
+// Shared inner: one warp-GEMV of Q5_0/Q5_1 row at wp (nb blocks) vs h.
+// Lane owns blocks i = lane, lane+32, ...; 4 (u32-paired) ushort qs loads plus
+// byte-wise d/qh per block (Q5_0's 22 B blocks are only 2-byte aligned by
+// construction). `lane` must equal thread_index_in_simdgroup() of the caller.
+template <bool Q51>
+static inline float m64_gemv_q5_row(const device uchar * wp, const device float * h,
+                                    uint nb, uint lane) {
+    float a = 0.0f;
+    for (uint i = lane; i < nb; i += 32u) {
+        const device uchar * b = wp + (size_t)i * (Q51 ? 24u : 22u);
+        const uint qh = Q51 ? m64_ld32(b + 4u) : m64_ld32(b + 2u);
+        const float d = f16b(m64_ld16(b));
+        const float m = Q51 ? f16b(m64_ld16(b + 2u)) : 0.0f;
+        const ushort * qs = (const ushort *)(b + (Q51 ? 8u : 6u));   // even offsets: aligned
+        const device float4 * hlo = (const device float4 *)(h + i * 32u);
+        const device float4 * hhi = hlo + 4u;
+        // uint t = qs bytes 4t..4t+3 (LE ushort pair): byte jj=4t+u low nibble
+        // = elem jj (qh bit jj) -> hlo[t].comp[u]; high nibble = elem 16+jj
+        // (qh bit jj+16) -> hhi[t].comp[u] (dequant.hpp:117-124).
+        #pragma unroll
+        for (uint t = 0u; t < 4u; t++) {
+            const uint v = uint(qs[2u * t]) | (uint(qs[2u * t + 1u]) << 16);
+            const float4 vlo = hlo[t], vhi = hhi[t];
+            #pragma unroll
+            for (uint u = 0u; u < 4u; u++) {
+                const uint jj = 4u * t + u;
+                float x0 = float(((v >> (8u * u)) & 0xFu) | (((qh >> jj) << 4) & 0x10u));
+                // high nibble element 16+jj takes qh bit jj+16 == (qh >> (jj+12)) & 0x10 (dequant.hpp:119)
+                float x1 = float(((v >> (8u * u + 4u)) & 0xFu) | ((qh >> (jj + 12u)) & 0x10u));
+                if (!Q51) { x0 -= 16.0f; x1 -= 16.0f; }
+                float s0 = d * x0, s1 = d * x1;
+                if (Q51) { s0 += m; s1 += m; }
+                if (u == 0u) { a = fma(s0, vlo.x, a); a = fma(s1, vhi.x, a); }
+                if (u == 1u) { a = fma(s0, vlo.y, a); a = fma(s1, vhi.y, a); }
+                if (u == 2u) { a = fma(s0, vlo.z, a); a = fma(s1, vhi.z, a); }
+                if (u == 3u) { a = fma(s0, vlo.w, a); a = fma(s1, vhi.w, a); }
+            }
+        }
+    }
+    return simd_sum(a);
+}
+
+// Batch-8 MoE down-proj + weighted reduce, Q5_0 weights, FP32 activations.
+// Warp per row; the FULL warp cooperates on each expert dot (m64_gemv_q5_row
+// is a warp collective), expert loop e-ascending plain mul+add
+// (k_gemv_down_reduce8 oracle order). Activations are PER-EXPERT rows: expert
+// e reads SCR[hoff + e*k .. hoff + (e+1)*k) (k_situ_f32_batch emits a packed
+// [8][k] h slab with row stride k). grid.x = ceil(nout / 8) tgs of 256.
+kernel void k_gemv_down_reduce8_q5_0_f32in(device float * SCR [[buffer(0)]],
+                                           constant MoeDownQ5F32Args & A [[buffer(1)]],
+                                           const device uchar * PACK [[buffer(2)]],
+                                           uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                           uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    uint r = M64_TGPG.x * 8u + (M64_TITG.x >> 5);
+    if (r >= A.nout) return;
+    uint lane = M64_TITG.x & 31u;
+    const device float * h = SCR + A.hoff;
+    const uint nb = A.k >> 5;
+    const size_t rowb = (size_t)nb * 22ull;
+    float acc = 0.0f;
+    for (uint e = 0u; e < 8u; e++) {
+        const uint exp_id = ((const device uint *)(SCR + A.seloff))[e];
+        const uint slot = A.wtab_off != 0u ? ((const device uint *)(SCR + A.wtab_off))[exp_id] : exp_id;
+        const device uchar * wp = PACK + A.woff + (size_t)slot * A.stride + (size_t)r * rowb;
+        const float ea = m64_gemv_q5_row<false>(wp, h + (size_t)e * A.k, nb, lane);
+        acc = acc + SCR[A.wtoff + e] * ea;              // oracle: acc + w*dbuf
+    }
+    if (lane == 0u) SCR[A.accoff + r] = acc;
+}
+
+// Same with Q5_1 blocks (24 B, shared min-offset m; no -16 bias).
+kernel void k_gemv_down_reduce8_q5_1_f32in(device float * SCR [[buffer(0)]],
+                                           constant MoeDownQ5F32Args & A [[buffer(1)]],
+                                           const device uchar * PACK [[buffer(2)]],
+                                           uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                           uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    uint r = M64_TGPG.x * 8u + (M64_TITG.x >> 5);
+    if (r >= A.nout) return;
+    uint lane = M64_TITG.x & 31u;
+    const device float * h = SCR + A.hoff;
+    const uint nb = A.k >> 5;
+    const size_t rowb = (size_t)nb * 24ull;
+    float acc = 0.0f;
+    for (uint e = 0u; e < 8u; e++) {
+        const uint exp_id = ((const device uint *)(SCR + A.seloff))[e];
+        const uint slot = A.wtab_off != 0u ? ((const device uint *)(SCR + A.wtab_off))[exp_id] : exp_id;
+        const device uchar * wp = PACK + A.woff + (size_t)slot * A.stride + (size_t)r * rowb;
+        const float ea = m64_gemv_q5_row<true>(wp, h + (size_t)e * A.k, nb, lane);
+        acc = acc + SCR[A.wtoff + e] * ea;
+    }
+    if (lane == 0u) SCR[A.accoff + r] = acc;
 }

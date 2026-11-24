@@ -16,7 +16,8 @@
 //   GEN <max_tokens> <temp> <top_p> <seed> <eos_csv> -- <id0> <id1> ...
 //   WARM [-- ]<id0> <id1> ...        (pin a static prefix; replies WARMED ...)
 //   QUIT
-// Protocol output (stdout): "TOK <id>", "DONE <n> <ms> <finish>",
+// Protocol output (stdout): "TOK <id>", "DONE <n> <ms> <finish>"
+// (finish in {stop, length, cancelled}; SIGUSR1 cancels the in-flight GEN),
 // "WARMED <n> {computed|cached|disk|disabled}", "ERR <reason>".
 // All diagnostics stay on stderr so stdout is machine-parseable.
 //
@@ -43,6 +44,7 @@
 #include <numeric>
 #include <random>
 #include <set>
+#include <signal.h>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -53,6 +55,14 @@
 #include "prefix_disk.hpp"
 
 namespace {
+
+// Worker-mode GEN cancellation (tools/takuan_server.py sends SIGUSR1 when a
+// client disconnects mid-stream): the handler only sets this flag, which the
+// GEN loop checks between decode steps so the worker finishes cleanly with
+// "DONE <n> <ms> cancelled" instead of deadlocking on a full stdout pipe.
+static volatile sig_atomic_t g_cancel_gen = 0;
+
+void on_sigusr1(int /*sig*/) { g_cancel_gen = 1; }
 
 struct RefBins {
     int32_t n = 0;
@@ -172,7 +182,7 @@ int usage() {
         "              [--out-prefix P] [--bench] [--compare ref_logits.bin ref_tokens.bin]\n"
         "              [--backend metal|cpu] [--arena-gb N] [--io pread|mtlio]\n"
         "              [--ctx N] [--worker] [--prefix-cache N] [--cache-dir DIR]\n"
-        "  --prefix-cache N  worker LRU prefix checkpoints (0=off; -1/auto: 2 full-pack,\n"
+        "  --prefix-cache N  worker LRU prefix checkpoints (0=off; -1/auto: 4 full-pack,\n"
         "                    1 when --arena-gb > 6, else 0); pinned via the WARM command\n"
         "  --cache-dir DIR   persist WARM prefixes as .m64kv files on SSD (Metal only);\n"
         "                    restores warmed state across restarts (WARMED <n> disk)\n");
@@ -219,12 +229,12 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "error: --io must be pread|mtlio\n");
         return 2;
     }
-    // --prefix-cache auto defaults: full-pack keeps 2 checkpoints, a big
+    // --prefix-cache auto defaults: full-pack keeps 4 checkpoints, a big
     // arena (>6 GiB) keeps 1, a tight arena (<=6 GiB) stays off. An explicit
     // --cache-dir forces at least 1 (WARM needs the RAM prefix path alive),
     // while an explicit --prefix-cache 0 always stays off.
     if (prefix_cache < 0) {
-        prefix_cache = (arena_gb == 0.0) ? 2 : (arena_gb > 6.0 ? 1 : 0);
+        prefix_cache = (arena_gb == 0.0) ? 4 : (arena_gb > 6.0 ? 1 : 0);
         if (!cache_dir.empty() && prefix_cache < 1) prefix_cache = 1;
     }
     if (prefix_cache > 8) prefix_cache = 8;   // each checkpoint is ~kv-sized; cap
@@ -275,6 +285,16 @@ int main(int argc, char ** argv) {
 
     // ---------------- worker mode: persistent line protocol (stdin/stdout) ----
     if (worker) {
+        // SIGUSR1 = cancel the in-flight GEN (see g_cancel_gen). SA_RESTART so
+        // the blocking stdin getline never fails with EINTR mid-command.
+        struct sigaction sa;
+        sa.sa_handler = on_sigusr1;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        if (sigaction(SIGUSR1, &sa, nullptr) != 0) {
+            std::perror("sigaction(SIGUSR1)");
+            return 7;
+        }
         const int64_t vocab = fwd.vocab_effective();
         std::printf("READY vocab=%lld ctx=%d\n", (long long)vocab, ctx);
         std::fflush(stdout);
@@ -454,6 +474,7 @@ int main(int argc, char ** argv) {
                 continue;
             }
             // GEN <max_tokens> <temp> <top_p> <seed> <eos_csv> -- <ids>
+            g_cancel_gen = 0;
             int max_tokens = 0;
             float temp = 0.0f, top_p = 0.0f;
             unsigned long long seed = 0;
@@ -548,11 +569,14 @@ int main(int argc, char ** argv) {
             int limit = std::min(max_tokens, avail);
             int n_gen = 0;
             const char * finish = "length";
+            // Cancelled while prefill ran: skip decode entirely, report clean DONE.
+            if (g_cancel_gen) finish = "cancelled";
             // Tokens whose KV+rs state is in the engine = prompt + every
             // token actually consumed by fwd.step() (NOT the last sampled
             // token when we stop before stepping it).
             std::vector<int32_t> processed = prompt;
             for (int k = 0; k < limit; k++) {
+                if (g_cancel_gen) { finish = "cancelled"; break; }
                 int32_t tok = sample_token(r.logits, vocab, temp, top_p, r.argmax, rng);
                 if (eos_set.count(tok)) { finish = "stop"; break; }
                 std::printf("TOK %d\n", tok);

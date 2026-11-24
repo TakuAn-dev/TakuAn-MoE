@@ -255,6 +255,289 @@ kernel void k_attn_head_f16_batch(device float * SCR [[buffer(0)]],
     for (int i = 0; i < 4; i++) out[t + i] = oh[i] * inv;
 }
 
+// ---------------- FlashAttention-2 tiled prefill over FP16 KV (Milestone 4C)
+// Same AttnBatchF16Args / KV layout / exact Inkling-2-Mini semantics as
+// k_attn_head_f16_batch above: q*tau f16-rounded, GQA kvoff (h/3)*128,
+// tau, causal mask, SWA window + ring slot wrap (j % ring_cap), fused
+// relbias bv = sum_c relbias[dist][c]*(rout[c]*tau) for dist < M64_EXT
+// (bv = 0 beyond, but the f16r(bv - sink) bias term NEVER drops -sink),
+// online softmax with row-wise M/S and O rescaling, then the final
+// zero-sink term before out = O * (float)(1.0 / S).
+//
+// Tiling: BQ = 32 query tokens x BK = 32 KV tokens.
+//   grid = (kNH, ceil(B/32), 1); threads = (32, 4) = 4 simdgroups.
+//   Each simdgroup owns 8 query rows and keeps the 8x128 O block in
+//   16 simdgroup_float8x8 registers. Tensor-core mmas:
+//   S = Qh @ K^T (b loaded with transpose from tgKV) and O += P @ V.
+// Threadgroup memory = 24576 B (24.0 KiB <= 32 KiB cap):
+//   tgBig  half [2*32*136]  17408 B  rows [0..31] K tile then V tile (ld 136),
+//          rows [4352..]    Qh tile (hoisted to registers before the loop);
+//          the tgKV region (free between QK^T and the V load, and again in
+//          the epilogue) doubles as a float32 [32][64] staging tile (ld 64)
+//          for rescaling/writing-out accO: Apple Silicon's simdgroup_matrix
+//          element mapping is quad/Morton, so thread_elements() rows are
+//          NOT lane>>2 — all row-wise scaling round-trips through it.
+//   tgS    float [32][36]    4608 B  S scores, then P halfs in-place (ld 72h).
+//   tgRT   float [32][16]    2048 B  rout[c]*tau per query row.
+//   tgSink/tgM/tgSum/tgAlpha        512 B row-wise scalars.
+// Thread mappings (both cover all 32 query rows): loader/softmax/staging pass
+// uses qrow = tid>>2, seg = tid&3 (one 32-lane simdgroup holds 8 rows as
+// 4-thread quads -> butterfly max/sum with simd_shuffle_xor 1,2); the mma
+// tiles use the native simdgroup_matrix row = sgid*8 + (lane>>2) mapping
+// only via simdgroup_load/store, never through thread_elements().
+// P is f16-rounded for the PV product (tensor cores), so parity with the
+// scalar batch kernel is tolerance-based (GATE_SG in the test), not bitwise.
+// The relbias DRAM read has a tile-level fast path when every dist in the
+// tile is >= M64_EXT.
+#define M64_FQ_LD 136u          // padded threadgroup ld (halfs) for Q/K/V/O staging
+#define M64_FS_LD  36u          // threadgroup ld for tgS (floats) / tgP (halfs: 2x)
+
+kernel void k_attn_f16_flash_prefill(device float * SCR [[buffer(0)]],
+                                     constant AttnBatchF16Args & A [[buffer(1)]],
+                                     const device uchar * PACK [[buffer(2)]],
+                                     const device half * KV [[buffer(3)]],
+                                     uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                     uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    const uint h = M64_TGPG.x, b0 = M64_TGPG.y * 32u;
+    const uint tid = M64_TITG.y * 32u + M64_TITG.x;      // 0..127
+    const uint sgid = tid >> 5u;
+    const uint qrow = tid >> 2u, seg = tid & 3u;         // loader/softmax mapping
+
+    threadgroup half tgBig[2u * 32u * M64_FQ_LD];        // K/V tiles + Qh tile + O float staging
+    threadgroup half * tgQ = tgBig + 32u * M64_FQ_LD;
+    threadgroup half * tgKV = tgBig;
+    threadgroup float tgS[32u * M64_FS_LD];
+    threadgroup float tgRT[32u * 16u];
+    threadgroup float tgSink[32u];
+    threadgroup float tgAlpha[32u];
+    threadgroup float tgML[2u * 32u];                    // [0..31]=M, [32..63]=S
+    threadgroup float * tgM = tgML;
+    threadgroup float * tgSum = tgML + 32u;
+
+    const uint kvoff = (h / 3u) * 128u;
+    const uint b_hi = min(b0 + 31u, A.B - 1u);           // grid.y = ceil(B/32) => b0 < A.B
+    const uint pmin = A.pos0 + b0, pmax = A.pos0 + b_hi;
+    const uint js0 = (A.is_swa && pmin > A.n_swa) ? (pmin - A.n_swa) : 0u;
+
+    // ---- load Qh = half(q * tau) and per-row scalars (rout*tau, sink)
+    {
+        const uint b = b0 + qrow;
+        const bool v = b < A.B;
+        float tau = 1.0f;
+        if (v && !A.is_swa)
+            tau = metal::log(fmax(1.0f, ((float)(A.pos0 + b) + 1.0f) / A.log_scale_floor)) *
+                      A.log_scale_alpha + 1.0f;
+        threadgroup half * dq = tgQ + qrow * M64_FQ_LD + seg * 32u;
+        if (v) {
+            const device float * q = SCR + A.qoff + (size_t)b * A.q_stride + h * 128u;
+            #pragma unroll
+            for (uint i = 0; i < 32u; i++) dq[i] = half(q[seg * 32u + i] * tau);
+            if (seg == 0u) {
+                tgSink[qrow] = SCR[A.sinkoff + (size_t)b * A.sink_stride + h];
+                const device float * rt = SCR + A.rout + (size_t)b * A.rout_stride + h * 16u;
+                #pragma unroll
+                for (uint c = 0; c < 16u; c++) tgRT[qrow * 16u + c] = rt[c] * tau;
+            }
+        } else {
+            #pragma unroll
+            for (uint i = 0; i < 32u; i++) dq[i] = half(0.0f);
+            if (seg == 0u) {
+                tgSink[qrow] = 0.0f;
+                #pragma unroll
+                for (uint c = 0; c < 16u; c++) tgRT[qrow * 16u + c] = 0.0f;
+            }
+        }
+        if (seg == 0u) { tgM[qrow] = -INFINITY; tgSum[qrow] = 0.0f; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_half8x8 aQ[16];
+    #pragma unroll
+    for (uint d = 0u; d < 16u; d++)
+        simdgroup_load(aQ[d], tgQ + (sgid * 8u) * M64_FQ_LD + d * 8u, M64_FQ_LD);
+
+    simdgroup_float8x8 accO[16];
+    #pragma unroll
+    for (uint c = 0u; c < 16u; c++)
+        accO[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const float sink = tgSink[qrow];
+    for (uint j0 = js0; j0 <= pmax; j0 += 32u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- load K tile [32][128] (j > pmax -> zeros)
+        {
+            const uint jj = j0 + qrow;
+            threadgroup half * dK = tgKV + qrow * M64_FQ_LD + seg * 32u;
+            if (jj <= pmax) {
+                const uint slot = A.is_swa ? (jj % A.ring_cap) : jj;
+                const device half * src = KV + A.kvkoff + (size_t)slot * 1024u + kvoff + seg * 32u;
+                #pragma unroll
+                for (uint i = 0; i < 32u; i++) dK[i] = src[i];
+            } else {
+                #pragma unroll
+                for (uint i = 0; i < 32u; i++) dK[i] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- S = Qh @ K^T -> tgS (raw dot; scale applied in softmax pass)
+        {
+            simdgroup_float8x8 accS[4];
+            #pragma unroll
+            for (uint k = 0u; k < 4u; k++)
+                accS[k] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma unroll
+            for (uint d = 0u; d < 16u; d++)
+                #pragma unroll
+                for (uint k = 0u; k < 4u; k++) {
+                    simdgroup_half8x8 bT;
+                    simdgroup_load(bT, tgKV + (k * 8u) * M64_FQ_LD + d * 8u, (ulong)M64_FQ_LD,
+                                           ulong2(0u, 0u), true);
+                    simdgroup_multiply_accumulate(accS[k], aQ[d], bT, accS[k]);
+                }
+            #pragma unroll
+            for (uint k = 0u; k < 4u; k++)
+                simdgroup_store(accS[k], tgS + (sgid * 8u) * M64_FS_LD + k * 8u, M64_FS_LD);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- relbias + mask + online softmax: one 4-thread quad per row
+        {
+            const uint pos_q = A.pos0 + b0 + qrow;
+            const uint jstart_q = (A.is_swa && pos_q > A.n_swa) ? (pos_q - A.n_swa) : 0u;
+            const bool vq = (b0 + qrow) < A.B;
+            // fast path: EVERY valid entry in this tile has dist >= M64_EXT
+            const bool skip_rb = ((int64_t)pmin - (int64_t)(j0 + 31u)) >= (int64_t)M64_EXT;
+            float sv[8];
+            const threadgroup float * srow = tgS + qrow * M64_FS_LD + seg * 8u;
+            float m = -INFINITY;
+            #pragma unroll
+            for (uint i = 0; i < 8u; i++) {
+                const uint j = j0 + seg * 8u + i;
+                float s = -INFINITY;
+                if (vq && j <= pos_q && j >= jstart_q) {
+                    s = srow[i] * A.scale;
+                    const int dist = (int)pos_q - (int)j;
+                    if (skip_rb) {
+                        s += f16r(0.0f - sink);       // bv = 0, -sink MUST stay (see batch kernel)
+                    } else {
+                        float bv = 0.0f;
+                        if (dist < (int)M64_EXT) {    // out-of-extent relbias rows are 0
+                            const device float * brow =
+                                ((const device float *)(PACK + A.relbiaspack)) + (size_t)dist * 16u;
+                            const threadgroup float * rt = tgRT + qrow * 16u;
+                            #pragma unroll
+                            for (uint c = 0; c < 16u; c++) bv = fma(brow[c], rt[c], bv);
+                        }
+                        s += f16r(bv - sink);
+                    }
+                }
+                sv[i] = s;
+                m = fmax(m, s);
+            }
+            m = fmax(m, simd_shuffle_xor(m, 1u));
+            m = fmax(m, simd_shuffle_xor(m, 2u));
+            const float M_old = tgM[qrow];
+            const float M_new = fmax(M_old, m);
+            const float alpha = (M_new == -INFINITY) ? 1.0f : metal::exp(M_old - M_new);
+            float rs = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 8u; i++) {
+                const float p = (sv[i] == -INFINITY) ? 0.0f : metal::exp(sv[i] - M_new);
+                rs += p;
+                ((threadgroup half *)tgS)[qrow * (M64_FS_LD * 2u) + seg * 8u + i] = half(p);
+            }
+            rs += simd_shuffle_xor(rs, 1u);
+            rs += simd_shuffle_xor(rs, 2u);
+            if (seg == 0u) {
+                tgAlpha[qrow] = alpha;
+                tgM[qrow] = M_new;
+                tgSum[qrow] = fma(tgSum[qrow], alpha, rs);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- rescale accO rows to the running max via tgKV float staging.
+        // Apple Silicon simdgroup_matrix element mapping is quad/Morton, NOT
+        // row = lane>>2, so thread_elements() must not be touched: round-trip
+        // the tiles through (threadgroup float *)tgKV (free between QK^T and
+        // the V load), scale by row, and load back. j0 == js0: accO is all
+        // zeros, skipping the pass is exact and saves work.
+        if (j0 > js0) {
+            threadgroup float * tgF = (threadgroup float *)tgKV;   // 32*64 floats
+            #pragma unroll
+            for (uint hb = 0u; hb < 16u; hb += 8u) {
+                #pragma unroll
+                for (uint c = 0u; c < 8u; c++)
+                    simdgroup_store(accO[hb + c], tgF + (sgid * 8u) * 64u + c * 8u, 64u);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float aq = tgAlpha[qrow];
+                threadgroup float * frow = tgF + qrow * 64u + seg * 16u;
+                #pragma unroll
+                for (uint i = 0u; i < 16u; i++) frow[i] *= aq;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                #pragma unroll
+                for (uint c = 0u; c < 8u; c++)
+                    simdgroup_load(accO[hb + c], tgF + (sgid * 8u) * 64u + c * 8u, 64u);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        // ---- load V tile [32][128]
+        {
+            const uint jj = j0 + qrow;
+            threadgroup half * dV = tgKV + qrow * M64_FQ_LD + seg * 32u;
+            if (jj <= pmax) {
+                const uint slot = A.is_swa ? (jj % A.ring_cap) : jj;
+                const device half * src = KV + A.kvvoff + (size_t)slot * 1024u + kvoff + seg * 32u;
+                #pragma unroll
+                for (uint i = 0; i < 32u; i++) dV[i] = src[i];
+            } else {
+                #pragma unroll
+                for (uint i = 0; i < 32u; i++) dV[i] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- O += P @ V (P read back f16-rounded, exactly what the mma sees)
+        #pragma unroll
+        for (uint kk = 0u; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 pT;
+            simdgroup_load(pT, (const threadgroup half *)tgS + (sgid * 8u) * (M64_FS_LD * 2u) + kk,
+                           M64_FS_LD * 2u);
+            #pragma unroll
+            for (uint c = 0u; c < 16u; c++) {
+                simdgroup_half8x8 vT;
+                simdgroup_load(vT, tgKV + kk * M64_FQ_LD + c * 8u, M64_FQ_LD);
+                simdgroup_multiply_accumulate(accO[c], pT, vT, accO[c]);
+            }
+        }
+    }
+    // ---- final zero-sink term (sinks tensor == 0), same as
+    // k_attn_head_f16_batch, then write O through the tgKV float staging
+    // (2 x 64-column passes): never touch thread_elements() (see above).
+    {
+        threadgroup float * tgF = (threadgroup float *)tgKV;   // 32*64 floats
+        const float M = tgM[qrow];
+        const float ms = (0.0f > M) ? ((M == -INFINITY) ? 0.0f : metal::exp(M)) : 1.0f;
+        const float sum_final = (0.0f > M) ? fma(tgSum[qrow], metal::exp(M), 1.0f)
+                                           : tgSum[qrow] + metal::exp(0.0f - M);
+        const float scale_out = ms * (float)(1.0 / sum_final);
+        const uint b = b0 + qrow;
+        device float * out = SCR + A.outoff + (size_t)b * A.out_stride + h * 128u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (uint hb = 0u; hb < 16u; hb += 8u) {
+            #pragma unroll
+            for (uint c = 0u; c < 8u; c++)
+                simdgroup_store(accO[hb + c], tgF + (sgid * 8u) * 64u + c * 8u, 64u);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (b < A.B) {
+                const threadgroup float * srcrow = tgF + qrow * 64u + seg * 16u;
+                #pragma unroll
+                for (uint i = 0u; i < 16u; i++)
+                    out[hb * 8u + seg * 16u + i] = srcrow[i] * scale_out;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
 // --------------------------------------------- grouped MoE Q8_0 GEMM (prefill)
 // grid = (ceil(nout/4), n_experts), threadgroup = (32, 4): warp = one output
 // row of one expert; walks the expert's token list in chunks of 8, loading
@@ -920,4 +1203,252 @@ kernel void k_moe_grouped_f32in_sg(device float * SCR [[buffer(0)]],
             }
         }
     }
+}
+
+// ============================================================================
+// Milestone 4B: tensor-core grouped MoE with Q4_K / Q5_0 / Q5_1 weights
+// ============================================================================
+// Same tile pipeline as k_moe_grouped_f32in_sg; ONLY the weight loader swaps.
+// Bit layouts byte-for-byte per engine/src/dequant.hpp refs (see m64_p2a.metal
+// Milestone 4B header for the derivation). All weight loads are byte-wise
+// (m64_ld16 / m64_ld32) so Q5_0's 22 B blocks need no alignment at all.
+
+// Q4_K: one 32-col tile = one sub-block (blk & 7) of block (blk >> 3).
+// row bytes = nb/8 * 144 == nb * 18 (nb = k/32, k % 256 == 0).
+static inline void dequant_q4_k_tile32x32_to_tg(const device uchar * wmat,
+                                                uint m0, uint nout, uint blk,
+                                                uint nb, uint tid,
+                                                threadgroup half * tg, uint ld) {
+    const uint row = tid >> 2u, seg = tid & 3u;
+    const uint b = blk >> 3u, is = blk & 7u;
+    const size_t rowb = (size_t)nb * 18ull;
+    threadgroup half * dst = tg + row * ld + seg * 8u;
+    if (m0 + row < nout) {
+        const device uchar * bp = wmat + (size_t)(m0 + row) * rowb + (size_t)b * 144ull;
+        const uint q = m64_ld32(bp + 4u), q2 = m64_ld32(bp + 8u), q3 = m64_ld32(bp + 12u);
+        float sd, sm;
+        m64_scale_min_k4(is, q, q2, q3, sd, sm);
+        const float vd = f16b(m64_ld16(bp)) * sd;
+        const float vm = f16b(m64_ld16(bp + 2u)) * sm;
+        const device uchar * qb = bp + 16u + (is >> 1u) * 32u + seg * 8u;
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) {
+            const uint byte = qb[i];
+            const uint n = (is & 1u) ? (byte >> 4) : (byte & 0xFu);
+            dst[i] = half(vd * float(n) - vm);
+        }
+    } else {
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) dst[i] = half(0.0f);
+    }
+}
+
+// Q5_0: one 32-col tile = one 22 B block. row bytes = nb * 22.
+// elem j (0..15): (qs[j] & 0xF) | bit j of qh at 0x10, minus 16, times d;
+// elem 16+j: (qs[j] >> 4) | bit (j + 12) of qh at 0x10 (dequant.hpp:117-124).
+static inline void dequant_q5_0_tile32x32_to_tg(const device uchar * wmat,
+                                                uint m0, uint nout, uint blk,
+                                                uint nb, uint tid,
+                                                threadgroup half * tg, uint ld) {
+    const uint row = tid >> 2u, seg = tid & 3u;
+    const size_t rowb = (size_t)nb * 22ull;
+    threadgroup half * dst = tg + row * ld + seg * 8u;
+    if (m0 + row < nout) {
+        const device uchar * bp = wmat + (size_t)(m0 + row) * rowb + (size_t)blk * 22ull;
+        const float d = f16b(m64_ld16(bp));
+        const uint qh = m64_ld32(bp + 2u);
+        const device uchar * qs = bp + 6u;
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) {
+            const uint l = seg * 8u + i, j = l & 15u;
+            const uint lo = (l < 16u);
+            const uint byte = qs[j];
+            const uint nib = lo ? (byte & 0xFu) : (byte >> 4);
+            const uint bit = lo ? (((qh >> j) << 4) & 0x10u)
+                                : ((qh >> (j + 12u)) & 0x10u);
+            dst[i] = half(d * (float(nib | bit) - 16.0f));   // signed: 16u would underflow to inf
+        }
+    } else {
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) dst[i] = half(0.0f);
+    }
+}
+
+// Q5_1: 24 B block {d f16 @0, m f16 @2, qh @4, qs[16] @8}, y = d*x + m.
+static inline void dequant_q5_1_tile32x32_to_tg(const device uchar * wmat,
+                                                uint m0, uint nout, uint blk,
+                                                uint nb, uint tid,
+                                                threadgroup half * tg, uint ld) {
+    const uint row = tid >> 2u, seg = tid & 3u;
+    const size_t rowb = (size_t)nb * 24ull;
+    threadgroup half * dst = tg + row * ld + seg * 8u;
+    if (m0 + row < nout) {
+        const device uchar * bp = wmat + (size_t)(m0 + row) * rowb + (size_t)blk * 24ull;
+        const float d = f16b(m64_ld16(bp));
+        const float mm = f16b(m64_ld16(bp + 2u));
+        const uint qh = m64_ld32(bp + 4u);
+        const device uchar * qs = bp + 8u;
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) {
+            const uint l = seg * 8u + i, j = l & 15u;
+            const uint lo = (l < 16u);
+            const uint byte = qs[j];
+            const uint nib = lo ? (byte & 0xFu) : (byte >> 4);
+            const uint bit = lo ? (((qh >> j) << 4) & 0x10u)
+                                : ((qh >> (j + 12u)) & 0x10u);
+            dst[i] = half(d * float(nib | bit) + mm);
+        }
+    } else {
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) dst[i] = half(0.0f);
+    }
+}
+
+// QT: 1 = Q4_K, 2 = Q5_0, 3 = Q5_1. Identical control flow to
+// k_moe_grouped_f32in_sg; only the weight loader call switches (dead branches
+// fold at compile time since QT is a template constant). MSL forbids
+// threadgroup-declared arrays in non-kernel functions, so the buffers are
+// declared by each kernel wrapper and passed in.
+template <int QT>
+static inline void m64_moe_grouped_sg_q_impl(
+        device float * SCR, constant MoeGroupedF32SgArgs & A,
+        const device uchar * PACK, uint3 TITG, uint3 TGPG,
+        threadgroup half * tgW, threadgroup half * tgX, threadgroup float * tgO,
+        threadgroup uint * tgIn, threadgroup uint * tgOutP) {
+    const uint m0 = TGPG.x * 32u;
+    const uint exp_id = TGPG.y;
+    if (m0 >= A.nout || exp_id >= A.n_experts) return;     // threadgroup-uniform
+    const device uint * counts = (const device uint *)(SCR + A.count_off);
+    const uint cnt = counts[exp_id];
+    if (cnt == 0u) return;                                 // threadgroup-uniform
+    const uint base = ((const device uint *)(SCR + A.offset_off))[exp_id];
+    const device uint * list = (const device uint *)(SCR + A.list_off);
+
+    const uint tid = TITG.y * 32u + TITG.x;                // 0..127
+    const uint sg_row = ((tid >> 5u) >> 1u) * 16u;
+    const uint sg_col = ((tid >> 5u) & 1u) * 16u;
+    const uint bcol = tid >> 2u, kseg = tid & 3u;
+
+    const uint slot = A.wtab_off != 0u
+        ? ((const device uint *)SCR)[A.wtab_off + exp_id]
+        : exp_id;
+    const device uchar * wmat = PACK + (size_t)A.wbase + (size_t)slot * A.exp_stride +
+                                (size_t)A.part_off;
+    const uint nb = A.k / 32u;
+
+    for (uint off = 0u; off < cnt; off += 32u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 32u) {
+            const bool valid = (off + tid) < cnt;
+            const uint p = valid ? list[base + off + tid] : 0u;
+            tgIn[tid] = A.is_down ? p : (p / A.topk);
+            tgOutP[tid] = valid ? p : 0xFFFFFFFFu;
+        }
+        simdgroup_float8x8 acc[2][2];
+        #pragma unroll
+        for (int r = 0; r < 2; r++)
+            #pragma unroll
+            for (int c = 0; c < 2; c++)
+                acc[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint blk = 0u; blk < nb; blk++) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (QT == 1)
+                dequant_q4_k_tile32x32_to_tg(wmat, m0, A.nout, blk, nb, tid, tgW, M64_SG_LD);
+            else if (QT == 2)
+                dequant_q5_0_tile32x32_to_tg(wmat, m0, A.nout, blk, nb, tid, tgW, M64_SG_LD);
+            else
+                dequant_q5_1_tile32x32_to_tg(wmat, m0, A.nout, blk, nb, tid, tgW, M64_SG_LD);
+            {
+                const uint p_out = tgOutP[bcol];
+                threadgroup half * dx = tgX + kseg * 8u * M64_SG_LD + bcol;
+                if (p_out != 0xFFFFFFFFu) {
+                    const device float * xb = SCR + A.xoff +
+                        (size_t)tgIn[bcol] * A.x_stride + (size_t)blk * 32u + kseg * 8u;
+                    #pragma unroll
+                    for (uint i = 0; i < 8u; i++) dx[i * M64_SG_LD] = half(xb[i]);
+                } else {
+                    #pragma unroll
+                    for (uint i = 0; i < 8u; i++) dx[i * M64_SG_LD] = half(0.0f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
+            for (uint kk = 0u; kk < 32u; kk += 8u) {
+                simdgroup_half8x8 a0, a1, b0m, b1m;
+                simdgroup_load(a0, tgW + (sg_row + 0u) * M64_SG_LD + kk, M64_SG_LD);
+                simdgroup_load(a1, tgW + (sg_row + 8u) * M64_SG_LD + kk, M64_SG_LD);
+                simdgroup_load(b0m, tgX + kk * M64_SG_LD + sg_col, M64_SG_LD);
+                simdgroup_load(b1m, tgX + kk * M64_SG_LD + sg_col + 8u, M64_SG_LD);
+                simdgroup_multiply_accumulate(acc[0][0], a0, b0m, acc[0][0]);
+                simdgroup_multiply_accumulate(acc[0][1], a0, b1m, acc[0][1]);
+                simdgroup_multiply_accumulate(acc[1][0], a1, b0m, acc[1][0]);
+                simdgroup_multiply_accumulate(acc[1][1], a1, b1m, acc[1][1]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (int r = 0; r < 2; r++)
+            #pragma unroll
+            for (int c = 0; c < 2; c++)
+                simdgroup_store(acc[r][c], tgO + (sg_row + (uint)r * 8u) * M64_SG_LD +
+                                         sg_col + (uint)c * 8u, M64_SG_LD);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint m = m0 + (tid >> 2u);
+        if (m < A.nout) {
+            const uint cbase = (tid & 3u) * 8u;
+            const threadgroup float * src = tgO + (tid >> 2u) * M64_SG_LD + cbase;
+            #pragma unroll
+            for (uint i = 0; i < 8u; i++) {
+                const uint outp = tgOutP[cbase + i];
+                if (outp != 0xFFFFFFFFu)
+                    SCR[A.yoff + (size_t)outp * A.y_stride + m] = src[i];
+            }
+        }
+    }
+}
+
+// grid = (ceil(nout/32), n_experts), threadgroup = (32, 4); Q4_K needs
+// k % 256 == 0, Q5_* need k % 32 == 0 (same as the Q8_0 kernel).
+kernel void k_moe_grouped_f32in_sg_q4k(device float * SCR [[buffer(0)]],
+                                       constant MoeGroupedF32SgArgs & A [[buffer(1)]],
+                                       const device uchar * PACK [[buffer(2)]],
+                                       uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                       uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    threadgroup half tgW[32u * M64_SG_LD];
+    threadgroup half tgX[32u * M64_SG_LD];
+    threadgroup float tgO[32u * M64_SG_LD];
+    threadgroup uint tgIn[32];
+    threadgroup uint tgOutP[32];
+    m64_moe_grouped_sg_q_impl<1>(SCR, A, PACK, M64_TITG, M64_TGPG,
+                                    tgW, tgX, tgO, tgIn, tgOutP);
+}
+
+kernel void k_moe_grouped_f32in_sg_q5_0(device float * SCR [[buffer(0)]],
+                                        constant MoeGroupedF32SgArgs & A [[buffer(1)]],
+                                        const device uchar * PACK [[buffer(2)]],
+                                        uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                        uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    threadgroup half tgW[32u * M64_SG_LD];
+    threadgroup half tgX[32u * M64_SG_LD];
+    threadgroup float tgO[32u * M64_SG_LD];
+    threadgroup uint tgIn[32];
+    threadgroup uint tgOutP[32];
+    m64_moe_grouped_sg_q_impl<2>(SCR, A, PACK, M64_TITG, M64_TGPG,
+                                    tgW, tgX, tgO, tgIn, tgOutP);
+}
+
+kernel void k_moe_grouped_f32in_sg_q5_1(device float * SCR [[buffer(0)]],
+                                        constant MoeGroupedF32SgArgs & A [[buffer(1)]],
+                                        const device uchar * PACK [[buffer(2)]],
+                                        uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                        uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    threadgroup half tgW[32u * M64_SG_LD];
+    threadgroup half tgX[32u * M64_SG_LD];
+    threadgroup float tgO[32u * M64_SG_LD];
+    threadgroup uint tgIn[32];
+    threadgroup uint tgOutP[32];
+    m64_moe_grouped_sg_q_impl<3>(SCR, A, PACK, M64_TITG, M64_TGPG,
+                                    tgW, tgX, tgO, tgIn, tgOutP);
 }

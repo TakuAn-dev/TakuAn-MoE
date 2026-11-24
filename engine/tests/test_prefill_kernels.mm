@@ -156,6 +156,122 @@ static void fill_q8(uint8_t * at, size_t rows, int nb, Rng & R) {
         at[r * rstride + (size_t)b * 34 + 1] &= 0x3B;   // finite f16 scales
 }
 
+// ---- Milestone 4B host writers (q4_K / q5_0 / Q5_1), bit layouts per
+// engine/src/dequant.hpp — mirrors the verified writers in test_p2a_kernels.
+static inline void w16le(uint8_t * at, uint16_t hv) { at[0] = (uint8_t)hv; at[1] = (uint8_t)(hv >> 8); }
+static inline void w32le(uint8_t * at, uint32_t v) {
+    at[0] = (uint8_t)v; at[1] = (uint8_t)(v >> 8); at[2] = (uint8_t)(v >> 16); at[3] = (uint8_t)(v >> 24);
+}
+
+// q4_K: 256 values -> one 144 B block. scales/min clamped <=15 so they fit the
+// 4-bit slots the word-packed decoders read (same restriction as test_p2a_kernels).
+static void fill_q4k(uint8_t * at, const float * v, float dmval, Rng & R) {
+    float bmn[8], bmx[8];
+    for (int j = 0; j < 8; j++) {
+        bmn[j] = v[j * 32]; bmx[j] = v[j * 32];
+        for (int i = 1; i < 32; i++) { float x = v[j * 32 + i]; if (x < bmn[j]) bmn[j] = x; if (x > bmx[j]) bmx[j] = x; }
+    }
+    float dmax = 0.0f;
+    for (int j = 0; j < 8; j++) dmax = std::max(dmax, (bmx[j] - bmn[j]) / 15.0f);
+    const float dval = dmax > 0.0f ? dmax : 1.0f;
+    w16le(at, h16bits(dval)); w16le(at + 2, h16bits(dmval));
+    int sc8[8], mn8[8];
+    for (int j = 0; j < 8; j++) {
+        double s = dmval != 0.0f ? std::rint((double)(bmn[j] / dmval)) : 0.0;
+        sc8[j] = (int)std::max(0.0, std::min(15.0, std::rint((double)((bmx[j] - bmn[j]) / 15.0f / dval))));
+        mn8[j] = (int)std::max(0.0, std::min(15.0, s));   // <16 keeps the q[j-4]-quirk decoders bit-agreeing
+    }
+    uint8_t scb[12];
+    memset(scb, 0, 12);
+    for (int j = 0; j < 4; j++) { scb[j] = (uint8_t)sc8[j]; scb[j + 4] = (uint8_t)mn8[j]; }
+    for (int j = 4; j < 8; j++) scb[j + 4] = (uint8_t)((sc8[j] & 0xF) | ((mn8[j] & 0xF) << 4));
+    uint8_t code[256];
+    for (int j = 0; j < 8; j++) {
+        float step = dval * (float)sc8[j];
+        for (int i = 0; i < 32; i++) {
+            double c = step != 0.0f ? std::rint((double)((v[j * 32 + i] - dmval * (float)mn8[j]) / step)) : 0.0;
+            code[j * 32 + i] = (uint8_t)std::max(0.0, std::min(15.0, c));
+        }
+    }
+    for (int j = 0; j < 12; j++) at[4 + (size_t)j] = scb[j];
+    for (int c = 0; c < 4; c++) for (int l = 0; l < 32; l++)
+        at[16 + (size_t)c * 32 + l] = (uint8_t)(code[c * 64 + l] | (code[c * 64 + 32 + l] << 4));
+}
+
+// q5_0 (22 B) / q5_1 (24 B): 32 values -> one block; qh bit j = MSB of elem j,
+// qh bit j+16 = MSB of elem 16+j (dequant.hpp:110-149).
+static void fill_q5(uint8_t * at, const float * v, bool q51) {
+    float mn = v[0], mx = v[0];
+    for (int i = 1; i < 32; i++) { if (v[i] < mn) mn = v[i]; if (v[i] > mx) mx = v[i]; }
+    float d = (mx - mn) / 31.0f, m = q51 ? mn : 0.0f;
+    if (d == 0.0f) d = 1.0f;
+    w16le(at, h16bits(d));
+    uint32_t qh = 0;
+    uint8_t qs[16], code[32];
+    for (int i = 0; i < 32; i++) {
+        double c = std::rint((double)((v[i] - m) / d));
+        code[i] = (uint8_t)std::max(0.0, std::min(31.0, c));
+    }
+    for (int i = 0; i < 16; i++) {
+        qs[i] = (uint8_t)((code[i] & 0xF) | ((code[16 + i] & 0xF) << 4));
+        qh |= (uint32_t)((code[i] >> 4) & 1) << (uint32_t)i;
+        qh |= (uint32_t)((code[16 + i] >> 4) & 1) << (uint32_t)(16 + i);
+    }
+    if (q51) w16le(at + 2, h16bits(m));
+    w32le(at + (q51 ? 4 : 2), qh);
+    for (int i = 0; i < 16; i++) at[(q51 ? 8 : 6) + (size_t)i] = qs[i];
+}
+
+// FP64 oracle for the sg kernels: dequant bit-exactly per dequant.hpp, model the
+// kernel's fp32 dequant + f16 rounding of weights (threadgroup staging) and the
+// FP32->f16 activation cast, then accumulate in FP64. The only residual delta is
+// the tensor-core fp32 accumulation order (gate: 1024-ulp fp32 bound, test 23 policy).
+struct DotS { double a, sab; };
+static void sm4k(const uint8_t * q, int j, double & D, double & M) {
+    if (j < 4) { D = q[j] & 63; M = q[j + 4] & 63; }
+    else { D = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); M = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+// fmt: 1 = Q4_K (row = (nb/8) * 144 B), 2 = Q5_0 (nb * 22 B), 3 = Q5_1 (nb * 24 B).
+static DotS dot_sg_q(int fmt, const uint8_t * wrow, uint32_t nb, const float * x) {
+    DotS r{0, 0};
+    double & a = r.a, & sa = r.sab;
+    for (uint32_t blk = 0; blk < nb; blk++) {
+        const float * xb = x + (size_t)blk * 32;
+        if (fmt == 1) {
+            const uint8_t * bp = wrow + (size_t)(blk >> 3) * 144;
+            const int is = (int)(blk & 7u);
+            double D, M; sm4k(bp + 4, is, D, M);
+            const float vd = f16le(bp) * (float)D;      // exact: f16 x small int
+            const float vm = f16le(bp + 2) * (float)M;  // (<= 15 bits mantissa)
+            const uint8_t * qb = bp + 16 + (is >> 1) * 32;
+            for (int i = 0; i < 32; i++) {
+                const uint8_t n = (is & 1) ? (qb[i] >> 4) : (qb[i] & 0xFu);
+                const double w = (double)r16(vd * (float)n - vm);
+                const double xh = (double)r16(xb[i]);
+                a += w * xh; sa += std::fabs(w) * std::fabs(xh);
+            }
+        } else {
+            const uint32_t bs = fmt == 2 ? 22u : 24u;
+            const uint8_t * bp = wrow + (size_t)blk * bs;
+            const float d = f16le(bp);
+            const float m = fmt == 3 ? f16le(bp + 2) : 0.0f;
+            const uint32_t qh = (uint32_t)bp[fmt == 3 ? 4 : 2] | ((uint32_t)bp[fmt == 3 ? 5 : 3] << 8) |
+                                ((uint32_t)bp[fmt == 3 ? 6 : 4] << 16) | ((uint32_t)bp[fmt == 3 ? 7 : 5] << 24);
+            for (int j = 0; j < 16; j++) {
+                const uint8_t qv = bp[(fmt == 3 ? 8 : 6) + j];
+                const int x0 = (qv & 0xF) | (int)(((qh >> j) << 4) & 0x10u);
+                const int x1 = (qv >> 4) | (int)((qh >> (j + 12)) & 0x10u);
+                const double w0 = (double)r16(fmt == 2 ? d * (float)(x0 - 16) : d * (float)x0 + m);
+                const double w1 = (double)r16(fmt == 2 ? d * (float)(x1 - 16) : d * (float)x1 + m);
+                const double xh0 = (double)r16(xb[j]), xh1 = (double)r16(xb[16 + j]);
+                a += w0 * xh0 + w1 * xh1;
+                sa += std::fabs(w0) * std::fabs(xh0) + std::fabs(w1) * std::fabs(xh1);
+            }
+        }
+    }
+    return r;
+}
+
 int main(int argc, char ** argv) {
     bool do_bench = false;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--bench")) do_bench = true;
@@ -502,6 +618,175 @@ int main(int argc, char ** argv) {
                 gate("attn_f16_batch swa", ref.data(), scr.data() + sOb, ref.size(), GATE_ATTN);
                 bKv = nil;
             }
+        }
+
+        // ================= 5b. k_attn_f16_flash_prefill parity (Milestone 4C)
+        // Flash-2 tiled kernel vs the scalar batch kernel across B / pos0,
+        // SWA ring wrap (ring_cap 1025 crossing at j=1025), relbias-extent
+        // boundary (dist 1023 vs 1024, sentinel 100.0 beyond), causal +
+        // SWA-window masking and OOB query tails (B % 32). P is f16-rounded
+        // for the tensor-core PV product, so the batch->flash gate is
+        // GATE_SG (half-input accumulation policy); selected small configs
+        // additionally gate the FP64 host oracle (also GATE_SG: the flash PV
+        // mma sees f16-rounded P, so fp64-oracle parity is tolerance-based).
+        {
+            const float scale = 1.0f / sqrtf((float)kDH);
+            size_t rbF = psegs(1200u * kNREL * sizeof(float));
+            for (uint32_t d = 0; d < 1200u * kNREL; d++)
+                ((float *)(pk.data() + rbF))[d] = (d < 1024u * kNREL) ? R.f(-0.5f, 0.5f) : 100.0f;
+
+            const uint32_t BMAXF = 128;
+            uint32_t sQf = seg(BMAXF * kNH * kDH), sRf = seg(BMAXF * kNH * kNREL),
+                     sSf = seg(BMAXF * kNH + 4), sOf = seg(BMAXF * kNH * kDH);
+            for (uint32_t i = 0; i < BMAXF * kNH * kDH; i++) scr[sQf + i] = R.f(-1.5f, 1.5f);
+            for (uint32_t i = 0; i < BMAXF * kNH * kNREL; i++) scr[sRf + i] = R.f(-0.5f, 0.5f);
+            for (uint32_t i = 0; i < BMAXF * kNH; i++) scr[sSf + i] = R.f(-1.5f, 1.5f);
+
+            auto ref_attn_f = [&](uint32_t pos0, uint32_t b_cnt, uint32_t is_swa,
+                                  uint32_t n_swa, uint32_t ring_cap,
+                                  const std::vector<uint16_t> & mk, const std::vector<uint16_t> & mv,
+                                  std::vector<float> & ref) {
+                for (uint32_t b = 0; b < b_cnt; b++) {
+                    const uint32_t pos = pos0 + b;
+                    const float tau = is_swa ? 1.0f
+                        : (float)(std::log(std::max(1.0, ((double)pos + 1.0) / 8192.0)) * 0.25 + 1.0);
+                    const uint32_t j_start = (is_swa && pos > n_swa) ? (pos - n_swa) : 0u;
+                    for (uint32_t h = 0; h < kNH; h++) {
+                        const float * q = scr.data() + sQf + (size_t)b * kNH * kDH + h * kDH;
+                        const float * ro = scr.data() + sRf + (size_t)b * kNH * kNREL + h * kNREL;
+                        const double snk = scr[sSf + b * kNH + h];
+                        const uint32_t kvh2 = h / 3u;
+                        double oh[kDH] = {0}, M = -INFINITY, S = 0.0;
+                        for (uint32_t j = j_start; j <= pos; j++) {
+                            const uint32_t slot = is_swa ? (j % ring_cap) : j;
+                            const uint16_t * kj = mk.data() + (size_t)slot * kKVD + kvh2 * kDH;
+                            const uint16_t * vj = mv.data() + (size_t)slot * kKVD + kvh2 * kDH;
+                            double d = 0.0;
+                            for (int i = 0; i < (int)kDH; i++)
+                                d += (double)r16(q[i] * tau) * h16d(kj[i]);
+                            uint32_t dist = pos - j;
+                            double bv = 0.0;
+                            if (dist < 1024u) {
+                                const float * br = ((const float *)(pk.data() + rbF)) + dist * 16u;
+                                for (int i = 0; i < 16; i++) bv += (double)br[i] * ((double)ro[i] * (double)tau);
+                            }
+                            double s = d * (double)scale + (double)r16((float)(bv - snk));
+                            double ms = 1.0, vs = 1.0;
+                            if (s > M) {
+                                ms = std::exp(M - s);
+                                for (int i = 0; i < (int)kDH; i++) oh[i] *= ms;
+                                M = s;
+                            } else {
+                                vs = std::exp(s - M);
+                            }
+                            for (int i = 0; i < (int)kDH; i++)
+                                oh[i] += vs * h16d(vj[i]);
+                            S = S * ms + vs;
+                        }
+                        {
+                            double ms = 1.0, vs = 1.0;
+                            if (0.0 > M) { ms = std::exp(M); for (int i = 0; i < (int)kDH; i++) oh[i] *= ms; M = 0.0; }
+                            else { vs = std::exp(0.0 - M); }
+                            S = S * ms + vs;
+                        }
+                        const double inv = 1.0 / S;
+                        for (int i = 0; i < (int)kDH; i++)
+                            ref[((size_t)b * kNH + h) * kDH + i] = (float)(oh[i] * inv);
+                    }
+                }
+            };
+
+            auto attn_args_f = [&](uint32_t pos0, uint32_t Bb, uint32_t is_swa, uint32_t n_swa,
+                                   uint32_t ring_cap, uint64_t kvv_off) {
+                AttnBatchF16Args A{};
+                A.relbiaspack = rbF; A.kvkoff = 0; A.kvvoff = kvv_off;
+                A.qoff = sQf; A.rout = sRf; A.sinkoff = sSf; A.outoff = sOf;
+                A.q_stride = kNH * kDH; A.rout_stride = kNH * kNREL;
+                A.sink_stride = kNH; A.out_stride = kNH * kDH;
+                A.pos0 = pos0; A.B = Bb; A.is_swa = is_swa; A.n_swa = n_swa;
+                A.ring_cap = ring_cap; A.pad0 = 0;
+                A.scale = scale; A.log_scale_floor = 8192.0f; A.log_scale_alpha = 0.25f; A.pad1 = 0;
+                return A;
+            };
+
+            struct FCfg { const char * nm; uint32_t pos0, B, oracle; };
+            // full attention: relbias-extent boundary at p=1020/B=37 spans
+            // dist 1023/1024; p=20000/B=128 exercises the tile fast path + tail
+            const FCfg full_cfgs[] = {
+                {"full b1 p0",       0u,     1u, 1u},
+                {"full b32 p0",      0u,    32u, 1u},
+                {"full b7 p7",       7u,     7u, 0u},
+                {"full b8 p512",     512u,   8u, 1u},
+                {"full b37 p1020",   1020u, 37u, 0u},
+                {"full b128 p20000", 20000u,128u, 0u},
+            };
+            // SWA ring_cap 1025: batch p1020..1051 wraps j=1025 -> slot 0;
+            // window mask j < pos-1024; p20000 wraps the ring repeatedly.
+            const FCfg swa_cfgs[] = {
+                {"swa b8 p0",        0u,     8u, 1u},
+                {"swa b32 p1020",    1020u, 32u, 1u},
+                {"swa b37 p2040",    2040u, 37u, 0u},
+                {"swa b128 p20000",  20000u,128u, 0u},
+            };
+
+            const uint32_t FPMAX = 20040u;
+            const size_t fhalf = (size_t)FPMAX * kKVD;
+            std::vector<uint16_t> fmk(fhalf), fmv(fhalf);
+            for (size_t i = 0; i < fhalf; i++) { fmk[i] = h16bits(R.f(-2, 2)); fmv[i] = h16bits(R.f(-2, 2)); }
+            id<MTLBuffer> bKvF = [rt.device() newBufferWithLength:fhalf * 2 * sizeof(uint16_t)
+                                                          options:MTLResourceStorageModeShared];
+            CHECK(bKvF != nil, "flash full KV alloc");
+            if (bKvF) {
+                uint16_t * dev = (uint16_t *)bKvF.contents;
+                memcpy(dev, fmk.data(), fhalf * 2);
+                memcpy(dev + fhalf, fmv.data(), fhalf * 2);
+            }
+            const uint32_t SWR = 1025u;
+            const size_t shalf = (size_t)SWR * kKVD;
+            std::vector<uint16_t> smk(shalf), smv(shalf);
+            for (size_t i = 0; i < shalf; i++) { smk[i] = h16bits(R.f(-2, 2)); smv[i] = h16bits(R.f(-2, 2)); }
+            id<MTLBuffer> bKvS = [rt.device() newBufferWithLength:shalf * 2 * sizeof(uint16_t)
+                                                          options:MTLResourceStorageModeShared];
+            CHECK(bKvS != nil, "flash SWA KV alloc");
+            if (bKvS) {
+                uint16_t * dev = (uint16_t *)bKvS.contents;
+                memcpy(dev, smk.data(), shalf * 2);
+                memcpy(dev + shalf, smv.data(), shalf * 2);
+            }
+            CHECK(bKvF && bKvS, "flash parity KV buffers");
+
+            auto flash_case = [&](const FCfg & c, uint32_t is_swa, uint32_t ring, size_t halfs,
+                                  id<MTLBuffer> bKv, const std::vector<uint16_t> & mk,
+                                  const std::vector<uint16_t> & mv) {
+                if (!bKv) return;
+                const auto A = attn_args_f(c.pos0, c.B, is_swa, 1024u, ring, halfs);
+                const size_t n = (size_t)c.B * kNH * kDH;
+                std::vector<float> refb(n);
+                std::fill(scr.begin() + sOf, scr.begin() + sOf + n, -9999.0f);
+                run("k_attn_head_f16_batch", true, kNH, c.B, 32, 1, &A, sizeof(A), bKv);
+                memcpy(refb.data(), scr.data() + sOf, n * 4);
+                std::fill(scr.begin() + sOf, scr.begin() + sOf + n, -9999.0f);
+                run("k_attn_f16_flash_prefill", true, kNH, (c.B + 31u) / 32u, 32, 4, &A, sizeof(A), bKv);
+                char nm1[48];
+                snprintf(nm1, sizeof(nm1), "flash vs batch %s", c.nm);
+                gate(nm1, refb.data(), scr.data() + sOf, n, GATE_SG);
+                if (c.oracle) {
+                    std::vector<float> refh(n);
+                    ref_attn_f(c.pos0, c.B, is_swa, 1024u, ring, mk, mv, refh);
+                    char nm2[48];
+                    snprintf(nm2, sizeof(nm2), "flash vs fp64 %s", c.nm);
+                    // GATE_SG, not GATE_ATTN: the flash PV product runs on
+                    // tensor cores with f16-rounded P (mma operands MUST be
+                    // half), so its fp64-oracle error is set by the p->half
+                    // rounding (~1e-3 rel), not by accumulation order.
+                    gate(nm2, refh.data(), scr.data() + sOf, n, GATE_SG);
+                }
+            };
+            for (const auto & c : full_cfgs)
+                flash_case(c, 0u, FPMAX, fhalf, bKvF, fmk, fmv);
+            for (const auto & c : swa_cfgs)
+                flash_case(c, 1u, SWR, shalf, bKvS, smk, smv);
+            bKvF = nil; bKvS = nil;
         }
 
         // ================= 6/7. k_moe_grouped_gemm_q8 =================
@@ -1221,6 +1506,146 @@ int main(int argc, char ** argv) {
                 gate(nm, ref.data(), scr.data() + sY, ref.size(), GATE_SG);
             }
         }
+        // ---- 10f. k_moe_grouped_f32in_sg_{q4k,q5_0,q5_1} (Milestone 4B) ----
+        // FP64-oracle parity per DotS gate (1024-ulp fp32 bound): q4k needs k%256==0.
+        // Expert 0 stays cnt=0 in every scenario; expert 1 gets cnt=37 (> 32-tile).
+        {
+            const double EPSF = 1.1920928955078125e-7;
+            auto gate_ulp = [&](const char * name, const std::vector<DotS> & ref, uint32_t off, size_t n) {
+                const float * got = scr.data() + off;
+                double worst = 0.0; size_t bad = 0, nonfinite = 0;
+                for (size_t i = 0; i < n; i++) {
+                    const double g = (double)got[i];
+                    if (!std::isfinite(g) || !std::isfinite(ref[i].a)) { nonfinite++; continue; }
+                    double bnd = 1e-4 * std::fabs(ref[i].a) + 1024.0 * EPSF * ref[i].sab;
+                    double dl = std::fabs(g - ref[i].a);
+                    if (dl > bnd) bad++;
+                    if (bnd != 0.0 && dl / bnd > worst) worst = dl / bnd;
+                }
+                bad += nonfinite;   // NaN/inf never compares > bound; count them explicitly
+                CHECK(bad == 0, "%s %zu/%zu over 1024-ulp bound (%zu nonfinite, worst %.1f)",
+                      name, bad, n, nonfinite, worst);
+                printf("%-36s ulp-gated %zu rows %s (worst %.2f bound)\n", name, n, bad ? "FAIL" : "OK", worst);
+            };
+            const char * fq[3] = {"q4k", "q5_0", "q5_1"};
+            const char * fk[3] = {"k_moe_grouped_f32in_sg_q4k", "k_moe_grouped_f32in_sg_q5_0",
+                                  "k_moe_grouped_f32in_sg_q5_1"};
+            struct SC4 { uint32_t B, NEXP, NSLOTS, TOPK, k, nout, is_down, use_wtab; } scs4[] = {
+                {8u,   16u,  16u, 8u, 256u,  37u,  0u, 0u},   // direct + cnt=0/37 + nout tail
+                {32u,  32u,  12u, 8u, 512u,  64u,  0u, 1u},   // wtab arena + multi-tile
+                {128u,128u,  16u, 8u, 256u,  96u,  0u, 1u},   // B=128 full, npairs=1024
+                {128u,128u,  16u, 8u, 512u,  64u,  1u, 1u},   // is_down=1 + wtab
+            };
+            float v4[256], v5[32];
+            for (int f = 0; f < 3; f++) {
+                const int fmt = f + 1;
+                const uint32_t bb = fmt == 1 ? 18u : (fmt == 2 ? 22u : 24u);
+                for (auto & sc : scs4) {
+                    cur = cur9; pcur = pcur9;
+                    const uint32_t B = sc.B, NEXP = sc.NEXP, TOPK = sc.TOPK,
+                                   k = sc.k, nout = sc.nout, nb = k / 32, npairs = B * TOPK;
+                    const uint64_t exp_stride = (uint64_t)nout * nb * bb;
+                    const uint32_t nstore = sc.use_wtab ? sc.NSLOTS : NEXP;
+                    size_t wbase = psegs((size_t)nstore * exp_stride);
+                    for (uint32_t s = 0; s < nstore; s++) {
+                        uint8_t * wp = pk.data() + wbase + (size_t)s * exp_stride;
+                        for (uint32_t r = 0; r < nout; r++) {
+                            if (fmt == 1)
+                                for (uint32_t b = 0; b < nb; b += 8u) {
+                                    for (int i = 0; i < 256; i++) v4[i] = R.f(-0.4f, 0.4f);
+                                    fill_q4k(wp + (size_t)r * nb * 18 + (size_t)b * 18, v4,
+                                             ((r + b) & 1) ? R.f(-0.0003f, 0.0003f) : 0.0f, R);
+                                }
+                            else
+                                for (uint32_t b = 0; b < nb; b++) {
+                                    for (int i = 0; i < 32; i++) v5[i] = R.f(-0.4f, 0.4f);
+                                    fill_q5(wp + (size_t)r * nb * bb + (size_t)b * bb, v5, fmt == 3);
+                                }
+                        }
+                    }
+                    const uint32_t nrows_x = sc.is_down ? npairs : B;
+                    uint32_t sX = seg(nrows_x * k + 32), sY = seg(npairs * nout + 32);
+                    uint32_t sSel = seg(npairs + 16), sCnt = seg(NEXP + 16), sOff = seg(NEXP + 16),
+                             sList = seg(npairs + 16), sWtab = seg(NEXP + 16);
+                    for (uint32_t i = 0; i < nrows_x * k; i++) scr[sX + i] = R.f(-4, 4);
+                    for (uint32_t p = 0; p < npairs; p++) {
+                        uint32_t e;
+                        if (npairs >= 64 && p < 37) e = 1u;
+                        else e = 1u + ((p * 7u + (p / TOPK) * 3u) % (NEXP - 1u));
+                        ((uint32_t *)scr.data())[sSel + p] = e;
+                    }
+                    std::vector<uint32_t> exp2slot(NEXP, 0);
+                    for (uint32_t e = 0; e < NEXP; e++) {
+                        uint32_t sl = sc.use_wtab ? ((e * 5u + 3u) % sc.NSLOTS) : e;
+                        exp2slot[e] = sl;
+                        ((uint32_t *)scr.data())[sWtab + e] = sl;
+                    }
+                    MoeBucketArgs BA{sSel, sCnt, sOff, sList, NEXP, npairs, 0u, 0u};
+                    run("k_moe_bucket_build", true, 1, 1, 256, 1, &BA, sizeof(BA));
+                    MoeGroupedF32SgArgs A{wbase, exp_stride, 0ull, sX, sY, sList, sCnt, sOff,
+                                          sc.use_wtab ? sWtab : 0u, nout, k, k, nout, NEXP, TOPK,
+                                          sc.is_down, 0u};
+                    run(fk[f], true, (nout + 31) / 32, NEXP, 32, 4, &A, sizeof(A));
+                    std::vector<DotS> ref((size_t)npairs * nout);
+                    for (uint32_t p = 0; p < npairs; p++) {
+                        const uint32_t xin = sc.is_down ? p : (p / TOPK);
+                        const uint32_t e = ((const uint32_t *)scr.data())[sSel + p];
+                        const uint8_t * wr = pk.data() + wbase + (size_t)exp2slot[e] * exp_stride;
+                        const float * xrow = scr.data() + sX + (size_t)xin * k;
+                        for (uint32_t r = 0; r < nout; r++)
+                            ref[(size_t)p * nout + r] = dot_sg_q(fmt, wr + (size_t)r * nb * bb, nb, xrow);
+                    }
+                    char nm[64];
+                    snprintf(nm, sizeof(nm), "moe_grouped_sg_%s B=%-3u d=%u w=%u", fq[f], B, sc.is_down, sc.use_wtab);
+                    gate_ulp(nm, ref, sY, ref.size());
+                }
+            }
+            // wtab indirection == direct, bitwise (identical slot contents, shuffled mapping)
+            for (int f = 0; f < 3; f++) {
+                const int fmt = f + 1;
+                const uint32_t bb = fmt == 1 ? 18u : (fmt == 2 ? 22u : 24u);
+                cur = cur9; pcur = pcur9;
+                const uint32_t B = 16u, NEXP = 8u, TOPK = 8u, k = 256u, nout = 64u,
+                               nb = k / 32, npairs = B * TOPK;
+                const uint64_t exp_stride = (uint64_t)nout * nb * bb;
+                size_t wbase = psegs((size_t)NEXP * exp_stride);
+                for (uint32_t r = 0; r < nout; r++) {
+                    if (fmt == 1)
+                        for (uint32_t b = 0; b < nb; b += 8u) {
+                            for (int i = 0; i < 256; i++) v4[i] = R.f(-0.4f, 0.4f);
+                            fill_q4k(pk.data() + wbase + (size_t)r * nb * 18 + (size_t)b * 18, v4, 0.0f, R);
+                        }
+                    else
+                        for (uint32_t b = 0; b < nb; b++) {
+                            for (int i = 0; i < 32; i++) v5[i] = R.f(-0.4f, 0.4f);
+                            fill_q5(pk.data() + wbase + (size_t)r * nb * bb + (size_t)b * bb, v5, fmt == 3);
+                        }
+                }
+                for (uint32_t s = 1; s < NEXP; s++)      // all slots carry identical expert bytes
+                    memcpy(pk.data() + wbase + (size_t)s * exp_stride, pk.data() + wbase, (size_t)exp_stride);
+                uint32_t sX = seg(B * k + 32), sYa = seg(npairs * nout + 32), sYb = seg(npairs * nout + 32);
+                uint32_t sSel = seg(npairs + 16), sCnt = seg(NEXP + 16), sOff = seg(NEXP + 16),
+                         sList = seg(npairs + 16), sWtab = seg(NEXP + 16);
+                for (uint32_t i = 0; i < B * k; i++) scr[sX + i] = R.f(-4, 4);
+                for (uint32_t p = 0; p < npairs; p++)
+                    ((uint32_t *)scr.data())[sSel + p] = (p * 3u + 1u) % NEXP;
+                MoeBucketArgs BA{sSel, sCnt, sOff, sList, NEXP, npairs, 0u, 0u};
+                run("k_moe_bucket_build", true, 1, 1, 256, 1, &BA, sizeof(BA));
+                MoeGroupedF32SgArgs A{wbase, exp_stride, 0ull, sX, sYa, sList, sCnt, sOff, 0u,
+                                       nout, k, k, nout, NEXP, TOPK, 0u, 0u};
+                MoeGroupedF32SgArgs B2 = A; B2.yoff = sYb;
+                for (uint32_t e = 0; e < NEXP; e++) ((uint32_t *)scr.data())[sWtab + e] = (e * 3u + 1u) % NEXP;
+                B2.wtab_off = sWtab;
+                run(fk[f], true, (nout + 31) / 32, NEXP, 32, 4, &A, sizeof(A));
+                run(fk[f], true, (nout + 31) / 32, NEXP, 32, 4, &B2, sizeof(B2));
+                const uint32_t * pa = (const uint32_t *)scr.data();
+                size_t bad = 0;
+                for (uint32_t i = 0; i < npairs * nout; i++)
+                    if (pa[sYa + i] != pa[sYb + i]) bad++;
+                CHECK(bad == 0, "moe_grouped_sg_%s wtab vs direct %zu bitwise mismatches", fq[f], bad);
+                printf("%-36s wtab == direct bitwise %s\n", fq[f], bad ? "FAIL" : "OK");
+            }
+        }
 
         // ================= 11. k_attn_head_f16_split + reduce vs k_attn_head_f16 =================
         id<MTLBuffer> bKvSplit = nil;
@@ -1419,71 +1844,110 @@ int main(int argc, char ** argv) {
                     }
                 }
             }
-            // ---- k_moe_grouped_f32in_sg (3C) vs k_moe_grouped_gemm_q8 (3A/3B) ----
+            // ---- k_moe_grouped_f32in_sg: Q8_0 (3C) vs Q4_K/Q5_0/Q5_1 (4B) + vs k_moe_grouped_gemm_q8 ----
             {
-                cur = cur9; pcur = pcur9;
                 const uint32_t NEXP = 128, NSLOTS = 16, TOPK = 8, k = 2304, nout = 1152, nb = k / 32;
-                const uint64_t exp_stride = (uint64_t)nout * nb * 34;
-                size_t wbase = psegs((size_t)NSLOTS * exp_stride);
-                for (uint32_t s = 0; s < NSLOTS; s++)
-                    fill_q8(pk.data() + wbase + (size_t)s * exp_stride, nout, (int)nb, R);
-                id<MTLComputePipelineState> pMG = rt.pipeline("k_moe_grouped_gemm_q8");
-                id<MTLComputePipelineState> pSG = rt.pipeline("k_moe_grouped_f32in_sg");
-                CHECK(pMG != nil && pSG != nil, "bench moe pipelines missing");
-                double t_mg32 = 0.0;
-                for (uint32_t Bm : {32u, 128u}) {
-                    cur = (uint32_t)(cur9 + 0);   // rewind SCR per Bm
-                    const uint32_t npairs = Bm * TOPK, qstr = k / 4 + 16, dstr = nb + 4;
-                    uint32_t sXq = seg(Bm * qstr + 32), sDx = seg(Bm * dstr + 32), sXf = seg(Bm * k + 32);
-                    uint32_t sY = seg(npairs * nout + 32);
-                    uint32_t sSel = seg(npairs + 16), sCnt = seg(NEXP + 16), sOff = seg(NEXP + 16),
-                             sList = seg(npairs + 16), sWtab = seg(NEXP + 16);
-                    for (uint32_t t = 0; t < Bm; t++) {
-                        std::vector<float> x(k);
-                        for (auto & v : x) v = R.f(-4, 4);
-                        memcpy(scr.data() + sXf + (size_t)t * k, x.data(), k * 4);
-                        std::vector<uint8_t> codes; std::vector<float> d;
-                        quantize(x, (int)k, codes, d);
-                        memcpy(scr.data() + sXq + (size_t)t * qstr, codes.data(), k);
-                        for (uint32_t b = 0; b < nb; b++) scr[sDx + (size_t)t * dstr + b] = d[b];
-                        for (uint32_t k0 = 0; k0 < TOPK; k0++)
-                            ((uint32_t *)scr.data())[sSel + t * TOPK + k0] = (k0 * 13u + t * 5u) % NEXP;
+                struct QFmt { const char * tag; const char * fn; uint32_t bb; } fmts[] = {
+                    {"Q8_0", "k_moe_grouped_f32in_sg",      34u},
+                    {"Q4_K", "k_moe_grouped_f32in_sg_q4k",  18u},
+                    {"Q5_0", "k_moe_grouped_f32in_sg_q5_0", 22u},
+                    {"Q5_1", "k_moe_grouped_f32in_sg_q5_1", 24u},
+                };
+                float v4[256], v5[32];
+                double ms_sg[4][2] = {{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}};
+                double t_mg[2] = {0.0, 0.0};
+                for (int fi = 0; fi < 4; fi++) {
+                    cur = cur9; pcur = pcur9;
+                    const uint64_t exp_stride = (uint64_t)nout * nb * fmts[fi].bb;
+                    size_t wbase = psegs((size_t)NSLOTS * exp_stride);
+                    for (uint32_t s = 0; s < NSLOTS; s++) {
+                        uint8_t * wp = pk.data() + wbase + (size_t)s * exp_stride;
+                        if (fi == 0) {
+                            fill_q8(wp, nout, (int)nb, R);
+                        } else if (fi == 1) {
+                            for (uint32_t r = 0; r < nout; r++)
+                                for (uint32_t b = 0; b < nb; b += 8u) {
+                                    for (int i = 0; i < 256; i++) v4[i] = R.f(-0.4f, 0.4f);
+                                    fill_q4k(wp + (size_t)r * nb * 18 + (size_t)b * 18, v4,
+                                             ((r + b) & 1) ? R.f(-0.0003f, 0.0003f) : 0.0f, R);
+                                }
+                        } else {
+                            for (uint32_t r = 0; r < nout; r++)
+                                for (uint32_t b = 0; b < nb; b++) {
+                                    for (int i = 0; i < 32; i++) v5[i] = R.f(-0.4f, 0.4f);
+                                    fill_q5(wp + (size_t)r * nb * fmts[fi].bb + (size_t)b * fmts[fi].bb,
+                                            v5, fi == 3);
+                                }
+                        }
                     }
-                    for (uint32_t e = 0; e < NEXP; e++)
-                        ((uint32_t *)scr.data())[sWtab + e] = e % NSLOTS;
-                    MoeBucketArgs BA{sSel, sCnt, sOff, sList, NEXP, npairs, 0u, 0u};
-                    run("k_moe_bucket_build", true, 1, 1, 256, 1, &BA, sizeof(BA));
-                    memcpy(bScr.contents, scr.data(), SCR_F * 4);
-                    memcpy(bPk.contents, pk.data(), PK_B);
+                    id<MTLComputePipelineState> pSG = rt.pipeline(fmts[fi].fn);
+                    id<MTLComputePipelineState> pMG = fi == 0 ? rt.pipeline("k_moe_grouped_gemm_q8") : nil;
+                    CHECK(pSG != nil && (fi != 0 || pMG != nil), "bench moe pipelines missing");
+                    int bi = 0;
+                    for (uint32_t Bm : {32u, 128u}) {
+                        cur = (uint32_t)(cur9 + 0);   // rewind SCR per Bm
+                        const uint32_t npairs = Bm * TOPK, qstr = k / 4 + 16, dstr = nb + 4;
+                        uint32_t sXq = seg(Bm * qstr + 32), sDx = seg(Bm * dstr + 32), sXf = seg(Bm * k + 32);
+                        uint32_t sY = seg(npairs * nout + 32);
+                        uint32_t sSel = seg(npairs + 16), sCnt = seg(NEXP + 16), sOff = seg(NEXP + 16),
+                                 sList = seg(npairs + 16), sWtab = seg(NEXP + 16);
+                        for (uint32_t t = 0; t < Bm; t++) {
+                            std::vector<float> x(k);
+                            for (auto & v : x) v = R.f(-4, 4);
+                            memcpy(scr.data() + sXf + (size_t)t * k, x.data(), k * 4);
+                            std::vector<uint8_t> codes; std::vector<float> d;
+                            quantize(x, (int)k, codes, d);
+                            memcpy(scr.data() + sXq + (size_t)t * qstr, codes.data(), k);
+                            for (uint32_t b = 0; b < nb; b++) scr[sDx + (size_t)t * dstr + b] = d[b];
+                            for (uint32_t k0 = 0; k0 < TOPK; k0++)
+                                ((uint32_t *)scr.data())[sSel + t * TOPK + k0] = (k0 * 13u + t * 5u) % NEXP;
+                        }
+                        for (uint32_t e = 0; e < NEXP; e++)
+                            ((uint32_t *)scr.data())[sWtab + e] = e % NSLOTS;
+                        MoeBucketArgs BA{sSel, sCnt, sOff, sList, NEXP, npairs, 0u, 0u};
+                        run("k_moe_bucket_build", true, 1, 1, 256, 1, &BA, sizeof(BA));
+                        memcpy(bScr.contents, scr.data(), SCR_F * 4);
+                        memcpy(bPk.contents, pk.data(), PK_B);
 
-                    MoeGroupedGemmArgs MGA{wbase, exp_stride, 0ull, sXq, sDx, sY, sList, sCnt, sOff,
-                                           nout, k, qstr, dstr, nout, NEXP, TOPK, 0u, sWtab, 0u};
-                    char nm1[48], nm2[48];
-                    snprintf(nm1, sizeof(nm1), "moe_grouped_q8 B=%u", Bm);
-                    double t_old = timed(nm1, [&](id<MTLComputeCommandEncoder> en) {
-                        [en setComputePipelineState:pMG];
-                        [en setBuffer:bScr offset:0 atIndex:0];
-                        [en setBytes:&MGA length:sizeof(MGA) atIndex:1];
-                        [en setBuffer:bPk offset:0 atIndex:2];
-                        [en dispatchThreadgroups:MTLSizeMake((nout + 3) / 4, NEXP, 1)
-                            threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-                    });
-                    if (Bm == 32u) t_mg32 = t_old;
-
-                    MoeGroupedF32SgArgs SGA{wbase, exp_stride, 0ull, sXf, sY, sList, sCnt, sOff, sWtab,
-                                            nout, k, k, nout, NEXP, TOPK, 0u, 0u};
-                    snprintf(nm2, sizeof(nm2), "moe_grouped_f32_sg B=%u", Bm);
-                    double t_new = timed(nm2, [&](id<MTLComputeCommandEncoder> en) {
-                        [en setComputePipelineState:pSG];
-                        [en setBuffer:bScr offset:0 atIndex:0];
-                        [en setBytes:&SGA length:sizeof(SGA) atIndex:1];
-                        [en setBuffer:bPk offset:0 atIndex:2];
-                        [en dispatchThreadgroups:MTLSizeMake((nout + 31) / 32, NEXP, 1)
-                            threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-                    });
-                    const double per_tok_gain = (t_mg32 / 32.0) / (t_new / (double)Bm);
-                    printf("SPEEDUP moe_grouped_sg@%-3u: %.2fx same-B, %.2fx per-token vs q8@32 (%.3f vs %.3f ms/tok)\n",
-                           Bm, t_old / t_new, per_tok_gain, t_new / Bm, t_mg32 / 32.0);
+                        if (fi == 0) {
+                            MoeGroupedGemmArgs MGA{wbase, exp_stride, 0ull, sXq, sDx, sY, sList, sCnt, sOff,
+                                                   nout, k, qstr, dstr, nout, NEXP, TOPK, 0u, sWtab, 0u};
+                            char nm1[48];
+                            snprintf(nm1, sizeof(nm1), "moe_grouped_q8 B=%u", Bm);
+                            t_mg[bi] = timed(nm1, [&](id<MTLComputeCommandEncoder> en) {
+                                [en setComputePipelineState:pMG];
+                                [en setBuffer:bScr offset:0 atIndex:0];
+                                [en setBytes:&MGA length:sizeof(MGA) atIndex:1];
+                                [en setBuffer:bPk offset:0 atIndex:2];
+                                [en dispatchThreadgroups:MTLSizeMake((nout + 3) / 4, NEXP, 1)
+                                    threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                            });
+                        }
+                        MoeGroupedF32SgArgs SGA{wbase, exp_stride, 0ull, sXf, sY, sList, sCnt, sOff, sWtab,
+                                                nout, k, k, nout, NEXP, TOPK, 0u, 0u};
+                        char nm2[64];
+                        snprintf(nm2, sizeof(nm2), "moe_grouped_f32_sg %s B=%u", fmts[fi].tag, Bm);
+                        ms_sg[fi][bi] = timed(nm2, [&](id<MTLComputeCommandEncoder> en) {
+                            [en setComputePipelineState:pSG];
+                            [en setBuffer:bScr offset:0 atIndex:0];
+                            [en setBytes:&SGA length:sizeof(SGA) atIndex:1];
+                            [en setBuffer:bPk offset:0 atIndex:2];
+                            [en dispatchThreadgroups:MTLSizeMake((nout + 31) / 32, NEXP, 1)
+                                threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                        });
+                        bi++;
+                    }
+                }
+                for (int bi = 0; bi < 2; bi++) {
+                    const uint32_t Bm = bi ? 128u : 32u;
+                    printf("MOE-SG weight-format bench B=%u (NEXP=128 slots=16 topk=8 k=2304 nout=1152):\n", Bm);
+                    for (int fi = 0; fi < 4; fi++) {
+                        const double gbs = (double)NEXP * nout * nb * fmts[fi].bb / (ms_sg[fi][bi] * 1e-3) / 1e9;
+                        printf("  %-5s %8.4f ms/iter  %6.2fx vs Q8_0  logical wstream %6.1f GB/s\n",
+                               fmts[fi].tag, ms_sg[fi][bi], ms_sg[0][bi] / ms_sg[fi][bi], gbs);
+                    }
+                    printf("  Q8_0 per-token vs k_moe_grouped_gemm_q8: %.2fx (%.3f vs %.3f ms/tok)\n",
+                           t_mg[bi] / ms_sg[0][bi], ms_sg[0][bi] / Bm, t_mg[bi] / Bm);
                 }
             }
             // ---- k_attn_head_f16_split + reduce vs k_attn_head_f16 @ pos=20000 ----
@@ -1538,6 +2002,91 @@ int main(int argc, char ** argv) {
                 });
                 printf("SPEEDUP attn_f16_split32@20000: %.2fx (%.4f vs %.4f ms/iter)\n",
                        t_serial / t_split, t_split, t_serial);
+            }
+            // ---- k_attn_f16_flash_prefill vs k_attn_head_f16_batch @ pos=20000 ----
+            {
+                cur = cur9; pcur = pcur9;
+                const uint32_t POSB = 20000u, KB = 128u;
+                const float scale = 1.0f / sqrtf((float)kDH);
+                const size_t rbB = psegs(1024u * kNREL * sizeof(float));
+                for (uint32_t d = 0; d < 1024u * kNREL; d++)
+                    ((float *)(pk.data() + rbB))[d] = R.f(-0.4f, 0.4f);
+                const uint32_t sQ = seg(KB * kNH * kDH), sRr = seg(KB * kNH * kNREL),
+                                 sSnk = seg(KB * kNH), sOut = seg(KB * kNH * kDH);
+                for (uint32_t i = 0; i < KB * kNH * kDH; i++) scr[sQ + i] = R.f(-1.2f, 1.2f);
+                for (uint32_t i = 0; i < KB * kNH * kNREL; i++) scr[sRr + i] = R.f(-0.5f, 0.5f);
+                for (uint32_t i = 0; i < KB * kNH; i++) scr[sSnk + i] = R.f(-1.0f, 1.0f);
+                const size_t kvh = (size_t)(POSB + KB + 8u) * kKVD;   // 20136 slots
+                id<MTLBuffer> bKvB = [rt.device() newBufferWithLength:kvh * 2 * sizeof(uint16_t)
+                                                              options:MTLResourceStorageModeShared];
+                CHECK(bKvB != nil, "bench flash KV alloc");
+                if (bKvB) {
+                    uint16_t * dev = (uint16_t *)bKvB.contents;
+                    for (size_t i = 0; i < kvh * 2u; i++) dev[i] = h16bits(R.f(-1.5f, 1.5f));
+                }
+                memcpy(bScr.contents, scr.data(), SCR_F * 4);
+                memcpy(bPk.contents, pk.data(), PK_B);
+                id<MTLComputePipelineState> pFB = rt.pipeline("k_attn_head_f16_batch");
+                id<MTLComputePipelineState> pFF = rt.pipeline("k_attn_f16_flash_prefill");
+                CHECK(pFB != nil && pFF != nil && bKvB != nil, "bench flash pipelines missing");
+                if (pFB && pFF && bKvB) {
+                    double t_b[2][2] = {{0, 0}, {0, 0}}, t_f[2][2] = {{0, 0}, {0, 0}};  // [swa][B]
+                    int si = 0;
+                    for (uint32_t is_swa : {0u, 1u}) {
+                        int bi = 0;
+                        for (uint32_t Bb : {128u, 32u}) {
+                            AttnBatchF16Args A{};
+                            A.relbiaspack = rbB; A.kvkoff = 0; A.kvvoff = (uint64_t)kvh;
+                            A.qoff = sQ; A.rout = sRr; A.sinkoff = sSnk; A.outoff = sOut;
+                            A.q_stride = kNH * kDH; A.rout_stride = kNH * kNREL;
+                            A.sink_stride = kNH; A.out_stride = kNH * kDH;
+                            A.pos0 = POSB; A.B = Bb; A.is_swa = is_swa; A.n_swa = 1024u;
+                            A.ring_cap = 1025u; A.pad0 = 0;
+                            A.scale = scale; A.log_scale_floor = 8192.0f;
+                            A.log_scale_alpha = 0.25f; A.pad1 = 0;
+                            char nm[64];
+                            snprintf(nm, sizeof(nm), "attn_batch p=%u B=%u swa=%u", POSB, Bb, is_swa);
+                            t_b[si][bi] = timed(nm, [&](id<MTLComputeCommandEncoder> en) {
+                                [en setComputePipelineState:pFB];
+                                [en setBuffer:bScr offset:0 atIndex:0];
+                                [en setBytes:&A length:sizeof(A) atIndex:1];
+                                [en setBuffer:bPk offset:0 atIndex:2];
+                                [en setBuffer:bKvB offset:0 atIndex:3];
+                                [en dispatchThreadgroups:MTLSizeMake(kNH, Bb, 1)
+                                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                            });
+                            snprintf(nm, sizeof(nm), "attn_flash p=%u B=%u swa=%u", POSB, Bb, is_swa);
+                            t_f[si][bi] = timed(nm, [&](id<MTLComputeCommandEncoder> en) {
+                                [en setComputePipelineState:pFF];
+                                [en setBuffer:bScr offset:0 atIndex:0];
+                                [en setBytes:&A length:sizeof(A) atIndex:1];
+                                [en setBuffer:bPk offset:0 atIndex:2];
+                                [en setBuffer:bKvB offset:0 atIndex:3];
+                                [en dispatchThreadgroups:MTLSizeMake(kNH, (Bb + 31u) / 32u, 1)
+                                    threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                            });
+                            // post-timing parity cross-check of the two kernels
+                            const size_t n = (size_t)Bb * kNH * kDH;
+                            std::vector<float> refb(n);
+                            run("k_attn_head_f16_batch", true, kNH, Bb, 32, 1, &A, sizeof(A), bKvB);
+                            memcpy(refb.data(), scr.data() + sOut, n * 4);
+                            std::fill(scr.begin() + sOut, scr.begin() + sOut + n, -9999.0f);
+                            run("k_attn_f16_flash_prefill", true, kNH, (Bb + 31u) / 32u, 32, 4,
+                                &A, sizeof(A), bKvB);
+                            char gn[64];
+                            snprintf(gn, sizeof(gn), "bench flash B=%u swa=%u", Bb, is_swa);
+                            gate(gn, refb.data(), scr.data() + sOut, n, GATE_SG);
+                            bi++;
+                        }
+                        si++;
+                    }
+                    for (int s2 = 0; s2 < 2; s2++)
+                        for (int b2 = 0; b2 < 2; b2++)
+                            printf("SPEEDUP attn_flash vs batch p=%u B=%u is_swa=%u: %.2fx (%.4f vs %.4f ms/iter)\n",
+                                   POSB, b2 ? 32u : 128u, (uint32_t)s2,
+                                   t_b[s2][b2] / t_f[s2][b2], t_f[s2][b2], t_b[s2][b2]);
+                }
+                bKvB = nil;
             }
         }
 

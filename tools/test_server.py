@@ -504,6 +504,8 @@ class BPE:
         return "".join(self.tokens[i] for i in ids
                        if 0 <= i < len(self.tokens)
                        and not (skip_special_tokens and i in self.special_ids))
+    def token_bytes(self, tid):
+        return self.tokens[tid].encode("utf-8")
 
 class StreamDecoder:
     def __init__(self, bpe, skip_special_tokens=True):
@@ -659,6 +661,30 @@ def test_tool_calling(fix):
               len(tcs) == 1 and tcs[0]["function"]["name"] == "run"
               and json.loads(tcs[0]["function"]["arguments"]) == {"cmd": "ls"}, tcs)
         check("tool stream finish tool_calls", last["finish_reason"] == "tool_calls", last)
+        # Thinking must stream live as delta.reasoning_content (never buffered
+        # until the end: a >60s thinking phase would trip stale-stream
+        # watchdogs in clients such as Hermes Agent).
+        rds = [c["choices"][0]["delta"]["reasoning_content"]
+               for c in chunks if c.get("choices")
+               and c["choices"][0]["delta"].get("reasoning_content") is not None]
+        check("tool stream reasoning_content chunks emitted live",
+              len(rds) >= 6, (len(rds), rds))
+        check("tool stream reasoning_content joins intact",
+              "".join(rds) == "need ls", repr("".join(rds)))
+        order = [("r" if c["choices"][0]["delta"].get("reasoning_content") is not None
+                  else "c" if c["choices"][0]["delta"].get("content")
+                  else "-")
+                 for c in chunks if c.get("choices")]
+        check("tool stream reasoning chunks precede content chunks",
+              "r" in order and "c" in order
+              and max(i for i, k in enumerate(order) if k == "r")
+                  < min(i for i, k in enumerate(order) if k == "c"), order)
+        check("tool stream reasoning chunks carry finish_reason null",
+              all(c["choices"][0]["finish_reason"] is None for c in chunks
+                  if c.get("choices")
+                  and c["choices"][0]["delta"].get("reasoning_content") is not None),
+              [c for c in chunks if c.get("choices")
+               and c["choices"][0]["delta"].get("reasoning_content") is not None][:2])
     finally:
         proc.terminate()
         try:
@@ -927,7 +953,7 @@ def test_sse_keepalive(fix):
             '    elif line.startswith("GEN "):\n'
             '        time.sleep(0.15)\n'
             '        sys.stdout.write("TOK 10\\n"); sys.stdout.flush()\n'
-            '        time.sleep(0.15)\n'
+            '        time.sleep(0.45)\n'
             '        for tok in [11, 32]:\n'
             '            sys.stdout.write("TOK %d\\n" % tok)\n'
             '        sys.stdout.write("DONE 2 300.0 stop\\n"); sys.stdout.flush()\n'
@@ -984,6 +1010,204 @@ def test_sse_keepalive(fix):
             proc.kill()
 
 
+# --------------------------------------------------------------------------
+# 7. Thinking tokens stream live as delta.reasoning_content (_make_stream_fn)
+# --------------------------------------------------------------------------
+def test_reasoning_stream(fix):
+    print("[7] Thinking tokens stream live (unit: _make_stream_fn)")
+    import takuan_server
+    ns = {}
+    exec(TOOL_STUB_BPE_SRC, ns)
+    bpe = ns["BPE"]()
+
+    reply = ('<|content_thinking|>need ls<|end_message|>'
+             '<|message_model|><|content_text|>Running tool.<|end_message|>'
+             '<|content_model_end_sampling|>')
+
+    class FakeWorker:
+        def __init__(self, seq):
+            self.seq = seq
+
+        def generate(self, prompt_ids, max_tokens, temperature, top_p,
+                     seed, eos_ids):
+            for tid in self.seq:
+                yield ("tok", tid)
+            yield ("done", len(self.seq), 1.0, "stop")
+
+    events = []
+    run = takuan_server._make_stream_fn(FakeWorker(bpe.encode(reply)),
+                                        bpe, 2048)
+    res = run([0], 512, 1.0, 1.0, 0, [],
+              lambda kind, payload: events.append((kind, payload)),
+              structured=True)
+
+    kinds = [k for k, _ in events]
+    rds = [p for k, p in events if k == "reasoning_delta"]
+    check("thinking yields one reasoning_delta per token (7)",
+          len(rds) == 7, (len(rds), rds))
+    check("reasoning_delta payloads join to thinking text",
+          "".join(rds) == "need ls", repr("".join(rds)))
+    check("all thinking yields precede any text delta (no buffering)",
+          "reasoning_delta" in kinds and "delta" in kinds
+          and max(i for i, k in enumerate(kinds) if k == "reasoning_delta")
+              < min(i for i, k in enumerate(kinds) if k == "delta"),
+          kinds[:14])
+    check("result.reasoning still accumulated for final field",
+          res["reasoning"] == "need ls", res.get("reasoning"))
+    check("result.text unaffected by thinking streaming",
+          res["text"] == "Running tool.", repr(res["text"]))
+    check("finish_reason intact after streaming thinking",
+          res["finish"] == "stop", res["finish"])
+
+    # Plain (non-structured) mode must keep the old no-reasoning behaviour.
+    events2 = []
+    res2 = takuan_server._make_stream_fn(FakeWorker(bpe.encode(reply)),
+                                         bpe, 2048)(
+        [0], 512, 1.0, 1.0, 0, [],
+        lambda kind, payload: events2.append((kind, payload)),
+        structured=False)
+    check("plain mode emits no reasoning_delta",
+          not any(k == "reasoning_delta" for k, _ in events2),
+          [k for k, _ in events2][:8])
+    check("plain mode reasoning stays empty", res2["reasoning"] == "",
+          repr(res2["reasoning"]))
+
+
+# --------------------------------------------------------------------------
+# 8. Client disconnect mid-SSE: the server must cancel the in-flight GEN and
+#    drain stdout to DONE *before* releasing the worker lock, so the very
+#    next request returns ONLY its own tokens (no stale stream, no deadlock).
+# --------------------------------------------------------------------------
+DISCONNECT_MOCK_WORKER = r'''
+import sys, time
+sys.stdout.write("READY vocab=32 ctx=2048\n"); sys.stdout.flush()
+call = 0
+while True:
+    line = sys.stdin.readline()
+    if not line or line.strip() == "QUIT":
+        break
+    parts = line.split()
+    if parts[0] != "GEN":
+        sys.stdout.write("ERR bad_command\n"); sys.stdout.flush(); continue
+    call += 1
+    n = int(parts[1])
+    if call == 1:
+        seq = [16] * 150        # 'q' x150, one every 5 ms (aborted request)
+    else:
+        seq = [25] * 8 + [28]   # 'z' x8 + EOS(28) -> DONE stop
+    emitted = 0
+    for t in seq:
+        if emitted >= n:
+            sys.stdout.write("DONE %d 10.0 length\n" % emitted)
+            sys.stdout.flush(); break
+        sys.stdout.write("TOK %d\n" % t); sys.stdout.flush()
+        emitted += 1
+        time.sleep(0.005)
+    else:
+        sys.stdout.write("DONE %d 10.0 stop\n" % emitted); sys.stdout.flush()
+'''
+
+
+def _sse_abort(base, body, want_chunks):
+    """POST a streaming request over a raw socket, wait for `want_chunks`
+    SSE data events, then close the socket mid-stream (abrupt client
+    disconnect). Returns how many data events were seen before closing."""
+    host, port = base.rsplit("://", 1)[1].rsplit(":", 1)
+    payload = json.dumps(body).encode("utf-8")
+    head = ("POST /v1/chat/completions HTTP/1.1\r\n"
+            "Host: %s\r\nContent-Type: application/json\r\n"
+            "Content-Length: %d\r\nConnection: close\r\n\r\n"
+            % (host, len(payload))).encode("ascii")
+    s = socket.create_connection((host, int(port)), timeout=20)
+    try:
+        s.sendall(head + payload)
+        buf = b""
+        while buf.count(b"data: ") < want_chunks:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        got = buf.count(b"data: ")
+    finally:
+        s.close()  # client aborts mid-stream
+    return got
+
+
+def test_disconnect_drain(fix):
+    print("[8] Client disconnect mid-stream: cancel + drain, next request clean")
+    tmp = tempfile.mkdtemp(prefix="takuan_disc_")
+    mock_py = os.path.join(tmp, "disconnect_worker.py")
+    with open(mock_py, "w") as f:
+        f.write(DISCONNECT_MOCK_WORKER)
+    stub_dir = os.path.join(tmp, "stubpkg")
+    os.makedirs(stub_dir, exist_ok=True)
+    with open(os.path.join(stub_dir, "bpe_gguf.py"), "w") as f:
+        f.write(STUB_BPE_SRC)
+    free = socket.socket()
+    free.bind(("127.0.0.1", 0))
+    port = free.getsockname()[1]
+    free.close()
+    env = dict(os.environ, PYTHONPATH=HERE)
+    boot = ("import sys; sys.path.insert(0, %r); import bpe_gguf; "
+            "import takuan_server; takuan_server.main()" % stub_dir)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", boot,
+         "--worker-cmd", sys.executable + " " + mock_py,
+         "--gguf", os.path.join(fix, "tiny.gguf"),
+         "--port", str(port), "--ctx", "2048"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env, text=True)
+    ready_line = proc.stderr.readline()
+    check("disconnect server starts", "serving" in ready_line, ready_line.strip())
+    base = "http://127.0.0.1:%d" % port
+    try:
+        got = _sse_abort(base, {
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 200, "stream": True}, want_chunks=3)
+        check("aborted stream delivered initial SSE chunks", got >= 3, got)
+
+        # The mock worker is STILL emitting 'q' tokens into the pipe. The
+        # server must cancel it and drain up to DONE before serving again;
+        # a deadlock here would blow the http() 30 s timeout.
+        j = {}
+        try:
+            st, raw, _ = http("POST", base + "/v1/chat/completions", {
+                "messages": [{"role": "user", "content": "again"}],
+                "max_tokens": 20})
+            j = json.loads(raw)
+            content = j["choices"][0]["message"]["content"]
+        except Exception as e:
+            st, content, raw = 0, "", "second request failed: %r" % e
+        check("second request after abort returns 200", st == 200, raw[:200])
+        check("no stale 'q' tokens leak from aborted request",
+              "q" not in content, repr(content))
+        check("second request content is its own stream only",
+              st == 200 and content == "zzzzzzzz"
+              and j["choices"][0]["finish_reason"] == "stop",
+              (repr(content), st == 200 and j["choices"][0].get("finish_reason")))
+
+        # Streaming + stop string right after the abort cycle must also be
+        # clean (drain left the worker exactly at its command prompt).
+        st, raw, ct = http("POST", base + "/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "again"}],
+            "max_tokens": 20, "stream": True, "stop": ["zz"]})
+        evs = sse_events(raw)
+        chunks = [json.loads(e) for e in evs if e != "[DONE]"]
+        text = "".join(c["choices"][0]["delta"].get("content", "")
+                       for c in chunks if c["choices"])
+        finals = [c for c in chunks if c["choices"]]
+        last = finals[-1]["choices"][0] if finals else {}
+        check("post-abort streaming+stop clean",
+              st == 200 and evs and evs[-1] == "[DONE]"
+              and "q" not in text and text == "" and last.get("finish_reason") == "stop",
+              (st, repr(text), last))
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 def main():
     fix = _fixture_dir()
     t0 = time.time()
@@ -993,6 +1217,8 @@ def main():
     test_tool_calling(fix)
     test_prefix_cache(fix)
     test_sse_keepalive(fix)
+    test_reasoning_stream(fix)
+    test_disconnect_drain(fix)
     print("----")
     print("%d passed, %d failed (%.1fs)" % (PASSED, len(FAILED), time.time() - t0))
     if FAILED:

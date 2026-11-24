@@ -299,6 +299,9 @@ class EngineWorker:
         self.cmd = cmd
         self.lock = threading.Lock()
         self._closed = False
+        # Only the real m64run binary understands SIGUSR1 GEN cancellation;
+        # a custom --worker-cmd (tests) may not, so never signal it.
+        self._can_sigusr1 = (worker_cmd is None)
         # stderr is inherited: engine startup logs (pack / resident bytes /
         # arena report) stay visible in the server console.
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
@@ -318,12 +321,18 @@ class EngineWorker:
     def generate(self, prompt_ids, max_tokens, temperature, top_p, seed, eos_ids):
         """Yield ("tok", id) then ("done", n_gen, elapsed_ms, finish_reason).
 
-        The worker lock is held for the whole exchange; abandoning the
-        generator releases it (the worker stays in sync because the caller
-        must drain to DONE — see _iter_events)."""
+        The worker lock is held for the whole exchange. If the consumer
+        abandons the generator mid-stream (client disconnect / stop), the
+        finally below cancels the GEN (SIGUSR1 on the real m64run) and drains
+        stdout up to DONE/ERR *before* releasing the lock, so the worker is
+        back at its command prompt and the pipe never fills up to deadlock.
+        """
         with self.lock:
             if self._closed or self.proc.poll() is not None:
                 raise RuntimeError("worker is not running")
+            pipe = self.proc.stdout
+            if pipe is None:
+                raise RuntimeError("worker has no stdout pipe")
             eos = ",".join(str(i) for i in eos_ids) if eos_ids else "-1"
             line = "GEN %d %s %s %d %s -- %s\n" % (
                 int(max_tokens), repr(float(temperature)), repr(float(top_p)),
@@ -334,21 +343,49 @@ class EngineWorker:
                 self.proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 raise RuntimeError("worker pipe closed")
-            while True:
-                out = self.proc.stdout.readline()
-                if not out:
-                    raise RuntimeError("worker exited mid-generation")
-                parts = out.split()
-                if not parts:
-                    continue
-                if parts[0] == "TOK":
-                    yield ("tok", int(parts[1]))
-                elif parts[0] == "DONE":
-                    yield ("done", int(parts[1]), float(parts[2]), parts[3])
-                    return
-                elif parts[0] == "ERR":
-                    raise RuntimeError("worker error: %s"
-                                       % (parts[1] if len(parts) > 1 else "unknown"))
+            finished = False
+            try:
+                while True:
+                    out = pipe.readline()
+                    if not out:
+                        finished = True  # EOF: nothing left to drain
+                        raise RuntimeError("worker exited mid-generation")
+                    parts = out.split()
+                    if not parts:
+                        continue
+                    if parts[0] == "TOK":
+                        yield ("tok", int(parts[1]))
+                    elif parts[0] == "DONE":
+                        finished = True
+                        yield ("done", int(parts[1]), float(parts[2]), parts[3])
+                        return
+                    elif parts[0] == "ERR":
+                        finished = True
+                        raise RuntimeError("worker error: %s"
+                                           % (parts[1] if len(parts) > 1
+                                              else "unknown"))
+            finally:
+                # Consumer left before DONE/ERR/EOF (GeneratorExit from
+                # gen.close(), or an exception raised out of the loop):
+                # tell the real worker to stop emitting, then consume every
+                # remaining line up to its terminal DONE/ERR, still holding
+                # the lock so the next request never sees stale tokens.
+                if not finished and self.proc.poll() is None:
+                    if self._can_sigusr1:
+                        try:
+                            self.proc.send_signal(signal.SIGUSR1)
+                        except OSError:
+                            pass  # exited in the meantime
+                    while True:
+                        try:
+                            out = pipe.readline()
+                        except (OSError, ValueError):
+                            break
+                        if not out:
+                            break
+                        parts = out.split()
+                        if parts and parts[0] in ("DONE", "ERR"):
+                            break
 
     def warm(self, prompt_ids):
         """Pin a static prefix (tool_declare + system head) in the worker so
@@ -446,7 +483,8 @@ def _parse_tool_invocation(raw_text, header_name):
 def _make_stream_fn(worker, bpe, ctx):
     """Run one generation over EngineWorker events and apply decoding rules.
 
-    yield_fn(kind, payload) is called with kind in {"delta", "tool_call"}.
+    yield_fn(kind, payload) is called with kind in {"delta", "reasoning_delta",
+    "tool_call"}.
     """
     tid_text = bpe.id_of.get("<|content_text|>")
     tid_think = bpe.id_of.get("<|content_thinking|>")
@@ -478,6 +516,15 @@ def _make_stream_fn(worker, bpe, ctx):
             if piece:
                 text.append(piece)
                 yield_fn("delta", piece)
+
+        def emit_reasoning(piece):
+            """Stream thinking tokens out live (like llama.cpp/Splash
+            delta.reasoning_content) so clients never see a dead-air gap >60s
+            while the model is thinking; also accumulate for the final
+            reasoning_content field."""
+            if piece:
+                reasoning.append(piece)
+                yield_fn("reasoning_delta", piece)
 
         def push_text(chunk):
             nonlocal buf, stop_hit
@@ -560,7 +607,7 @@ def _make_stream_fn(worker, bpe, ctx):
                         push_text(tail)
                         flush_text()
                     elif state == "thinking" and tail:
-                        reasoning.append(tail)
+                        emit_reasoning(tail)
                     elif state == "tool_json":
                         finish_tool_segment(tail)
                     reset_seg()
@@ -579,7 +626,7 @@ def _make_stream_fn(worker, bpe, ctx):
                     elif state == "text":
                         push_text(piece)
                     elif state == "thinking":
-                        reasoning.append(piece)
+                        emit_reasoning(piece)
                     elif state == "tool_json":
                         tool_buf.append(piece)
 
@@ -589,7 +636,7 @@ def _make_stream_fn(worker, bpe, ctx):
                 push_text(tail)
                 flush_text()
             elif state == "thinking" and tail:
-                reasoning.append(tail)
+                emit_reasoning(tail)
             elif state == "tool_json":
                 finish_tool_segment(tail)
 
@@ -599,6 +646,13 @@ def _make_stream_fn(worker, bpe, ctx):
                 finish = "tool_calls"
         except _Stop:  # pragma: no cover - client disconnected mid-SSE
             finish = "stop" if stop_hit else ("tool_calls" if tool_calls else "length")
+        finally:
+            # Close the worker generator deterministically on EVERY exit path
+            # (BrokenPipeError/OSError from yield_fn on client disconnect,
+            # _Stop, or any other exception): EngineWorker.generate's finally
+            # then cancels + drains stdout to DONE before the lock is released,
+            # instead of leaving the worker emitting into an unread pipe.
+            gen.close()
         return {
             "text": "".join(text),
             "reasoning": "".join(reasoning),
@@ -873,6 +927,11 @@ class Handler(BaseHTTPRequestHandler):
             def yield_fn(kind, payload):
                 if kind == "delta" and payload:
                     w(chunk_obj({"content": payload} if chat else payload, None))
+                elif kind == "reasoning_delta" and payload and chat:
+                    # OpenAI-compatible thinking stream (same field as
+                    # llama.cpp/Splash): keeps data: chunks flowing while the
+                    # model thinks, so stale-stream watchdogs never fire.
+                    w(chunk_obj({"reasoning_content": payload}, None))
                 elif kind == "tool_call" and chat:
                     idx, tc = payload
                     w(chunk_obj({"tool_calls": [{

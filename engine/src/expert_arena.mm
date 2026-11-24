@@ -251,6 +251,15 @@ bool ExpertArena::create(const ExpertArenaCfg & cfg, std::string & err) {
               " slots; need >= 8 for top-8 MoE)";
         return false;
     }
+    // Slot spacing (exp_stride) must cover every per-layer pack stride, else a
+    // streamed blob would spill into the neighbouring slot.
+    for (size_t l = 0; l < cfg_.layer_stride.size(); l++)
+        if (cfg_.layer_stride[l] > cfg_.exp_stride) {
+            err = "arena: layer " + std::to_string(l) + " pack stride " +
+                  std::to_string(cfg_.layer_stride[l]) + " exceeds slot stride " +
+                  std::to_string(cfg_.exp_stride);
+            return false;
+        }
     if (!arena_.alloc(cfg_.num_slots * cfg_.exp_stride, err)) return false;
     const size_t nkeys = cfg_.layer_base.size() * (size_t)cfg_.n_experts;
     table_.assign(nkeys, -1);
@@ -345,6 +354,9 @@ bool ExpertArena::resolve_batch(int layer, const uint32_t * exps, int n_exps,
     pins.reserve((size_t)n_exps);
     std::vector<PreadPool::Job> jobs;
     jobs.reserve((size_t)n_exps);
+    // Milestone 4B: pack stride may differ per layer (mixed-dtype packs);
+    // arena slot spacing stays fixed at cfg_.exp_stride (= max stride).
+    const uint64_t st = stride_at(layer);
     // Pass 1: hits (touch -> MRU).
     for (int i = 0; i < n_exps; i++) {
         const uint32_t e = exps[i];
@@ -375,7 +387,7 @@ bool ExpertArena::resolve_batch(int layer, const uint32_t * exps, int n_exps,
         tel_.misses++;
         jobs.push_back({arena_.ptr() ? (void *)((uint8_t *)arena_.ptr() + (size_t)s * cfg_.exp_stride)
                                      : nullptr,
-                        cfg_.layer_base[(size_t)layer] + (uint64_t)e * cfg_.exp_stride});
+                        cfg_.layer_base[(size_t)layer] + (uint64_t)e * st});
         pins.push_back((uint32_t)s);
     }
     const int njobs = (int)jobs.size();
@@ -388,7 +400,7 @@ bool ExpertArena::resolve_batch(int layer, const uint32_t * exps, int n_exps,
         std::vector<ExpertArenaSlotRead> mjobs((size_t)njobs);
         for (int i = 0; i < njobs; i++) { mjobs[(size_t)i].dst = (const uint8_t *)jobs[(size_t)i].dst; mjobs[(size_t)i].file_off = jobs[(size_t)i].file_off; }
         std::string merr;
-        ok = mtl_read(mtl_, (const uint8_t *)arena_.ptr(), mjobs, cfg_.exp_stride, &ns, merr);
+        ok = mtl_read(mtl_, (const uint8_t *)arena_.ptr(), mjobs, st, &ns, merr);
         if (!ok) {
             fprintf(stderr, "m64arena: WARNING mtlio read failed (%s); using pread pool\n", merr.c_str());
             ((MtlIo *)mtl_)->buf = nil;  // deactivate for the rest of the run
@@ -398,10 +410,10 @@ bool ExpertArena::resolve_batch(int layer, const uint32_t * exps, int n_exps,
     }
 #endif
     if (!ok) {
-        if (!pool_.read_batch(jobs, cfg_.exp_stride, &ns, err)) return false;
+        if (!pool_.read_batch(jobs, st, &ns, err)) return false;
     }
     tel_.ssd_ns += ns;
-    tel_.ssd_read_bytes += (uint64_t)njobs * cfg_.exp_stride;
+    tel_.ssd_read_bytes += (uint64_t)njobs * st;
     return true;
 }
 

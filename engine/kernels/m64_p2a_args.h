@@ -416,3 +416,37 @@ struct SituF32BatchArgs {
     unsigned int k, npairs;
     float beta, lb, inv_beta, inv_lb;
 };
+
+// ---------------- Milestone 4B: FP32-input decode MoE, Q4_K / Q5_0 / Q5_1 ----------------
+// Batch-8 MoE gate|up GEMV over FP32 activations (no k_quant pass). Weights are
+// PACK Q4_K rows: row bytes = (k/QK_K)*144 (Inkling gate/up: k=2304 -> 9 blocks,
+// 1296 B). Expert exp of slot e: exp_id = sel[e] (SCR uint32), arena slot index
+// slot = wtab_off ? ((const uint *)(SCR + wtab_off))[exp_id] : exp_id, row base
+// = PACK + (up ? woff2 : woff) + (u64)slot * stride + r * row_bytes. Same layout
+// as k_gemv_gateup_batch8: gate rows at woff, up rows at woff2 (row r in both).
+// grid.x = ceil(8*2*nout / 8) threadgroups of 256 (warp per row).
+// Requires woff % 4 == woff2 % 4 == stride % 4 == 0 (uint-4B loads inside the
+// 144 B block; f16 scales are byte-wise). sizeof == 48.
+struct MoeGateUpQ4KF32Args {
+    unsigned long woff, woff2;                  // PACK: Q4_K gate / up rows
+    unsigned int xoff;                          // SCR fp32 activations [k]
+    unsigned int yoff, yoff2;                   // SCR fp32 out [8][nout] (gate/up)
+    unsigned int seloff, wtab_off;              // SCR uint32: router sel / arena slot table (0 = direct)
+    unsigned int nout, k, stride;               // k % 256 == 0; stride = expert blob bytes
+};
+
+// Batch-8 MoE down-proj + weighted reduce over FP32 activations, Q5_0 / Q5_1
+// weights: acc[o] = sum_{e<8} wgt[e] * dot(row o of expert sel[e], h). Row
+// bytes = (k/32)*22 (Q5_0) or (k/32)*24 (Q5_1) (Inkling down: k=1152 -> 36
+// blocks). Arena indirection identical to MoeGateUpQ4KF32Args. Expert loop is
+// e-ascending with plain mul+add (k_gemv_down_reduce8 oracle order); all-8
+// per-row dots are FP32-simd-tree sum-reduce class. grid.x = ceil(nout / 8)
+// threadgroups of 256 (warp per row; all k/32 blocks per row are ushort/byte
+// loads, so Q5_0's 22 B block needs only even PACK offsets). sizeof == 48.
+struct MoeDownQ5F32Args {
+    unsigned long woff;                         // PACK: Q5_0 / Q5_1 down rows
+    unsigned int hoff, accoff;                  // SCR fp32 in [8][k] (expert e row at hoff+e*k) / out [nout]
+    unsigned int wtoff, seloff;                 // SCR fp32 weights [8] / uint32 sel [8]
+    unsigned int wtab_off, pad0;                // SCR uint32 arena slot table (0 = direct)
+    unsigned int nout, k, stride, pad1;         // k % 32 == 0; stride = expert blob bytes
+};

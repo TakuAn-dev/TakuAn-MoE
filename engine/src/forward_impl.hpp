@@ -153,6 +153,16 @@ struct InklingForward::Impl {
         const float *aquery = nullptr;  int nq = 0;   // attn_res_query rows: 3 (swa) / 0 (absent)
         const float *ffn_query = nullptr;
         const uint8_t * experts = nullptr;  // base of 128 experts for this layer
+        // Milestone 4B: per-part MoE dtypes / byte offsets / expert stride
+        // (part: 0=gate, 1=up, 2=down). Uniform Q8_0 packs keep the defaults.
+        DType moe_dt[3] = {DType::Q8_0, DType::Q8_0, DType::Q8_0};
+        uint64_t moe_off[3] = {0ull, (uint64_t)PART_BYTES, 2ull * PART_BYTES};
+        uint64_t moe_stride = 0;  // this layer's pack expert stride (set in init)
+        bool moe_q4k = false;     // gate/up Q4_K + down Q5_0/Q5_1 combo
+        // Milestone 4B fix: Q4_K_S packs store the small dense attn projections
+        // (attn_sink_proj / attn_k_conv_proj / attn_v_conv_proj) as f32 instead of
+        // q8_0. false keeps the legacy q8_0 dispatch (pointer read as Q8_0 blocks).
+        bool wsink_f32 = false, kcovp_f32 = false, vcovp_f32 = false;
     } phys[NPHYS];
     struct LL {
         const float * msgq = nullptr;             // [4][NE] ctrl order Q,K,V,FFN
@@ -241,6 +251,46 @@ struct InklingForward::Impl {
                 y[o] = gemv_q8_0_row_4x8(w + (size_t)o * rbytes, xq_.data(), dx32_.data(), nb);
         };
         if ((size_t)nout * nin >= 200000) pool.run(nout, fn); else fn(0, nout);
+    }
+    // Milestone 4B: expert GEMV for the non-Q8_0 part dtypes. Each output row
+    // is dequantized bit-exactly (dequant.hpp ggml reference ports) into an
+    // f32 row, then dot-producted with a fixed-order 4-accumulator FMA chain.
+    // Rows are partitioned deterministically, so results are run-stable.
+    static size_t quant_row_bytes(DType dt, int nin) {
+        switch (dt) {
+            case DType::Q4_K: return (size_t)(nin / QK_K) * sizeof(BlockQ4_K);
+            case DType::Q5_0: return (size_t)(nin / 32) * sizeof(BlockQ5_0);
+            case DType::Q5_1: return (size_t)(nin / 32) * sizeof(BlockQ5_1);
+            default:          return (size_t)(nin / 32) * 34;  // Q8_0
+        }
+    }
+    void gemv_dq(DType dt, const uint8_t * w, int nout, int nin, const float * x, float * y) {
+        const size_t rb = quant_row_bytes(dt, nin);
+        auto fn = [&](int lo, int hi) {
+            static thread_local std::vector<float> wrow;
+            wrow.resize((size_t)nin);
+            for (int o = lo; o < hi; o++) {
+                dequant_row(dt, w + (size_t)o * rb, wrow.data(), nin);
+                const float * wr = wrow.data();
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                int i = 0;
+                for (; i + 3 < nin; i += 4) {
+                    a0 = fmaf(wr[i], x[i], a0); a1 = fmaf(wr[i+1], x[i+1], a1);
+                    a2 = fmaf(wr[i+2], x[i+2], a2); a3 = fmaf(wr[i+3], x[i+3], a3);
+                }
+                float acc = (a0 + a1) + (a2 + a3);
+                for (; i < nin; i++) acc = fmaf(wr[i], x[i], acc);
+                y[o] = acc;
+            }
+        };
+        if ((size_t)nout * nin >= 200000) pool.run(nout, fn); else fn(0, nout);
+    }
+    // dispatch one MoE part GEMV by its dtype (Q8_0 keeps the exact-oracle
+    // quantized-activation path; Q4_K/Q5_0/Q5_1 use gemv_dq).
+    void gemv_part(const LW & L, const uint8_t * eb, int part, int nout, int nin,
+                   const float * x, float * y) {
+        if (!L.moe_q4k) gemv_q8_0(eb + L.moe_off[part], nout, nin, x, y);
+        else gemv_dq(L.moe_dt[part], eb + L.moe_off[part], nout, nin, x, y);
     }
     // f32 weights: f32 FMA chain (ggml_vec_dot_f32 NEON path = float acc + vfma)
     void gemv_f32(const float * w, int nout, int nin, const float * x, float * y) {
@@ -421,10 +471,11 @@ struct InklingForward::Impl {
 
         for (int i = 0; i < NE; i++) acc[i] = 0.0f;
         for (int i = 0; i < TOPK; i++) {
-            // expert blob stride from the pack header (= 3*part + tail padding)
-            const uint8_t * eb = L.experts + (int64_t)sel[i] * exp_stride;
-            gemv_q8_0(eb, NF, NE, x, gate2.data());
-            gemv_q8_0(eb + PART_BYTES, NF, NE, x, ubuf.data());
+            // expert blob base uses THIS layer's pack stride; parts addressed by
+            // per-part offsets (all_q8 packs: off = {0, PART_BYTES, 2*PART_BYTES}).
+            const uint8_t * eb = L.experts + (int64_t)sel[i] * (int64_t)(L.moe_stride ? L.moe_stride : (uint64_t)exp_stride);
+            gemv_part(L, eb, 0, NF, NE, x, gate2.data());
+            gemv_part(L, eb, 1, NF, NE, x, ubuf.data());
             // situ = [beta*tanh(x*(1/beta))] * sigmoid(x) * [lb*tanh(u*(1/lb))]
             // oracle graph: ggml_scale(x, 1.0f/beta) -> tanh -> ggml_scale(beta); sigmoid = 1/(1+expf(-x))
             const float inv_beta = 1.0f / situ_beta, inv_lb = 1.0f / situ_lb;
@@ -435,7 +486,7 @@ struct InklingForward::Impl {
                 float ulin = situ_lb * tanhf(u * inv_lb);
                 hbuf[f] = act * ulin;
             }
-            gemv_q8_0(eb + 2 * PART_BYTES, NE, NF, hbuf.data(), dbuf.data());
+            gemv_part(L, eb, 2, NE, NF, hbuf.data(), dbuf.data());
             float w = wgt[i];
             for (int e = 0; e < NE; e++) acc[e] = acc[e] + w * dbuf[e];
         }
@@ -563,14 +614,16 @@ struct InklingForward::Impl {
         float * rs_sec = rs.data() + ((size_t)il * CH) * HR;
         const float conv_sc = fa_conv_scale_dyn;
         if (L.wkcovp) {
-            gemv_q8_0(L.wkcovp, 32, NE, ksrc, dynb.data());
+            if (L.kcovp_f32) gemv_f32((const float *)L.wkcovp, 32, NE, ksrc, dynb.data());
+            else gemv_q8_0(L.wkcovp, 32, NE, ksrc, dynb.data());
             conv_slot(rs_sec + (size_t)0 * HR, KVD, K.data(), L.kconv, dynb.data(), KVD / 8, conv_sc, tA.data());
         } else {
             conv_slot(rs_sec + (size_t)0 * HR, KVD, K.data(), L.kconv, nullptr, KVD, 1.0f / sqrtf(5.0f), tA.data());
         }
         std::memcpy(K.data(), tA.data(), KVD * sizeof(float));
         if (L.wvcovp) {
-            gemv_q8_0(L.wvcovp, 32, NE, vsrc, dynb.data());
+            if (L.vcovp_f32) gemv_f32((const float *)L.wvcovp, 32, NE, vsrc, dynb.data());
+            else gemv_q8_0(L.wvcovp, 32, NE, vsrc, dynb.data());
             conv_slot(rs_sec + (size_t)KVD * HR, KVD, V.data(), L.vconv, dynb.data(), KVD / 8, conv_sc, tA.data());
         } else {
             conv_slot(rs_sec + (size_t)KVD * HR, KVD, V.data(), L.vconv, nullptr, KVD, 1.0f / sqrtf(5.0f), tA.data());
@@ -590,7 +643,8 @@ struct InklingForward::Impl {
             for (int i = 0; i < NH * NREL; i++) Rr[i] *= tau_v;
         }
 
-        gemv_q8_0(L.wsink, NH, NE, qsrc, sinkb.data());
+        if (L.wsink_f32) gemv_f32((const float *)L.wsink, NH, NE, qsrc, sinkb.data());
+        else gemv_q8_0(L.wsink, NH, NE, qsrc, sinkb.data());
 
         // write K,V into cache slot (store_kv writes the clipped/normed tensors)
         {
@@ -723,6 +777,14 @@ struct InklingForward::Impl {
     static const uint8_t * q8p(const PackReader & pk, const std::string & n) {
         return (const uint8_t *)pk.ptr(pk.require(n));
     }
+    // Milestone 4B fix: classify a small dense projection tensor: 1=f32, 0=q8_0, -1=bad.
+    static int proj_dt(const PackReader & pk, const std::string & n) {
+        const TensorInfo * t = pk.find(n);
+        if (!t) return -1;
+        if (t->dtype == DType::F32) return 1;
+        if (t->dtype == DType::Q8_0) return 0;
+        return -1;
+    }
 
     bool init(PackReader & pk, int context_len, std::string & err) {
         pack = &pk;
@@ -793,6 +855,7 @@ struct InklingForward::Impl {
         if (!eidx.present || (int)eidx.layer_base.size() != NPHYS || eidx.expert_stride <= 0) {
             err = "init: expert index missing/broken"; return false;
         }
+        exp_stride = eidx.expert_stride;  // baseline; raised to max per-layer stride below
 
         for (int p = 0; p < NPHYS; p++) {
             LW & L = phys[p];
@@ -803,6 +866,11 @@ struct InklingForward::Impl {
             L.wo = q8p(pk, b + "attn_output.weight");
             L.wgate = q8p(pk, b + "attn_gate.weight");
             L.wsink = q8p(pk, b + "attn_sink_proj.weight");
+            {  // Milestone 4B fix: f32-vs-q8_0 dispatch flag (Q4_K_S packs store this as f32).
+                const int dt = proj_dt(pk, b + "attn_sink_proj.weight");
+                if (dt < 0) { err = "init: attn_sink_proj.weight missing/bad dtype (need f32 or q8_0) in " + b; return false; }
+                L.wsink_f32 = dt == 1;
+            }
             L.wrel = q8p(pk, b + "attn_rel.weight");
             L.qclip = f32p(pk, b + "attn_q_clip.weight");
             L.relclip = f32p(pk, b + "attn_rel_clip.weight");
@@ -817,13 +885,35 @@ struct InklingForward::Impl {
             L.ffn_query = f32p(pk, b + "ffn_res_query.weight");
             const TensorInfo * einfo = pk.find(b + "ffn_experts.weight");
             if (!einfo || !einfo->is_expert) { err = "init: missing " + b + "ffn_experts.weight"; return false; }
-            if (einfo->expert_stride != eidx.expert_stride) { err = "init: expert stride mismatch"; return false; }
             if (!einfo->part_gate.empty()) {
                 int64_t gsz = einfo->part_gate[0] * einfo->part_gate[1];
                 if (gsz / 32 * 34 != PART_BYTES) { err = "init: expert part size mismatch"; return false; }
             }
+            {  // Milestone 4B: per-part dtypes / byte offsets / expert stride (mirrors the Metal init).
+                const DType bdt = einfo->dtype;
+                DType dts[3];
+                for (int part = 0; part < 3; part++) dts[part] = einfo->part_dtype(bdt, part);
+                const bool all_q8 = dts[0] == DType::Q8_0 && dts[1] == DType::Q8_0 && dts[2] == DType::Q8_0;
+                const bool q4k_combo = dts[0] == DType::Q4_K && dts[1] == DType::Q4_K &&
+                                       (dts[2] == DType::Q5_0 || dts[2] == DType::Q5_1);
+                if (!all_q8 && !q4k_combo) {
+                    err = "init: unsupported expert part dtype combo in " + b +
+                          " (need all q8_0 or gate/up q4_k + down q5_0/q5_1)"; return false;
+                }
+                L.moe_q4k = q4k_combo;
+                for (int part = 0; part < 3; part++) L.moe_dt[part] = dts[part];
+                if (einfo->part_bytes_gate > 0 && einfo->part_bytes_up > 0 && einfo->part_bytes_down > 0) {
+                    L.moe_off[0] = 0;
+                    L.moe_off[1] = (uint64_t)einfo->part_bytes_gate;
+                    L.moe_off[2] = L.moe_off[1] + (uint64_t)einfo->part_bytes_up;
+                    if (L.moe_off[2] + (uint64_t)einfo->part_bytes_down > (uint64_t)einfo->expert_stride) {
+                        err = "init: expert part bytes exceed expert stride in " + b; return false;
+                    }
+                }
+                L.moe_stride = (uint64_t)einfo->expert_stride;
+                if ((int64_t)L.moe_stride > exp_stride) exp_stride = (int64_t)L.moe_stride;  // = max over layers
+            }
             L.experts = (const uint8_t *)pk.data() + eidx.layer_base[p];
-            exp_stride = eidx.expert_stride;
             bool full = !swa_phys[p];
             L.norm_attn = pk.find(b + "attn_norm.weight") ? f32p(pk, b + "attn_norm.weight") : nullptr;
             L.nq = 0;
@@ -838,6 +928,13 @@ struct InklingForward::Impl {
                 L.norm_v = f32p(pk, b + "attn_v_inp_norm.weight");
                 L.wkcovp = q8p(pk, b + "attn_k_conv_proj.weight");
                 L.wvcovp = q8p(pk, b + "attn_v_conv_proj.weight");
+                {  // f32-vs-q8_0 dispatch flags (Q4_K_S packs store these as f32).
+                    const int dk = proj_dt(pk, b + "attn_k_conv_proj.weight");
+                    const int dv = proj_dt(pk, b + "attn_v_conv_proj.weight");
+                    if (dk < 0 || dv < 0) { err = "init: attn _conv_proj.weight missing/bad dtype (need f32 or q8_0) in " + b; return false; }
+                    L.kcovp_f32 = dk == 1;
+                    L.vcovp_f32 = dv == 1;
+                }
                 if (L.nq != 3) { err = "init: full layer " + std::to_string(p) + " attn_res_query must have 3 queries"; return false; }
             } else {
                 if (!L.norm_attn) { err = "init: swa layer " + std::to_string(p) + " missing attn_norm"; return false; }

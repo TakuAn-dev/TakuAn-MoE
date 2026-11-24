@@ -470,7 +470,7 @@ int main(int argc, char ** argv) {
 
         // ---------------- host mirrors + GPU buffers ----------------
         const uint32_t SCR_F = 1024u << 10;            // 4 MB of floats (33 legacy tests + R4 need >2 MB)
-        const size_t PK_B = 32u * 1024 * 1024;         // 32 MB fake pack
+        const size_t PK_B = 96u * 1024 * 1024;         // 96 MB fake pack (legacy Q8 blobs + M4B Q4_K/Q5 arenas)
         std::vector<float> scr(SCR_F, 0.f);
         std::vector<uint8_t> pk(PK_B, 0);
         id<MTLBuffer> bScr = [rt.device() newBufferWithLength:SCR_F * 4 options:MTLResourceStorageModeShared];
@@ -1653,6 +1653,318 @@ int main(int argc, char ** argv) {
                 CHECK(pass, "attn_f16 swa_ring rel=%.3g mad=%.3g cos=%.8f", rel, mad, cosv);
                 printf("attn_f16 swa_ring p=1099 rel=%.3g mad=%.3g cos=%.8f %s\n",
                        rel, mad, cosv, pass ? "OK" : "FAIL");
+            }
+        }
+
+        // ============ Milestone 4B: decode Q4_K / Q5_0 / Q5_1 (FP32-input MoE) ============
+        // Host oracles dequantize bit-exactly per engine/src/dequant.hpp (q4_K get_scale_min_k4
+        // + interleaved qs; q5_0/qh, q5_1/m) and accumulate in FP64. The kernels reduce over a
+        // 32-lane simd_sum tree, so the gate is the 1024-ulp fp64 bound (same policy as test 23).
+        {
+            auto hbits = [](float x) { __fp16 h = (__fp16)x; uint16_t v; memcpy(&v, &h, 2); return v; };
+            auto w16 = [&](size_t off, uint16_t hv) { pk[off] = (uint8_t)hv; pk[off + 1] = (uint8_t)(hv >> 8); };
+            auto w32 = [&](size_t off, uint32_t v) { pk[off] = (uint8_t)v; pk[off + 1] = (uint8_t)(v >> 8); pk[off + 2] = (uint8_t)(v >> 16); pk[off + 3] = (uint8_t)(v >> 24); };
+            const uint32_t NB4 = 9u, NO4 = 1152u;                    // gateup: 9 Q4_K blocks/row, Inkling nout
+            const uint32_t NB5 = 36u, NO5 = 2304u;                   // down:   36 Q5 blocks/row, Inkling nout
+
+            // ---- q4_K writer: 256 values -> one 144 B block (d/dmin/scales/qs per dequant.hpp layout) ----
+            auto fill_q4k = [&](size_t off, const float * v, int tag) {
+                float bmn[8], bmx[8];
+                for (int j = 0; j < 8; j++) {
+                    bmn[j] = v[j * 32]; bmx[j] = v[j * 32];
+                    for (int i = 1; i < 32; i++) { float x = v[j * 32 + i]; if (x < bmn[j]) bmn[j] = x; if (x > bmx[j]) bmx[j] = x; }
+                }
+                float dmax = 0.0f;
+                for (int j = 0; j < 8; j++) dmax = std::max(dmax, (bmx[j] - bmn[j]) / 15.0f);
+                float dval = dmax > 0.0f ? dmax : 1.0f;
+                float dmval = (tag & 1) ? R.f(-0.0003f, 0.0003f) : 0.0f;
+                w16(off, hbits(dval)); w16(off + 2, hbits(dmval));
+                int sc8[8], mn8[8];
+                for (int j = 0; j < 8; j++) {
+                    double s = dmval != 0.0f ? std::rint((double)(bmn[j] / dmval)) : 0.0;
+                    // sc8 <=15: scales fit the 4-bit word slot the decoders read (realistic q4_K)
+                    sc8[j] = (int)std::max(0.0, std::min(15.0, std::rint((double)((bmx[j] - bmn[j]) / 15.0f / dval))));
+                    mn8[j] = (int)std::max(0.0, std::min(15.0, s));   // <16 keeps the q[j-0]-quirk decoders bit-agreeing (see sm4k)
+                }
+                uint8_t scb[12];
+                memset(scb, 0, 12);
+                // Writer <-> dequant.hpp:80-87 decoder, valid because sc8/mn8 <= 15 here:
+                //   j<4:  d = scb[j]&63, m = scb[j+4]&63
+                //   j>=4: d = scb[j+4]&0xF (hi2 bits of scb[j-4] = 0), m = scb[j+4]>>4 (hi2 bits of scb[j] = 0)
+                for (int j = 0; j < 4; j++) { scb[j] = (uint8_t)sc8[j]; scb[j + 4] = (uint8_t)mn8[j]; }
+                for (int j = 4; j < 8; j++) scb[j + 4] = (uint8_t)((sc8[j] & 0xF) | ((mn8[j] & 0xF) << 4));
+                uint8_t code[256];
+                for (int j = 0; j < 8; j++) {
+                    float step = dval * (float)sc8[j];
+                    for (int i = 0; i < 32; i++) {
+                        double c = step != 0.0f ? std::rint((double)((v[j * 32 + i] - dmval * (float)mn8[j]) / step)) : 0.0;
+                        code[j * 32 + i] = (uint8_t)std::max(0.0, std::min(15.0, c));
+                    }
+                }
+                for (int j = 0; j < 12; j++) pk[off + 4 + (size_t)j] = scb[j];
+                for (int c = 0; c < 4; c++) for (int l = 0; l < 32; l++)
+                    pk[off + 16 + (size_t)c * 32 + l] = (uint8_t)(code[c * 64 + l] | (code[c * 64 + 32 + l] << 4));
+            };
+            // ---- q5 writer: 32 values -> one 22 B (Q5_0) / 24 B (Q5_1) block ----
+            auto fill_q5 = [&](size_t off, const float * v, bool q51) {
+                float mn = v[0], mx = v[0];
+                for (int i = 1; i < 32; i++) { if (v[i] < mn) mn = v[i]; if (v[i] > mx) mx = v[i]; }
+                float d = (mx - mn) / 31.0f, m = q51 ? mn : 0.0f;
+                if (d == 0.0f) d = 1.0f;
+                w16(off, hbits(d));
+                uint32_t qh = 0;
+                uint8_t qs[16], code[32];
+                for (int i = 0; i < 32; i++) {
+                    double c = std::rint((double)((v[i] - m) / d));
+                    code[i] = (uint8_t)std::max(0.0, std::min(31.0, c));
+                }
+                for (int i = 0; i < 16; i++) {
+                    qs[i] = (uint8_t)((code[i] & 0xF) | ((code[16 + i] & 0xF) << 4));
+                    qh |= (uint32_t)((code[i] >> 4) & 1) << (uint32_t)i;
+                    qh |= (uint32_t)((code[16 + i] >> 4) & 1) << (uint32_t)(16 + i);
+                }
+                if (q51) w16(off + 2, hbits(m));
+                w32(off + (q51 ? 4 : 2), qh);
+                for (int i = 0; i < 16; i++) pk[off + (q51 ? 8 : 6) + (size_t)i] = qs[i];
+            };
+            // ---- FP64 oracles (dequant math mirrors dequant.hpp references line-for-line) ----
+            auto sm4k = [](const uint8_t * q, int j, double & D, double & M) {
+                if (j < 4) { D = q[j] & 63; M = q[j + 4] & 63; }
+                else { D = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); M = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+            };
+            struct Dot { double a, sab; };
+            auto dot_q4k = [&](size_t row, const float * x) {
+                double a = 0, sa = 0;
+                for (int s = 0; s < 36; s++) {
+                    const uint8_t * p = pk.data() + row + (size_t)(s >> 2) * 144;
+                    double d = f16le(p), dm = f16le(p + 2), d1, m1, d2, m2;
+                    sm4k(p + 4, 2 * (s & 3), d1, m1); sm4k(p + 4, 2 * (s & 3) + 1, d2, m2);
+                    d1 *= d; m1 *= dm; d2 *= d; m2 *= dm;
+                    for (int l = 0; l < 32; l++) {
+                        uint8_t qv = p[16 + (s & 3) * 32 + l];
+                        double w0 = d1 * (qv & 0xF) - m1, w1 = d2 * (qv >> 4) - m2;
+                        a += w0 * (double)x[s * 64 + l]; sa += std::fabs(w0) * std::fabs(x[s * 64 + l]);
+                        a += w1 * (double)x[s * 64 + 32 + l]; sa += std::fabs(w1) * std::fabs(x[s * 64 + 32 + l]);
+                    }
+                }
+                return Dot{a, sa};
+            };
+            auto dot_q5 = [&](size_t row, const float * x, bool q51) {
+                double a = 0, sa = 0;
+                for (int b = 0; b < 36; b++) {
+                    const uint8_t * p = pk.data() + row + (size_t)b * (q51 ? 24 : 22);
+                    double d = f16le(p), m = q51 ? f16le(p + 2) : 0.0;
+                    uint32_t qh = (uint32_t)p[q51 ? 4 : 2] | ((uint32_t)p[q51 ? 5 : 3] << 8) | ((uint32_t)p[q51 ? 6 : 4] << 16) | ((uint32_t)p[q51 ? 7 : 5] << 24);
+                    for (int j = 0; j < 16; j++) {
+                        uint8_t qv = p[(q51 ? 8 : 6) + j];
+                        int x0 = (qv & 0xF) | (((qh >> j) << 4) & 0x10), x1 = (qv >> 4) | ((qh >> (j + 12)) & 0x10);
+                        double w0, w1;
+                        if (q51) { w0 = x0 * d + m; w1 = x1 * d + m; }
+                        else { w0 = (x0 - 16) * d; w1 = (x1 - 16) * d; }
+                        a += w0 * (double)x[b * 32 + j]; sa += std::fabs(w0) * std::fabs(x[b * 32 + j]);
+                        a += w1 * (double)x[b * 32 + 16 + j]; sa += std::fabs(w1) * std::fabs(x[b * 32 + 16 + j]);
+                    }
+                }
+                return Dot{a, sa};
+            };
+            const double EPSF = 1.1920928955078125e-7;
+            auto gate = [&](const char * name, const std::vector<Dot> & ref, uint32_t off, size_t n) {
+                const float * got = scr.data() + off;
+                double worst = 0.0; size_t widx = 0; size_t bad = 0;
+                for (size_t i = 0; i < n; i++) {
+                    double bnd = 1e-4 * std::fabs(ref[i].a) + 1024.0 * EPSF * ref[i].sab;
+                    double dl = std::fabs((double)got[i] - ref[i].a);
+                    if (bnd == 0.0) { if (got[i] != 0.0f) bad++; continue; }
+                    if (dl / bnd > worst) { worst = dl / bnd; widx = i; }
+                    if (dl > bnd) bad++;
+                }
+                CHECK(bad == 0, "%s %zu/%zu over 1024-ulp bound (worst %.1f @ %zu)", name, bad, n, worst, widx);
+                if (bad && getenv("M64_DUMP")) {
+                    for (size_t i = 0; i < n; i++) {
+                        double bnd = 1e-4 * std::fabs(ref[i].a) + 1024.0 * EPSF * ref[i].sab;
+                        if (std::fabs((double)got[i] - ref[i].a) > bnd) {
+                            printf("DUMP %s i=%zu ref=%.9g got=%.9g\n", name, i, ref[i].a, got[i]);
+                            fflush(stdout);
+                            break;
+                        }
+                    }
+                }
+                printf("%-38s ulp-gated %zu rows %s (worst %.2f bound)\n", name, n, bad ? "FAIL" : "OK", worst);
+            };
+
+            uint32_t ssel = seg(8u);
+            uint32_t * sel = (uint32_t *)(scr.data() + ssel);
+            const uint32_t expids[8] = {2300u, 0u, 7u, 123u, 8u, 255u, 1400u, 1401u};
+            const uint32_t modsel8[8] = {4u, 0u, 7u, 3u, 0u, 7u, 0u, 1u};   // expids[e] % 8
+            for (uint32_t e = 0; e < 8u; e++) if (expids[e] % 8u != modsel8[e]) { fprintf(stderr, "modsel8 mismatch\n"); return 2; }
+            for (uint32_t e = 0; e < 8u; e++) sel[e] = e;   // direct mode: blob index = sel (only 8 blobs filled)
+            uint32_t swtab = seg(1024u);
+            uint32_t * wt = (uint32_t *)(scr.data() + swtab);
+            auto set_sel = [&](const uint32_t * v) { for (uint32_t e = 0; e < 8u; e++) sel[e] = v[e]; };
+
+            uint32_t sx = seg(2304u), sh = seg(8u * 1152u);
+            float * x = scr.data() + sx, * h = scr.data() + sh;
+            for (uint32_t i = 0; i < 2304u; i++) x[i] = R.f(-3.0f, 3.0f);
+            // per-expert h rows (k_gemv_down_reduce8_q5_* consumes SCR[hoff + e*k])
+            for (uint32_t i = 0; i < 8u * 1152u; i++) h[i] = R.f(-2.0f, 2.0f);
+
+            size_t wgt = psegs((size_t)8 * NO4 * NB4 * 144), wup = psegs((size_t)8 * NO4 * NB4 * 144);
+            float v4[256], v5[32];
+            for (uint32_t e = 0; e < 8u; e++) for (uint32_t r = 0; r < NO4; r++) for (uint32_t b = 0; b < NB4; b++) {
+                for (int i = 0; i < 256; i++) v4[i] = R.f(-0.4f, 0.4f);
+                fill_q4k(wgt + ((size_t)e * NO4 + r) * NB4 * 144 + (size_t)b * 144, v4, (int)((e + r + b) & 1));
+                for (int i = 0; i < 256; i++) v4[i] = R.f(-0.4f, 0.4f);
+                fill_q4k(wup + ((size_t)e * NO4 + r) * NB4 * 144 + (size_t)b * 144, v4, (int)(r & 1));
+            }
+            uint32_t sgy = seg(8u * NO4), suy = seg(8u * NO4);
+
+            // Test 39: k_gemv_gateup_batch8_q4k_f32in, Inkling dims (k=2304, nout=1152), direct
+            {
+                MoeGateUpQ4KF32Args A{};
+                A.woff = wgt; A.woff2 = wup; A.xoff = sx; A.yoff = sgy; A.yoff2 = suy;
+                A.seloff = ssel; A.wtab_off = 0u; A.nout = NO4; A.k = 2304u; A.stride = NO4 * NB4 * 144u;
+                run("k_gemv_gateup_batch8_q4k_f32in", true, 8u * 2u * NO4 / 8u, 1, 256, &A, sizeof(A));
+                std::vector<Dot> rg(8 * NO4), ru(8 * NO4);
+                for (uint32_t e = 0; e < 8u; e++) for (uint32_t r = 0; r < NO4; r++) {
+                    rg[e * NO4 + r] = dot_q4k(wgt + (size_t)e * (NO4 * NB4 * 144) + (size_t)r * NB4 * 144, x);
+                    ru[e * NO4 + r] = dot_q4k(wup + (size_t)e * (NO4 * NB4 * 144) + (size_t)r * NB4 * 144, x);
+                }
+                gate("gateup_batch8_q4k_f32in gate", rg, sgy, 8 * NO4);
+                gate("gateup_batch8_q4k_f32in up", ru, suy, 8 * NO4);
+            }
+
+            // Test 40: same output via wtab arena indirection -> must be BITWISE equal (same
+            // blobs reached through expert-id -> slot mapping with out-of-order slots)
+            {
+                uint32_t modsel[8];
+                for (uint32_t e = 0; e < 8u; e++) { wt[e] = e; modsel[e] = expids[e] % 8u; }
+                for (uint32_t s = 8u; s < 1024u; s++) wt[s] = 0u;
+                for (uint32_t e = 0; e < 8u; e++) wt[expids[e]] = modsel[e];
+                set_sel(expids);
+                MoeGateUpQ4KF32Args A{};
+                A.woff = wgt; A.woff2 = wup; A.xoff = sx; A.yoff = sgy; A.yoff2 = suy;
+                A.seloff = ssel; A.wtab_off = swtab; A.nout = NO4; A.k = 2304u; A.stride = NO4 * NB4 * 144u;
+                run("k_gemv_gateup_batch8_q4k_f32in", true, 8u * 2u * NO4 / 8u, 1, 256, &A, sizeof(A));
+                set_sel(modsel);
+                MoeGateUpQ4KF32Args B = A; B.wtab_off = 0u;
+                uint32_t sgy2 = seg(8u * NO4), suy2 = seg(8u * NO4);
+                B.yoff = sgy2; B.yoff2 = suy2;
+                run("k_gemv_gateup_batch8_q4k_f32in", true, 8u * 2u * NO4 / 8u, 1, 256, &B, sizeof(B));
+                int bad = 0;
+                for (uint32_t e = 0; e < 8u; e++) for (uint32_t r = 0; r < NO4; r++) {
+                    if (scr[sgy + e * NO4 + r] != scr[sgy2 + e * NO4 + r]) bad++;
+                    if (scr[suy + e * NO4 + r] != scr[suy2 + e * NO4 + r]) bad++;
+                }
+                CHECK(bad == 0, "gateup q4k wtab vs direct %d bitwise mismatches", bad);
+                printf("%-38s wtab == direct bitwise %s\n", "gateup_batch8_q4k_f32in wtab", bad ? "FAIL" : "OK");
+            }
+
+            // Test 41: edge nout 55/173 with wtab (small 16-blob arena: slot count bounded by pool)
+            {
+                const uint32_t NE = 16u;
+                size_t eg = psegs((size_t)NE * 64 * NB4 * 144), eu = psegs((size_t)NE * 64 * NB4 * 144);
+                for (uint32_t s = 0; s < NE; s++) for (uint32_t r = 0; r < 64; r++) for (uint32_t b = 0; b < NB4; b++) {
+                    for (int i = 0; i < 256; i++) v4[i] = R.f(-0.4f, 0.4f);
+                    fill_q4k(eg + ((size_t)s * 64 + r) * NB4 * 144 + (size_t)b * 144, v4, (int)(r & 1));
+                    for (int i = 0; i < 256; i++) v4[i] = R.f(-0.4f, 0.4f);
+                    fill_q4k(eu + ((size_t)s * 64 + r) * NB4 * 144 + (size_t)b * 144, v4, 0);
+                }
+                uint32_t slots[8] = {15u, 0u, 3u, 15u, 1u, 7u, 7u, 14u};
+                for (uint32_t s = 0; s < 1024u; s++) wt[s] = 0u;
+                for (uint32_t e = 0; e < 8u; e++) wt[expids[e]] = slots[e];
+                set_sel(expids);   // wtab path: exp_id -> slot via wt[]
+                for (uint32_t nout : {55u, 173u}) {
+                    uint32_t ey = seg(8u * nout), euY = seg(8u * nout);
+                    MoeGateUpQ4KF32Args A{};
+                    A.woff = eg; A.woff2 = eu; A.xoff = sx; A.yoff = ey; A.yoff2 = euY;
+                    A.seloff = ssel; A.wtab_off = swtab; A.nout = nout; A.k = 2304u; A.stride = 64 * NB4 * 144u;
+                    run("k_gemv_gateup_batch8_q4k_f32in", true, (8u * 2u * nout + 7u) / 8u, 1, 256, &A, sizeof(A));
+                    std::vector<Dot> rg(8 * nout), ru(8 * nout);
+                    for (uint32_t e = 0; e < 8u; e++) for (uint32_t r = 0; r < nout; r++) {
+                        rg[e * nout + r] = dot_q4k(eg + (size_t)slots[e] * (64 * NB4 * 144) + (size_t)r * NB4 * 144, x);
+                        ru[e * nout + r] = dot_q4k(eu + (size_t)slots[e] * (64 * NB4 * 144) + (size_t)r * NB4 * 144, x);
+                    }
+                    char nm[64];
+                    snprintf(nm, sizeof(nm), "gateup q4k edge nout=%u wtab g", nout); gate(nm, rg, ey, 8 * nout);
+                    snprintf(nm, sizeof(nm), "gateup q4k edge nout=%u wtab u", nout); gate(nm, ru, euY, 8 * nout);
+                }
+            }
+
+            // ---- Q5 blobs: one arena reused by Q5_0 then Q5_1 data ----
+            size_t wdn = psegs((size_t)8 * NO5 * NB5 * 24);
+            uint32_t sacc = seg(NO5);
+            uint32_t swt = seg(8u);
+            float * wts = scr.data() + swt;
+            auto run_down = [&](bool q51, uint32_t nout, uint32_t wtab_on, const uint32_t * slots) {
+                for (uint32_t e = 0; e < 8u; e++)
+                    sel[e] = wtab_on ? expids[e] : e;   // direct: blob index = sel
+                for (uint32_t e = 0; e < 8u; e++) wts[e] = R.f(-1.5f, 1.5f);
+                if (slots) wts[2] = 0.0f;                          // zero-weight item must drop out
+                MoeDownQ5F32Args A{};
+                A.woff = wdn; A.hoff = sh; A.accoff = sacc; A.wtoff = swt; A.seloff = ssel;
+                A.wtab_off = wtab_on ? swtab : 0u; A.nout = nout; A.k = 1152u;
+                A.stride = (size_t)NO5 * NB5 * (q51 ? 24 : 22);
+                run(q51 ? "k_gemv_down_reduce8_q5_1_f32in" : "k_gemv_down_reduce8_q5_0_f32in",
+                    true, (nout + 7u) / 8u, 1, 256, &A, sizeof(A));
+                std::vector<Dot> ref(nout);
+                for (uint32_t r = 0; r < nout; r++) {
+                    double a = 0, sa = 0;
+                    for (uint32_t e = 0; e < 8u; e++) {
+                        uint32_t slot = slots ? slots[e] : e;
+                        Dot d = dot_q5(wdn + (size_t)slot * (NO5 * NB5 * (q51 ? 24 : 22)) + (size_t)r * NB5 * (q51 ? 24 : 22), h + (size_t)e * 1152u, q51);
+                        a += (double)wts[e] * d.a; sa += std::fabs(wts[e]) * d.sab;   // oracle: acc + w*dbuf, e-ascending
+                    }
+                    ref[r] = Dot{a, sa};
+                }
+                char nm[64];
+                snprintf(nm, sizeof(nm), "down %s nout=%u %s", q51 ? "q5_1" : "q5_0", nout, wtab_on ? "wtab" : "direct");
+                gate(nm, ref, sacc, nout);
+            };
+            auto fill_q5_blobs = [&](bool q51) {
+                const uint32_t nexp = 8u;
+                for (uint32_t s = 0; s < nexp; s++) for (uint32_t r = 0; r < NO5; r++) {
+                    for (uint32_t b = 0; b < NB5; b++) {
+                        for (int i = 0; i < 32; i++) v5[i] = R.f(-0.3f, 0.3f);
+                        fill_q5(wdn + (size_t)s * (NO5 * NB5 * (q51 ? 24 : 22)) + (size_t)r * NB5 * (q51 ? 24 : 22) + (size_t)b * (q51 ? 24 : 22), v5, q51);
+                    }
+                }
+            };
+
+            // Test 42: down Q5_0, Inkling dims (k=1152, nout=2304), direct
+            fill_q5_blobs(false);
+            run_down(false, NO5, 0, nullptr);
+
+            // Test 43: down Q5_0 edge nout=173, direct (odd tail rows)
+            run_down(false, 173u, 0, nullptr);
+
+            // Test 44: down Q5_1, Inkling dims direct
+            fill_q5_blobs(true);
+            run_down(true, NO5, 0, nullptr);
+
+            // Test 45: down Q5_1 edge nout=100 + wtab + zero-weight experts (slots inside the 8-blob arena)
+            {
+                const uint32_t slots[8] = {7u, 0u, 3u, 7u, 1u, 5u, 6u, 4u};
+                for (uint32_t s = 0; s < 1024u; s++) wt[s] = 0u;
+                for (uint32_t e = 0; e < 8u; e++) wt[expids[e]] = slots[e];
+                set_sel(expids);
+                run_down(true, 100u, 1, slots);
+                set_sel(modsel8);
+            }
+
+            // Test 46: zero activations -> exact zero outputs (guards the bnd==0 path)
+            {
+                std::vector<float> save(8 * 1152);
+                memcpy(save.data(), h, 8u * 1152u * 4);
+                memset(h, 0, 8u * 1152u * 4);
+                MoeDownQ5F32Args A{};
+                A.woff = wdn; A.hoff = sh; A.accoff = sacc; A.wtoff = swt; A.seloff = ssel;
+                A.wtab_off = 0u; A.nout = NO5; A.k = 1152u; A.stride = (size_t)NO5 * NB5 * 24;
+                run("k_gemv_down_reduce8_q5_1_f32in", true, NO5 / 8u, 1, 256, &A, sizeof(A));
+                int bad = 0;
+                for (uint32_t r = 0; r < NO5; r++) if (scr[sacc + r] != 0.0f) bad++;
+                CHECK(bad == 0, "down q5_1 zero-x %d nonzero outputs", bad);
+                printf("%-38s zero-x bitwise %s\n", "down_reduce8_q5_1_f32in zero-x", bad ? "FAIL" : "OK");
+                memcpy(h, save.data(), 8u * 1152u * 4);
             }
         }
 

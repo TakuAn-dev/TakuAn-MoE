@@ -29,7 +29,9 @@ GPU_ALIGN = 1 << 14               # 16 KiB gpu/expert tensor alignment
 
 # ggml dtype ids mirrored from tools/m64pack.py DTYPES
 DT_F32, DT_F16, DT_Q8_0, DT_Q8_1, DT_BF16 = 0, 1, 8, 9, 30
-DT_NAME = {DT_F32: "f32", DT_F16: "f16", DT_Q8_0: "q8_0", DT_Q8_1: "q8_1", DT_BF16: "bf16"}
+DT_Q5_0, DT_Q5_1, DT_Q4_K = 6, 7, 12
+DT_NAME = {DT_F32: "f32", DT_F16: "f16", DT_Q8_0: "q8_0", DT_Q8_1: "q8_1", DT_BF16: "bf16",
+           DT_Q5_0: "q5_0", DT_Q5_1: "q5_1", DT_Q4_K: "q4_k"}
 
 
 # ------------------------------------------------------------------ tokenizer
@@ -58,7 +60,8 @@ TOKENS += [_b2u()[0xE3], _b2u()[0x81], _b2u()[0x82]]  # 'あ' split across 3 ids
 TOKENS += ["<|eos|>"]
 TOKEN_TYPES = [1] * (len(TOKENS) - 1) + [3]           # GGUF CONTROL on last id
 EOS_TOKEN_ID = len(TOKENS) - 1
-DT_BLOCK = {DT_F32: (1, 4), DT_F16: (1, 2), DT_Q8_0: (32, 34), DT_Q8_1: (32, 36), DT_BF16: (1, 2)}
+DT_BLOCK = {DT_F32: (1, 4), DT_F16: (1, 2), DT_Q8_0: (32, 34), DT_Q8_1: (32, 36), DT_BF16: (1, 2),
+            DT_Q5_0: (32, 22), DT_Q5_1: (32, 24), DT_Q4_K: (256, 144)}
 
 
 def f32(x):
@@ -223,6 +226,56 @@ def deq_row(dt, raw, nvals):
                 q = raw[b * 36 + 4 + j]
                 q = q - 256 if q >= 128 else q
                 out.append(f32(d * q - m))
+    elif dt == DT_Q4_K:
+        for b in range(len(raw) // 144):
+            o = b * 144
+            d = f16_val(struct.unpack_from("<H", raw, o)[0])
+            mn = f16_val(struct.unpack_from("<H", raw, o + 2)[0])
+            sc = raw[o + 4:o + 16]
+            def gsm(j):  # get_scale_min_k4
+                if j < 4:
+                    return sc[j] & 63, sc[j + 4] & 63
+                return ((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4),
+                        (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4))
+            qo = o + 16
+            for jj in range(4):           # 4 x 64 elements
+                sc1, m1i = gsm(2 * jj)
+                sc2, m2i = gsm(2 * jj + 1)
+                d1 = f32(d * sc1); m1 = f32(mn * m1i)
+                d2 = f32(d * sc2); m2 = f32(mn * m2i)
+                for l in range(32):
+                    out.append(f32(f32(d1 * (raw[qo + 32 * jj + l] & 0xF)) - m1))
+                for l in range(32):
+                    out.append(f32(f32(d2 * (raw[qo + 32 * jj + l] >> 4)) - m2))
+    elif dt == DT_Q5_0:
+        for b in range(len(raw) // 22):
+            o = b * 22
+            d = f16_val(struct.unpack_from("<H", raw, o)[0])
+            qh = int.from_bytes(raw[o + 2:o + 6], "little")
+            lo, hi = [], []
+            for j in range(16):
+                xh0 = ((qh >> (j + 0)) << 4) & 0x10
+                xh1 = (qh >> (j + 12)) & 0x10
+                qs = raw[o + 6 + j]
+                lo.append(((qs & 0xF) | xh0) - 16)
+                hi.append(((qs >> 4) | xh1) - 16)
+            for v in lo + hi:
+                out.append(f32(v * d))
+    elif dt == DT_Q5_1:
+        for b in range(len(raw) // 24):
+            o = b * 24
+            d = f16_val(struct.unpack_from("<H", raw, o)[0])
+            m = f16_val(struct.unpack_from("<H", raw, o + 2)[0])
+            qh = int.from_bytes(raw[o + 4:o + 8], "little")
+            lo, hi = [], []
+            for j in range(16):
+                xh0 = ((qh >> (j + 0)) << 4) & 0x10
+                xh1 = (qh >> (j + 12)) & 0x10
+                qs = raw[o + 8 + j]
+                lo.append((qs & 0xF) | xh0)
+                hi.append((qs >> 4) | xh1)
+            for v in lo + hi:
+                out.append(f32(f32(v * d) + m))
     else:
         raise ValueError(f"unsupported golden dtype {dt}")
     assert len(out) >= nvals
@@ -478,6 +531,19 @@ def write_pack(path, tensors, gguf_path):
 
 
 # ------------------------------------------------------------------ golden from fixture
+def _synth_blocks(rng, ts, f16_offs, nblocks):
+    """Random block bytes with finite f16 fields (exponent masked < 0x7C00 so
+    no NaN/Inf — the bitwise golden compare must stay deterministic)."""
+    out = bytearray()
+    for _ in range(nblocks):
+        blk = bytearray(rng.getrandbits(8) for _ in range(ts))
+        for off in f16_offs:
+            bits = (rng.getrandbits(1) << 15) | (rng.randrange(0x1F) << 10) | rng.getrandbits(10)
+            blk[off], blk[off + 1] = bits & 0xFF, (bits >> 8) & 0xFF
+        out += blk
+    return bytes(out)
+
+
 def write_golden(path, tensors):
     g = GoldenWriter()
     raws = {t["name"]: tensor_bytes(t) for t in tensors}
@@ -495,6 +561,14 @@ def write_golden(path, tensors):
     for e in range(2):
         g.emit(f"blk.0.ffn_gate_up_exps.weight#{e}", DT_Q8_1,
                gu[e * 2 * gate_bytes: e * 2 * gate_bytes + gate_bytes], 4 * 32)
+    # Synthetic raw-block records for the Milestone 4A dtypes: the raw bytes need
+    # not come from real tensors — test_dequant re-dequantizes them with the C++
+    # reference and compares bitwise. This covers q4_k/q5_0/q5_1 dispatch under
+    # `make test` without changing the m64run-facing tiny.m64pack layout at all.
+    rng = random.Random(4604)
+    g.emit("synth.q4_k", DT_Q4_K, _synth_blocks(rng, 144, (0, 2), 8), 8 * 256)
+    g.emit("synth.q5_0", DT_Q5_0, _synth_blocks(rng, 22, (0,), 8), 8 * 32)
+    g.emit("synth.q5_1", DT_Q5_1, _synth_blocks(rng, 24, (0, 2), 8), 8 * 32)
     g.write(path)
     return g.count
 

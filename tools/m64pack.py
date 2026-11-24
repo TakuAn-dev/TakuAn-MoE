@@ -309,7 +309,11 @@ class SfInput:
 import numpy as np
 
 def dequant_blocks(dt, raw):
-    """Bit-exact ggml dequant for f32/f16/bf16/q8_0/q8_1 blocks; other dtypes unsupported."""
+    """Bit-exact ggml dequant for f32/f16/bf16/q8_0/q8_1/q4_k/q5_0/q5_1 blocks.
+
+    All arithmetic stays in float32 with one IEEE op per C++ expression
+    (engine/src/dequant.hpp is compiled with -ffp-contract=off), so results
+    are bitwise identical to the C++ reference for the same block bytes."""
     name, bs, ts = DTYPES[dt]
     if name == "f32":
         return np.frombuffer(raw, dtype="<f4")
@@ -331,6 +335,57 @@ def dequant_blocks(dt, raw):
         s = blk[:, 2:4].copy().view(np.float16).astype(np.float32)
         q = blk[:, 4:].astype(np.int8).astype(np.float32)
         return (q * d - s * (1.0 / 32.0)).reshape(-1)
+    if name == "q4_k":
+        # block_q4_K (144 B / 256 el): {half d; half dmin; u8 scales[12]; u8 qs[128]}
+        # 8 sub-blocks of 32; get_scale_min_k4 unpacks the 6-bit scale/min pairs.
+        blk = np.frombuffer(raw, dtype=np.uint8).reshape(nb, 144)
+        d = blk[:, 0:2].copy().view(np.float16).astype(np.float32).reshape(-1, 1)
+        dmin = blk[:, 2:4].copy().view(np.float16).astype(np.float32).reshape(-1, 1)
+        sc = blk[:, 4:16]
+        sci = sc.astype(np.int16)
+        s32 = (sci[:, :4] & 63).astype(np.float32)
+        m32 = (sci[:, 4:8] & 63).astype(np.float32)
+        s47 = ((sci[:, 8:12] & 15) + (sci[:, 0:4] >> 6) * 16).astype(np.float32)
+        m47 = ((sci[:, 8:12] >> 4) + (sci[:, 4:8] >> 6) * 16).astype(np.float32)
+        dsub = np.hstack([s32, s47])   # (nb,8) per-sub-block scale multipliers
+        msub = np.hstack([m32, m47])
+        qs = blk[:, 16:144].astype(np.uint16)  # (nb,128) bytes; 4 chunks of 32
+        nib = np.empty((nb, 4, 2, 32), dtype=np.float32)
+        nib[:, :, 0, :] = (qs[:, 0:128:1] & 15).reshape(nb, 4, 32).astype(np.float32)   # low nibbles -> elems 64c+0..31
+        nib[:, :, 1, :] = (qs >> 4).reshape(nb, 4, 32).astype(np.float32)                # high nibbles -> elems 64c+32..63
+        d1 = (d * dsub).reshape(nb, 4, 2, 1)   # float32: d*sc per sub-block
+        m1 = (dmin * msub).reshape(nb, 4, 2, 1)
+        out = (d1 * nib - m1).reshape(nb, 256)
+        return out.reshape(-1)
+    if name == "q5_0":
+        # block_q5_0 (22 B / 32 el): {half d; u8 qh[4]; u8 qs[16]}
+        # elem j:    ((qs[j]&0xF) | (((qh>>j)<<4)&0x10)) - 16, times d
+        # elem j+16: ((qs[j]>>4)  | ((qh>>(j+12))&0x10)) - 16, times d
+        blk = np.frombuffer(raw, dtype=np.uint8).reshape(nb, 22)
+        d = blk[:, 0:2].copy().view(np.float16).astype(np.float32).reshape(-1, 1)
+        qh = blk[:, 2:6].copy().view(np.uint32)[:, 0]
+        qs = blk[:, 6:22]
+        j = np.arange(16, dtype=np.uint32)[None, :]
+        lo = ((qs & 0xF).astype(np.uint32) | (((qh[:, None] >> j) << 4) & 0x10)).astype(np.int32) - 16
+        hi = ((qs >> 4).astype(np.uint32) | ((qh[:, None] >> (j + 12)) & 0x10)).astype(np.int32) - 16
+        v = np.empty((nb, 32), dtype=np.float32)
+        v[:, :16] = lo.astype(np.float32)
+        v[:, 16:] = hi.astype(np.float32)
+        return (v * d).reshape(-1)
+    if name == "q5_1":
+        # block_q5_1 (24 B / 32 el): {half d; half m; u8 qh[4]; u8 qs[16]}; y = q*d + m
+        blk = np.frombuffer(raw, dtype=np.uint8).reshape(nb, 24)
+        d = blk[:, 0:2].copy().view(np.float16).astype(np.float32).reshape(-1, 1)
+        m = blk[:, 2:4].copy().view(np.float16).astype(np.float32).reshape(-1, 1)
+        qh = blk[:, 4:8].copy().view(np.uint32)[:, 0]
+        qs = blk[:, 8:24]
+        j = np.arange(16, dtype=np.uint32)[None, :]
+        lo = ((qs & 0xF).astype(np.uint32) | (((qh[:, None] >> j) << 4) & 0x10)).astype(np.uint32)
+        hi = ((qs >> 4).astype(np.uint32) | ((qh[:, None] >> (j + 12)) & 0x10)).astype(np.uint32)
+        v = np.empty((nb, 32), dtype=np.float32)
+        v[:, :16] = lo.astype(np.float32)
+        v[:, 16:] = hi.astype(np.float32)
+        return (v * d + m).reshape(-1)
     raise ValueError(f"golden dequant unsupported dtype {name}")
 
 
@@ -391,13 +446,21 @@ class Packer:
                 layer_bases[int(lay)] = lay_base
                 pos = lay_base + rec_len
                 gu, dn = exp[lay]["gate_up"], exp[lay]["down"]
-                records.append({"name": n.replace("gate_up_exps", "experts"), "dtype": DTYPES[t["dtype"]][0],
+                gname, dname = DTYPES[gu["dtype"]][0], DTYPES[dn["dtype"]][0]
+                _, gbs, gts = DTYPES[gu["dtype"]]
+                _, dbs, dts = DTYPES[dn["dtype"]]
+                n_col = int(gu["dims"][0]); half_cols = int(gu["dims"][1] // 2)
+                gate_len = half_cols * n_col // gbs * gts
+                down_len = int(dn["dims"][1]) * int(dn["dims"][0]) // dbs * dts
+                records.append({"name": n.replace("gate_up_exps", "experts"), "dtype": gname,
                                 "shape": [int(gu["dims"][2])],
                                 "parts": {"gate": [int(gu["dims"][1] // 2), int(gu["dims"][0])],
                                           "up": [int(gu["dims"][1] // 2), int(gu["dims"][0])],
                                           "down": [int(dn["dims"][1]), int(dn["dims"][0])]},
+                                "part_dtypes": {"gate": gname, "up": gname, "down": dname},
+                                "part_bytes": {"gate": gate_len, "up": gate_len, "down": down_len},
                                 "region": "expert", "layout": "expert_gateupdown",
-                                "offset": lay_base, "length": rec_len, "group_size": 32,
+                                "offset": lay_base, "length": rec_len, "group_size": gbs,
                                 "residency": "cold", "xxh64": rec_hash.hexdigest(), "expert_stride": stride})
                 continue
             if n.startswith("blk.") and ".ffn_down_exps." in n:
@@ -495,9 +558,10 @@ def _write_experts(self, out, pair, blob_hash, pos, golden, rng, golden_blocks):
     n_col = gu["dims"][0]            # ne0 = n_embd (contiguous per column)
     half_cols = gu["dims"][1] // 2   # n_ff per gate/up half
     d_col = dn["dims"][0]
-    bs, ts = DTYPES[gu["dtype"]][1], DTYPES[gu["dtype"]][2]
-    gate_bytes = half_cols * n_col // bs * ts
-    down_bytes = dn["dims"][1] * d_col // bs * ts
+    bs_g, ts_g = DTYPES[gu["dtype"]][1], DTYPES[gu["dtype"]][2]
+    bs_d, ts_d = DTYPES[dn["dtype"]][1], DTYPES[dn["dtype"]][2]
+    gate_bytes = half_cols * n_col // bs_g * ts_g
+    down_bytes = dn["dims"][1] * d_col // bs_d * ts_d
     per_exp = 2 * gate_bytes + down_bytes
     stride = align_up(per_exp, GPU_ALIGN)
     layer_base = align_up(pos, GPU_ALIGN)
@@ -505,19 +569,24 @@ def _write_experts(self, out, pair, blob_hash, pos, golden, rng, golden_blocks):
         out.write(b"\x00" * (layer_base - pos)); blob_hash.update(b"\x00" * (layer_base - pos))
     h = xxhash.xxh64()
     CHUNK = 1 << 24
+    parts = [
+        (gu, 0, gate_bytes, DTYPES[gu["dtype"]][0] + ".gate"),
+        (gu, gate_bytes, gate_bytes, DTYPES[gu["dtype"]][0] + ".up"),
+        (dn, 0, down_bytes, "down"),
+    ]
     for e in range(E):
-        gu_base = e * (2 * gate_bytes)
-        dn_base = e * down_bytes
-        for part, (src_t, off, ln) in enumerate([
-                (gu, gu_base, gate_bytes),
-                (gu, gu_base + gate_bytes, gate_bytes),
-                (dn, dn_base, down_bytes)]):
+        for part, (src_t, part_off, ln, suffix) in enumerate(parts):
+            base = e * (2 * gate_bytes if src_t is gu else down_bytes) + part_off
             done = 0
             while done < ln:
-                buf = self.src.read_tensor(src_t, off + done, min(CHUNK, ln - done))
+                buf = self.src.read_tensor(src_t, base + done, min(CHUNK, ln - done))
                 out.write(buf); h.update(buf); blob_hash.update(buf)
-                if golden is not None and part == 0:
-                    golden.maybe(f"{gu['name']}#{e}", gu["dtype"], buf, done, rng, golden_blocks)
+                # Golden volume control: fused experts keep per-(layer,expert) records
+                # only for expert 0 and each part, so mixed gate/up/down dtypes
+                # (e.g. q4_k gate|up + q5_0/q5_1 down) are all covered without
+                # dumping one record per expert on 128-expert models.
+                if golden is not None and e == 0:
+                    golden.maybe(f"{src_t['name']}#0.{suffix}", src_t["dtype"], buf, done, rng, golden_blocks)
                 done += len(buf)
         pad = stride - per_exp
         if pad:
@@ -545,7 +614,7 @@ class GoldenWriter:
             deq = dequant_blocks(dt, raw[: 1 << 20])
             blocks = len(deq)
             self._emit(name, dt, raw[: 1 << 20], deq)
-        elif DTYPES[dt][0] in ("q8_0", "q8_1"):
+        elif DTYPES[dt][0] in ("q8_0", "q8_1", "q4_k", "q5_0", "q5_1"):
             ts = DTYPES[dt][2]
             nb = len(raw) // ts
             k = min(max_blocks, nb)

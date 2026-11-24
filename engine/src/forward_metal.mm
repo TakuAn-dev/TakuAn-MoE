@@ -73,7 +73,20 @@ struct InklingForwardMetal::Impl {
                          qclip = 0, relclip = 0, relbias = 0, kconv = 0, vconv = 0,
                          kcovp = 0, vcovp = 0, postconv = 0, ffnconv = 0, router = 0,
                          probsb = 0, ffnnorm = 0, ffnq = 0, aquery = 0, experts = 0,
-                         normattn = 0, nq = 0, nk = 0, nv = 0; int nq_rows = 0; } phys[kNPHYS];
+                         normattn = 0, nq = 0, nk = 0, nv = 0; int nq_rows = 0;
+                         // Milestone 4B: per-layer MoE part layout from the pack. Defaults are the
+                         // legacy uniform-Q8_0 layout (gate@0 | up@kPartBytes | down@2*kPartBytes);
+                         // init() overwrites them from TensorInfo::part_dtype/part_bytes/expert_stride.
+                         // moe_dt parts: 0=gate, 1=up, 2=down. moe_stride = per-layer expert stride.
+                         DType moe_dt[3] = {DType::Q8_0, DType::Q8_0, DType::Q8_0};
+                         uint64_t moe_off[3] = {0ull, (uint64_t)kPartBytes, 2ull * kPartBytes};
+                         uint64_t moe_stride = 0;  // 0 until init()
+                         bool moe_q4k = false;     // gate/up Q4_K + down Q5_0/Q5_1 dispatch flag
+                         // Milestone 4B fix: Q4_K_S packs store the small dense attn projections
+                         // (attn_sink_proj / attn_k_conv_proj / attn_v_conv_proj) as f32 instead
+                         // of q8_0. false keeps the legacy uniform-Q8_0 dispatch 100% intact.
+                         bool wsink_f32 = false, kcovp_f32 = false, vcovp_f32 = false;
+                         } phys[kNPHYS];
     struct LL { uint64_t msgq = 0, down[4] = {0}, gain[4] = {0}, forg[4] = {0}; } loop[12];
     int s_phys[kNSLOT]; bool s_swa[kNSLOT]; int s_loop[kNSLOT];
 
@@ -181,6 +194,14 @@ struct InklingForwardMetal::Impl {
             if (!t) { static std::string miss; miss = std::string("metal: missing tensor ") + n; err = miss; throw std::runtime_error(miss); }
             return (uint64_t)t->offset;
         };
+        // Milestone 4B fix: classify a small dense projection tensor: 1=f32, 0=q8_0, -1=bad.
+        auto proj_dt = [&](const std::string & n) -> int {
+            const TensorInfo * t = pk->find(n);
+            if (!t) return -1;
+            if (t->dtype == DType::F32) return 1;
+            if (t->dtype == DType::Q8_0) return 0;
+            return -1;
+        };
         try {
             tok_embd = off("token_embd.weight"); tok_norm = off("token_embd_norm.weight");
             outw = off("output.weight"); out_norm = off("output_norm.weight");
@@ -194,6 +215,11 @@ struct InklingForwardMetal::Impl {
                 L.wo = off((b + "attn_output.weight").c_str());
                 L.wgate = off((b + "attn_gate.weight").c_str());
                 L.wsink = off((b + "attn_sink_proj.weight").c_str());
+                {  // f32-vs-q8_0 dispatch flag (Q4_K_S packs store this as f32).
+                    const int dt = proj_dt(b + "attn_sink_proj.weight");
+                    if (dt < 0) { err = "metal: attn_sink_proj.weight missing/bad dtype (need f32 or q8_0) in " + b; return false; }
+                    L.wsink_f32 = dt == 1;
+                }
                 L.wrel = off((b + "attn_rel.weight").c_str());
                 L.qclip = off((b + "attn_q_clip.weight").c_str());
                 L.relclip = off((b + "attn_rel_clip.weight").c_str());
@@ -227,9 +253,43 @@ struct InklingForwardMetal::Impl {
                     L.nv = off((b + "attn_v_inp_norm.weight").c_str());
                     L.kcovp = off((b + "attn_k_conv_proj.weight").c_str());
                     L.vcovp = off((b + "attn_v_conv_proj.weight").c_str());
+                    {  // f32-vs-q8_0 dispatch flags (Q4_K_S packs store these as f32).
+                        const int dk = proj_dt(b + "attn_k_conv_proj.weight");
+                        const int dv = proj_dt(b + "attn_v_conv_proj.weight");
+                        if (dk < 0 || dv < 0) { err = "metal: attn _conv_proj.weight missing/bad dtype (need f32 or q8_0) in " + b; return false; }
+                        L.kcovp_f32 = dk == 1;
+                        L.vcovp_f32 = dv == 1;
+                    }
                 }
                 const TensorInfo * einfo = pack.find(b + "ffn_experts.weight");
                 if (!einfo || !einfo->is_expert) { err = "metal: missing experts " + b; return false; }
+                {  // Milestone 4B: per-part dtypes / byte offsets / expert stride.
+                    const DType bdt = einfo->dtype;
+                    DType dts[3];
+                    for (int part = 0; part < 3; part++) dts[part] = einfo->part_dtype(bdt, part);
+                    const bool all_q8 = dts[0] == DType::Q8_0 && dts[1] == DType::Q8_0 && dts[2] == DType::Q8_0;
+                    const bool q4k_combo = dts[0] == DType::Q4_K && dts[1] == DType::Q4_K &&
+                                           (dts[2] == DType::Q5_0 || dts[2] == DType::Q5_1);
+                    if (!all_q8 && !q4k_combo) {
+                        err = "metal: unsupported expert part dtype combo in " + b +
+                              " (need all q8_0 or gate/up q4_k + down q5_0/q5_1)"; return false;
+                    }
+                    for (int part = 0; part < 3; part++) L.moe_dt[part] = dts[part];
+                    if (einfo->part_bytes_gate > 0 && einfo->part_bytes_up > 0 && einfo->part_bytes_down > 0) {
+                        L.moe_off[0] = 0;
+                        L.moe_off[1] = (uint64_t)einfo->part_bytes_gate;
+                        L.moe_off[2] = L.moe_off[1] + (uint64_t)einfo->part_bytes_up;
+                        if (L.moe_off[2] + (uint64_t)einfo->part_bytes_down > (uint64_t)einfo->expert_stride) {
+                            err = "metal: expert part bytes exceed expert stride in " + b; return false;
+                        }
+                    }
+                    if (q4k_combo && (L.moe_off[1] % 4u || L.moe_off[2] % 4u || einfo->expert_stride % 4)) {
+                        err = "metal: q4_k/q5 expert layout needs 4-byte aligned offsets in " + b; return false;
+                    }
+                    L.moe_stride = (uint64_t)einfo->expert_stride;
+                    L.moe_q4k = q4k_combo;
+                    if (L.moe_stride > (uint64_t)exp_stride) exp_stride = L.moe_stride;  // arena slot stride = max
+                }
             }
             for (int li = 0; li < 12; li++) {
                 std::string b = "blk." + std::to_string(li + 6) + ".";
@@ -247,7 +307,9 @@ struct InklingForwardMetal::Impl {
 
         const auto & eidx = pack.header().expert_index;
         if (!eidx.present || (int)eidx.layer_base.size() != kNPHYS) { err = "metal: expert index"; return false; }
-        exp_stride = (uint64_t)eidx.expert_stride;
+        // exp_stride is the arena SLOT stride: max over the header value and every
+        // per-layer stride collected in the init loop above (uniform Q8_0 packs: equal).
+        if ((uint64_t)eidx.expert_stride > exp_stride) exp_stride = (uint64_t)eidx.expert_stride;
         for (int p = 0; p < kNPHYS; p++) phys[p].experts = (uint64_t)eidx.layer_base[p];
 
         // ---- Phase 2B: compact resident weights (arena_mode) ----
@@ -416,7 +478,9 @@ struct InklingForwardMetal::Impl {
             acfg.pack_path = pack.path();
             for (int p = 0; p < kNPHYS; p++)
                 acfg.layer_base.push_back((uint64_t)pack.header().expert_index.layer_base[p]);
-            acfg.exp_stride = exp_stride;
+            acfg.exp_stride = exp_stride;  // slot spacing = max pack stride over layers
+            for (int p = 0; p < kNPHYS; p++)
+                acfg.layer_stride.push_back(phys[p].moe_stride);  // per-layer pack stride
             acfg.n_experts = kNEXP;
             size_t slots = budget / (size_t)exp_stride;
             const size_t total_experts = (size_t)kNPHYS * kNEXP;
@@ -738,6 +802,21 @@ struct InklingForwardMetal::Impl {
                 cur_disp++;
             }
         };
+        // d_th2: flat 2D thread-indexed kernels (kernel reads (x, y) of
+        // thread_position_in_grid, e.g. k_situ_f32_batch's (i, pair) grid).
+        auto d_th2 = [&](const char * fn, uint nx, uint ny, uint nth, const void * a, size_t sz) {
+            if (err.empty()) {
+                id<MTLComputePipelineState> p = rt.pipeline(fn);
+                if (!p) { err = std::string("pipeline ") + fn; return; }
+                [en setComputePipelineState:p];
+                [en setBuffer:scr offset:0 atIndex:0];
+                [en setBytes:a length:sz atIndex:1];
+                [en setBuffer:curPack offset:0 atIndex:2];
+                [en dispatchThreads:MTLSizeMake(nx, ny, 1)
+                    threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                cur_disp++;
+            }
+        };
         auto rms = [&](const uint32_t * xr, const uint64_t * wr, const uint32_t * yr,
                        uint32_t k, uint32_t rows, uint32_t hasw, float eps) {
             RMSArgs A{}; A.k = k; A.rows = rows; A.hasw = hasw; A.eps = eps;
@@ -870,8 +949,10 @@ struct InklingForwardMetal::Impl {
                 for (int j = 0; j < 3; j++) in3[j] = outp[j];
             }
             // --- fused input norms + Q8_0 quant ---
+            // *_f32 projections read the normalized FP32 directly (o.qsrc/ksrc/vsrc
+            // stay dead scratch when the flags are false, so Q8_0 packs are unchanged).
             if (is_swa && !lp) {
-                uint32_t y1 = M64_NOFFU, q1 = o.xqA, d1 = o.dxA;
+                uint32_t y1 = L.wsink_f32 ? o.qsrc : M64_NOFFU, q1 = o.xqA, d1 = o.dxA;
                 rms_quant(in3, &L.normattn, &y1, &q1, &d1, kNE, 1, f_eps);
             } else {
                 uint64_t wr3[3] = {
@@ -879,7 +960,11 @@ struct InklingForwardMetal::Impl {
                     is_swa ? L.normattn : L.nk,
                     is_swa ? L.normattn : L.nv
                 };
-                uint32_t yr3[3] = {M64_NOFFU, M64_NOFFU, M64_NOFFU};
+                uint32_t yr3[3] = {
+                    L.wsink_f32 ? o.qsrc : M64_NOFFU,
+                    L.kcovp_f32 ? o.ksrc : M64_NOFFU,
+                    L.vcovp_f32 ? o.vsrc : M64_NOFFU
+                };
                 uint32_t qr3[3] = {o.xqA, o.xqB, o.xqC};
                 uint32_t dr3[3] = {o.dxA, o.dxB, o.dxC};
                 rms_quant(in3, wr3, yr3, qr3, dr3, kNE, 3, f_eps);
@@ -891,27 +976,45 @@ struct InklingForwardMetal::Impl {
             // --- Q K V R (+ sink/gate when R3 fused) projections & short convolutions ---
             if (gemv_r3) {
                 if (is_swa && !lp) {
-                    const uint64_t ws[6] = {L.wq, L.wk, L.wv, L.wrel, L.wsink, L.wgate};
-                    const uint32_t ys[6] = {o.Q, o.K, o.V2, o.Rr, o.sinkb, o.gateb};
-                    const uint32_t ns[6] = {kNH * kDH, kKVD, kKVD, kNH * kNREL, kNH, kNH * kDH};
-                    gemv2304_multi(o.xqA, o.dxA, 6, ws, ys, ns);
+                    uint64_t ws[6]; uint32_t ys[6], ns[6], nn = 0;
+                    ws[nn] = L.wq;   ys[nn] = o.Q;    ns[nn] = kNH * kDH;   nn++;
+                    ws[nn] = L.wk;   ys[nn] = o.K;    ns[nn] = kKVD;        nn++;
+                    ws[nn] = L.wv;   ys[nn] = o.V2;   ns[nn] = kKVD;        nn++;
+                    ws[nn] = L.wrel; ys[nn] = o.Rr;   ns[nn] = kNH * kNREL; nn++;
+                    if (!L.wsink_f32) { ws[nn] = L.wsink; ys[nn] = o.sinkb; ns[nn] = kNH; nn++; }
+                    ws[nn] = L.wgate; ys[nn] = o.gateb; ns[nn] = kNH * kDH; nn++;
+                    gemv2304_multi(o.xqA, o.dxA, nn, ws, ys, ns);
+                    if (L.wsink_f32) gemvf32(o.sinkb, kNH, kNE, o.qsrc, L.wsink);
                     conv(il, 0, kKVD, o.K, o.K, L.kconv, 0, 128, kConvStatic);
                     conv(il, kKVD, kKVD, o.V2, o.V2, L.vconv, 0, 128, kConvStatic);
                 } else {
-                    const uint64_t ws[4] = {L.wq, L.wrel, L.wsink, L.wgate};
-                    const uint32_t ys[4] = {o.Q, o.Rr, o.sinkb, o.gateb};
-                    const uint32_t ns[4] = {kNH * kDH, kNH * kNREL, kNH, kNH * kDH};
-                    gemv2304_multi(o.xqA, o.dxA, 4, ws, ys, ns);
+                    uint64_t ws[4]; uint32_t ys[4], ns[4], nn = 0;
+                    ws[nn] = L.wq;   ys[nn] = o.Q;    ns[nn] = kNH * kDH;   nn++;
+                    ws[nn] = L.wrel; ys[nn] = o.Rr;   ns[nn] = kNH * kNREL; nn++;
+                    if (!L.wsink_f32) { ws[nn] = L.wsink; ys[nn] = o.sinkb; ns[nn] = kNH; nn++; }
+                    ws[nn] = L.wgate; ys[nn] = o.gateb; ns[nn] = kNH * kDH; nn++;
+                    gemv2304_multi(o.xqA, o.dxA, nn, ws, ys, ns);
+                    if (L.wsink_f32) gemvf32(o.sinkb, kNH, kNE, o.qsrc, L.wsink);
                     if (!is_swa) {
-                        const uint64_t wks[2] = {L.wk, L.kcovp};
-                        const uint32_t yks[2] = {o.K, o.dynb};
-                        const uint32_t nks[2] = {kKVD, 32};
-                        gemv2304_multi(o.xqB, o.dxB, 2, wks, yks, nks);
+                        if (L.kcovp_f32) {
+                            gemv2304(o.K, kKVD, o.xqB, o.dxB, L.wk);
+                            gemvf32(o.dynb, 32, kNE, o.ksrc, L.kcovp);
+                        } else {
+                            const uint64_t wks[2] = {L.wk, L.kcovp};
+                            const uint32_t yks[2] = {o.K, o.dynb};
+                            const uint32_t nks[2] = {kKVD, 32};
+                            gemv2304_multi(o.xqB, o.dxB, 2, wks, yks, nks);
+                        }
                         conv(il, 0, kKVD, o.K, o.K, L.kconv, o.dynb, 128, 1.0f / 3.0f);
-                        const uint64_t wvs[2] = {L.wv, L.vcovp};
-                        const uint32_t yvs[2] = {o.V2, o.dynb};
-                        const uint32_t nvs[2] = {kKVD, 32};
-                        gemv2304_multi(xqC, dxc, 2, wvs, yvs, nvs);
+                        if (L.vcovp_f32) {
+                            gemv2304(o.V2, kKVD, xqC, dxc, L.wv);
+                            gemvf32(o.dynb, 32, kNE, o.vsrc, L.vcovp);
+                        } else {
+                            const uint64_t wvs[2] = {L.wv, L.vcovp};
+                            const uint32_t yvs[2] = {o.V2, o.dynb};
+                            const uint32_t nvs[2] = {kKVD, 32};
+                            gemv2304_multi(xqC, dxc, 2, wvs, yvs, nvs);
+                        }
                         conv(il, kKVD, kKVD, o.V2, o.V2, L.vconv, o.dynb, 128, 1.0f / 3.0f);
                     } else {
                         gemv2304(o.K, kKVD, xqB, dxb, L.wk);
@@ -926,9 +1029,11 @@ struct InklingForwardMetal::Impl {
                 gemv2304(o.V2, kKVD, xqC, dxc, L.wv);
                 gemv2304(o.Rr, kNH * kNREL, o.xqA, o.dxA, L.wrel);
                 if (!is_swa) {
-                    gemv2304(o.dynb, 32, o.xqB, o.dxB, L.kcovp);
+                    if (L.kcovp_f32) gemvf32(o.dynb, 32, kNE, o.ksrc, L.kcovp);
+                    else gemv2304(o.dynb, 32, o.xqB, o.dxB, L.kcovp);
                     conv(il, 0, kKVD, o.K, o.K, L.kconv, o.dynb, 128, 1.0f / 3.0f);
-                    gemv2304(o.dynb, 32, xqC, dxc, L.vcovp);
+                    if (L.vcovp_f32) gemvf32(o.dynb, 32, kNE, o.vsrc, L.vcovp);
+                    else gemv2304(o.dynb, 32, xqC, dxc, L.vcovp);
                     conv(il, kKVD, kKVD, o.V2, o.V2, L.vconv, o.dynb, 128, 1.0f / 3.0f);
                 } else {
                     conv(il, 0, kKVD, o.K, o.K, L.kconv, 0, 128, kConvStatic);
@@ -948,7 +1053,10 @@ struct InklingForwardMetal::Impl {
             }
             clip(o.Rr, L.relclip, kNH, kNREL, f_rel_clip);
             // --- sink bias, KV cache write ---
-            if (!gemv_r3) gemv2304(o.sinkb, kNH, o.xqA, o.dxA, L.wsink);
+            if (!gemv_r3) {
+                if (L.wsink_f32) gemvf32(o.sinkb, kNH, kNE, o.qsrc, L.wsink);
+                else gemv2304(o.sinkb, kNH, o.xqA, o.dxA, L.wsink);
+            }
             if (err.empty()) {
                 const uint32_t ring_idx = is_swa ? ((uint32_t)pos % kv_cap[il]) : (uint32_t)pos;
                 KVWriteF16Args kw{
@@ -1103,6 +1211,32 @@ struct InklingForwardMetal::Impl {
             }
             {
                 const uint32_t seloff = arena_mode ? asel : o.sel;
+                const uint64_t mst = arena_mode ? exp_stride : L.moe_stride;  // arena slot stride vs per-layer pack stride
+                if (L.moe_q4k) {
+                    // Milestone 4B FP32-input pipeline: Q4_K gate/up -> f32 SITU
+                    // -> Q5_0/Q5_1 down+reduce. sel holds direct blob indexes
+                    // (expert ids on pack, arena slots in arena mode) so wtab=0.
+                    MoeGateUpQ4KF32Args g4{arena_mode ? 0ul : (unsigned long)(L.experts + L.moe_off[0]),
+                                           arena_mode ? (unsigned long)L.moe_off[1] : (unsigned long)(L.experts + L.moe_off[1]),
+                                           o.fin, o.gate2, o.ubuf, seloff, 0u,
+                                           kNF, kNE, (unsigned int)mst};
+                    if (arena_mode) curPack = expertBuf;
+                    d_tg("k_gemv_gateup_batch8_q4k_f32in", (kTOPK * 2 * kNF + 7) / 8, 1, 256, &g4, sizeof(g4));
+                    SituF32BatchArgs sf{o.gate2, o.ubuf, o.down_tmp, kNF, kNF, kNF, kNF, kTOPK,
+                                        situ_beta, situ_lb, 1.0f / situ_beta, 1.0f / situ_lb};
+                    d_th2("k_situ_f32_batch", kNF, kTOPK, 128, &sf, sizeof(sf));
+                    prof_flush(P_GATEUP);
+                    MoeDownQ5F32Args md{arena_mode ? (unsigned long)L.moe_off[2] : (unsigned long)(L.experts + L.moe_off[2]),
+                                        o.down_tmp, o.acc, o.wgt, seloff, 0u, 0u,
+                                        kNE, kNF, (unsigned int)mst, 0u};
+                    d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in"
+                                                    : "k_gemv_down_reduce8_q5_0_f32in",
+                         (kNE + 7) / 8, 1, 256, &md, sizeof(md));
+                    if (arena_mode) curPack = residentBuf;
+                    conv(il, 2 * kKVD + kNE, kNE, o.acc, o.tA, L.ffnconv, 0, kNE, kConvStatic);
+                    xfer2(o.cur, o.tA, 0, kNE, 0, 0, 0, 0, 0);
+                    prof_flush(P_DOWN);
+                } else {
                 GemvArgs gu{arena_mode ? 0ul : L.experts,
                             arena_mode ? (unsigned long)kPartBytes : L.experts + kPartBytes,
                             o.xqE, o.dxE, o.gate2, o.ubuf,
@@ -1133,6 +1267,7 @@ struct InklingForwardMetal::Impl {
                     xfer2(o.cur, o.tA, 0, kNE, 0, 0, 0, 0, 0);
                 }
                 prof_flush(P_DOWN);
+                }
             }
             if (trace_slot) { char tb[32]; snprintf(tb, sizeof(tb), "s%d_p%d_end", il, ip); trace_flush(tb); }
         };
@@ -1377,6 +1512,12 @@ struct InklingForwardMetal::Impl {
                  MTLSizeMake((nout + 31) / 32, (B + 31) / 32, 1),
                  MTLSizeMake(32, 4, 1), &A, sizeof(A), curPack);
         };
+        // Milestone 4B fix: f32 small dense projections (wsink/kcovp/vcovp) in Q4_K_S packs.
+        // b_n3 already holds the normalized FP32 rows (stride 3*kNE), so no extra staging.
+        auto gemv_f32_b = [&](uint64_t w, uint32_t x, uint32_t y, uint32_t ys, uint32_t nout) {
+            GemvF32BatchArgs A{w, x, y, 3 * kNE, ys, nout, kNE, B, 0u};
+            d_tg("k_gemv_f32_batch", nout, B, 256, &A, sizeof(A));
+        };
         auto rms_b = [&](uint64_t wp, uint32_t x, uint32_t xs, uint32_t xr,
                          uint32_t y, uint32_t ys, uint32_t yr,
                          uint32_t q, uint32_t d, uint32_t qs, uint32_t ds,
@@ -1449,12 +1590,15 @@ struct InklingForwardMetal::Impl {
             gemm_sg(L.wk,    nB, 3 * kNE, o.b_K,     kKVD,        kNE, kKVD);
             gemm_sg(L.wv,    nC, 3 * kNE, o.b_V2,    kKVD,        kNE, kKVD);
             gemm_sg(L.wrel,  nA, 3 * kNE, o.b_Rr,    kNH * kNREL, kNE, kNH * kNREL);
-            gemm_sg(L.wsink, nA, 3 * kNE, o.b_sinkb, kNH,         kNE, kNH);
-            gemm_sg(L.wgate, nA, 3 * kNE, o.b_gateb, kNH * kDH,   kNE, kNH * kDH);
+            if (L.wsink_f32) gemv_f32_b(L.wsink, nA, o.b_sinkb, kNH, kNH);
+            else gemm_sg(L.wsink, nA, 3 * kNE, o.b_sinkb, kNH, kNE, kNH);
+            gemm_sg(L.wgate, nA, 3 * kNE, o.b_gateb, kNH * kDH, kNE, kNH * kDH);
             if (!is_swa) {
-                gemm_sg(L.kcovp, nB, 3 * kNE, o.b_dynb, 32u, kNE, 32u);
+                if (L.kcovp_f32) gemv_f32_b(L.kcovp, nB, o.b_dynb, 32u, 32u);
+                else gemm_sg(L.kcovp, nB, 3 * kNE, o.b_dynb, 32u, kNE, 32u);
                 conv_b((uint32_t)il, 0u,   kKVD, o.b_K,  kKVD, o.b_K,  kKVD, L.kconv, o.b_dynb, 32u, 128u, 1.0f / 3.0f);
-                gemm_sg(L.vcovp, nC, 3 * kNE, o.b_dynb, 32u, kNE, 32u);
+                if (L.vcovp_f32) gemv_f32_b(L.vcovp, nC, o.b_dynb, 32u, 32u);
+                else gemm_sg(L.vcovp, nC, 3 * kNE, o.b_dynb, 32u, kNE, 32u);
                 conv_b((uint32_t)il, kKVD, kKVD, o.b_V2, kKVD, o.b_V2, kKVD, L.vconv, o.b_dynb, 32u, 128u, 1.0f / 3.0f);
             } else {
                 conv_b((uint32_t)il, 0u,   kKVD, o.b_K,  kKVD, o.b_K,  kKVD, L.kconv, 0u, 0u, 128u, kConvStatic);
@@ -1481,8 +1625,18 @@ struct InklingForwardMetal::Impl {
                     (uint32_t)pos, B, is_swa ? 1u : 0u, (uint32_t)n_swa, kv_cap[il], 0u,
                     1.0f / sqrtf((float)kDH), log_scale_floor, log_scale_alpha, 0.0f
                 };
-                disp("k_attn_head_f16_batch", true,
-                     MTLSizeMake(kNH, B, 1), MTLSizeMake(32, 1, 1), &aa, sizeof(aa), curPack, kvBuf);
+                // Milestone 4C: tiled FlashAttention prefill (tensor-core PV,
+                // 32-query-row threadgroups) wins from B >= 8 for both full
+                // and SWA attention; the scalar per-token kernel still wins
+                // for tiny batches.
+                if (B >= 8u)
+                    disp("k_attn_f16_flash_prefill", true,
+                         MTLSizeMake(kNH, (B + 31u) / 32u, 1), MTLSizeMake(32, 4, 1),
+                         &aa, sizeof(aa), curPack, kvBuf);
+                else
+                    disp("k_attn_head_f16_batch", true,
+                         MTLSizeMake(kNH, B, 1), MTLSizeMake(32, 1, 1),
+                         &aa, sizeof(aa), curPack, kvBuf);
             }
             bprof_flush(BP_ATTN);
             // --- gate mul, wo (sg GEMM), postconv, residual ---
@@ -1582,6 +1736,27 @@ struct InklingForwardMetal::Impl {
                             for (int i = 0; i < kTOPK; i++) ((uint32_t *)S)[o.b_wtab + i] = slots8[i];
                             // Note: synchronize per token in tiny-arena mode because shared
                             // o.b_wtab / o.xqE / o.gate2 are overwritten across iterations.
+                            if (L.moe_q4k) {
+                                // Milestone 4B FP32 pipeline over arena slots (slots are
+                                // the direct blob indexes in o.b_wtab[0..7]).
+                                const uint32_t msel = o.b_wtab;
+                                MoeGateUpQ4KF32Args g4{0ul, (unsigned long)L.moe_off[1],
+                                                       o.b_fin + b * kNE, o.gate2, o.ubuf, msel, 0u,
+                                                       kNF, kNE, (unsigned int)exp_stride};
+                                curPack = expertBuf;
+                                d_tg("k_gemv_gateup_batch8_q4k_f32in", (kTOPK * 2 * kNF + 7) / 8, 1, 256, &g4, sizeof(g4));
+                                SituF32BatchArgs sf4{o.gate2, o.ubuf, o.down_tmp, kNF, kNF, kNF, kNF, kTOPK,
+                                                     situ_beta, situ_lb, 1.0f / situ_beta, 1.0f / situ_lb};
+                                disp("k_situ_f32_batch", false, MTLSizeMake(kNF, kTOPK, 1),
+                                     MTLSizeMake(128, 1, 1), &sf4, sizeof(sf4), curPack);
+                                MoeDownQ5F32Args md4{(unsigned long)L.moe_off[2], o.down_tmp,
+                                                     o.b_acc + b * kNE, o.b_wgt + b * kTOPK, msel, 0u, 0u,
+                                                     kNE, kNF, (unsigned int)exp_stride, 0u};
+                                d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in"
+                                                                : "k_gemv_down_reduce8_q5_0_f32in",
+                                     (kNE + 7) / 8, 1, 256, &md4, sizeof(md4));
+                                curPack = residentBuf;
+                            } else {
                             QuantArgs qa{o.b_fin + b * kNE, o.xqE, o.dxE, kNE / 32u};
                             d_th("k_quant", kNE / 32u, 32, &qa, sizeof(qa));
                             GemvArgs gu{0ull, (unsigned long)kPartBytes,
@@ -1599,6 +1774,7 @@ struct InklingForwardMetal::Impl {
                             if (gemv_m2) d_tg("k_gemv_down_reduce8_m4", (kNE + 31) / 32, 1, 256, &md, sizeof(md));
                             else d_tg("k_gemv_down_reduce8", (kNE + 15) / 16, 1, 256, &md, sizeof(md));
                             curPack = residentBuf;
+                            }
                             if (b + 1 < B) {
                                 [en endEncoding]; [cb commit]; [cb waitUntilCompleted];
                                 if (cb.status != MTLCommandBufferStatusCompleted) { err = "metal: tiny arena fault"; break; }
@@ -1610,14 +1786,24 @@ struct InklingForwardMetal::Impl {
                 }
             }
             if (!used_per_tok_fallback && err.empty()) {
-                MoeGroupedF32SgArgs gup{moe_wbase, (uint64_t)exp_stride, 0ull,
+                // Milestone 4B: per-part grouped kernel picked from the layer's
+                // part dtypes (Q8_0 layers dispatch the exact same kernels as before).
+                auto moe_gk = [&](int part) {
+                    const DType dt = L.moe_dt[part];
+                    return dt == DType::Q4_K ? "k_moe_grouped_f32in_sg_q4k"
+                         : dt == DType::Q5_0 ? "k_moe_grouped_f32in_sg_q5_0"
+                         : dt == DType::Q5_1 ? "k_moe_grouped_f32in_sg_q5_1"
+                                            : "k_moe_grouped_f32in_sg";
+                };
+                const uint64_t mst = arena_mode ? exp_stride : L.moe_stride;  // slot vs per-layer pack stride
+                MoeGroupedF32SgArgs gup{moe_wbase, mst, (uint64_t)L.moe_off[0],
                                         o.b_fin, o.b_gate2, o.b_list, o.b_cnt, o.b_off,
                                         wtab_off, kNF, kNE, kNE, kNF, kNEXP, kTOPK, 0u, 0u};
-                disp("k_moe_grouped_f32in_sg", true, MTLSizeMake((kNF + 31) / 32, kNEXP, 1),
+                disp(moe_gk(0), true, MTLSizeMake((kNF + 31) / 32, kNEXP, 1),
                      MTLSizeMake(32, 4, 1), &gup, sizeof(gup), curPack);
-                gup.part_off = (uint64_t)kPartBytes;
+                gup.part_off = (uint64_t)L.moe_off[1];
                 gup.yoff = o.b_ubuf;
-                disp("k_moe_grouped_f32in_sg", true, MTLSizeMake((kNF + 31) / 32, kNEXP, 1),
+                disp(moe_gk(1), true, MTLSizeMake((kNF + 31) / 32, kNEXP, 1),
                      MTLSizeMake(32, 4, 1), &gup, sizeof(gup), curPack);
                 SituF32BatchArgs sba{o.b_gate2, o.b_ubuf, o.b_situ,
                                      kNF, kNF, kNF, kNF, B * kTOPK,
@@ -1625,10 +1811,10 @@ struct InklingForwardMetal::Impl {
                 disp("k_situ_f32_batch", false, MTLSizeMake(kNF, B * kTOPK, 1),
                      MTLSizeMake(128, 1, 1), &sba, sizeof(sba), curPack);
                 bprof_flush(BP_GATEUP);
-                MoeGroupedF32SgArgs dn{moe_wbase, (uint64_t)exp_stride, (uint64_t)(2 * kPartBytes),
+                MoeGroupedF32SgArgs dn{moe_wbase, mst, (uint64_t)L.moe_off[2],
                                        o.b_situ, o.b_down_tmp, o.b_list, o.b_cnt, o.b_off,
                                        wtab_off, kNE, kNF, kNF, kNE, kNEXP, kTOPK, 1u, 0u};
-                disp("k_moe_grouped_f32in_sg", true, MTLSizeMake((kNE + 31) / 32, kNEXP, 1),
+                disp(moe_gk(2), true, MTLSizeMake((kNE + 31) / 32, kNEXP, 1),
                      MTLSizeMake(32, 4, 1), &dn, sizeof(dn), curPack);
                 if (arena_mode) curPack = residentBuf;
                 MoeReduceBatchArgs mra{o.b_down_tmp, o.b_wgt, o.b_acc,

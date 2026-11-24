@@ -53,8 +53,11 @@ int main(int argc, char **argv) {
         switch (dt) {
             case 0: D = m64::DType::F32; break;
             case 1: D = m64::DType::F16; break;
+            case 6: D = m64::DType::Q5_0; break;
+            case 7: D = m64::DType::Q5_1; break;
             case 8: D = m64::DType::Q8_0; break;
             case 9: D = m64::DType::Q8_1; break;
+            case 12: D = m64::DType::Q4_K; break;
             case 30: D = m64::DType::BF16; break;
             default: CHECK(false, "golden dtype %u", dt); continue;
         }
@@ -95,16 +98,46 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < pack.n_tensors(); i++) {
         const auto &t = pack.tensor(i);
         if (!t.is_expert) continue;
-        auto bytes = [&](const std::vector<int64_t> &sh) {
+        // per-part dtype: manifests record part_dtypes/part_bytes for mixed-dtype
+        // experts (e.g. q4_k gate|up + q5_0/q5_1 down). Legacy packs omit both
+        // fields and fall back to the tensor-level dtype.
+        auto bytes = [&](int part) {
+            const std::vector<int64_t> &sh = part == 0 ? t.part_gate : part == 1 ? t.part_up : t.part_down;
             int64_t n = 1; for (auto d : sh) n *= d;
-            int be = m64::dtype_block_elems(t.dtype);
-            return n / be * (t.dtype == m64::DType::Q8_1 ? 36 : t.dtype == m64::DType::Q8_0 ? 34 : 4);
+            m64::DType pd = t.part_dtype(t.dtype, part);
+            int be = m64::dtype_block_elems(pd), ts = m64::dtype_type_size(pd);
+            CHECK(be && ts && n % be == 0, "%s part %d dtype %s: n=%lld not multiple of block %d",
+                  t.name.c_str(), part, m64::dtype_name(pd), (long long)n, be);
+            int64_t computed = n / be * ts;
+            int64_t manifest = t.part_bytes(computed, part);
+            CHECK(manifest == computed, "%s part %d manifest bytes %lld != computed %lld",
+                  t.name.c_str(), part, (long long)manifest, (long long)computed);
+            return computed;
         };
-        int64_t per = bytes(t.part_gate) + bytes(t.part_up) + bytes(t.part_down);
+        int64_t pg = bytes(0), pu = bytes(1), pdown = bytes(2);
+        int64_t per = pg + pu + pdown;
         CHECK(per <= t.expert_stride, "expert parts %lld > stride %lld", (long long)per, (long long)t.expert_stride);
-        printf("  ok  %-35s expert_stride=%lld parts=%lld+%lld+%lld\n", t.name.c_str(),
-               (long long)t.expert_stride, (long long)bytes(t.part_gate), (long long)bytes(t.part_up),
-               (long long)bytes(t.part_down));
+        // dispatch a few blocks of each part of expert 0 through dequant_row
+        // (exercises q4_k/q5_0/q5_1 on real pack bytes; golden checks exactness)
+        {
+            const uint8_t *base = (const uint8_t *)pack.ptr(t);
+            int64_t off = 0;
+            int64_t plens[3] = {pg, pu, pdown};
+            for (int part = 0; part < 3; part++) {
+                m64::DType pd = t.part_dtype(t.dtype, part);
+                int64_t n = (int64_t)m64::dtype_block_elems(pd) * 4;
+                if (n <= plens[part]) {
+                    std::vector<float> out(n);
+                    try { m64::dequant_row(pd, base + off, out.data(), n); }
+                    catch (const std::exception &e) { CHECK(false, "expert part dequant %s/%d: %s", t.name.c_str(), part, e.what()); }
+                }
+                off += plens[part];
+            }
+        }
+        printf("  ok  %-35s expert_stride=%lld parts=%lld+%lld+%lld (%s|%s|%s)\n", t.name.c_str(),
+               (long long)t.expert_stride, (long long)pg, (long long)pu, (long long)pdown,
+               m64::dtype_name(t.part_dtype(t.dtype, 0)), m64::dtype_name(t.part_dtype(t.dtype, 1)),
+               m64::dtype_name(t.part_dtype(t.dtype, 2)));
     }
 
     printf(g_fail ? "\nFAILURES: %d\n" : "\nALL PASS\n", g_fail);

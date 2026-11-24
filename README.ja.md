@@ -11,12 +11,17 @@
 - **Apple Silicon (M4 Max, 64 GiB)** — M4 Max 64 GiB 実機で検証済み。
 - **外部依存ゼロ** — C++20 / Objective-C++ / Metal と Python 3 標準ライブラリのみ。
 - **Inkling-2-Mini-Q8_0**（25.93 GiB / 680 テンソル / 48 論理スロット + MoE 24x128 top-8）— フル常駐（`--arena-gb 0`）と、メモリ上限付きの NVMe ストリーミング（`--arena-gb` + `pread` / `mtlio`）の両方に対応。
+- **Inkling-2-Mini-Q4_K_S**（`15.71 GiB` の `.m64pack`）— `Q4_K` / `Q5_0` / `Q5_1` のパック変換・逆量子化・Metal MoE カーネル（`k_gemv_gateup_batch8_q4k_f32in`、`k_gemv_down_reduce8_q5_{0,1}_f32in`、`k_moe_grouped_f32in_sg_{q4k,q5_0,q5_1}`）に対応。`F32` の密行列サポート（`attn_sink_proj`、`attn_{k,v}_conv_proj`）と層ごとの `ExpertArena` ストライドにも対応。
 - **最大 128K コンテキスト**（`--ctx 131072`）。
 - **Milestone 3C / 3D 最適化**（実測値）:
   - Tensor-Core Grouped MoE（`B=128`）+ FP32 SiTU — バッチプリフィル **222〜246 tok/s**。
   - Split-K FlashDecoding — 長いコンテキストのデコードで **24.1 倍**高速化（カーネルのみ、`pos=20000`）。
   - SSD 永続プレフィックスキャッシュ（`.m64kv`）— **17.5k トークン**を約 **0.1 秒**で復元。
   - OpenAI 互換の HTTP/SSE サーバー — ツールコール、連続 `: keepalive` ハートビートに対応。Hermes Agent による検証済み（**45k+ トークン**、マルチターンでの連続ツール実行）。
+- **Milestone 4A / 4B / 4C 最適化**（実測値）:
+  - タイル化 FlashAttention プリフィル（`k_attn_f16_flash_prefill`、`engine/kernels/m64_prefill.metal`）を `B >= 8` でフルアテンション層（`is_swa=0`）と SWA 層（`is_swa=1`）の両方に有効化 — `p=20000`（`B=128`）でアテンションのプリフィルが最大 **7.63 倍**高速化（`5.93 ms` vs `45.25 ms/iter`）、`B=32` で **3.44 倍**、SWA 層の `B=128` で **4.93 倍**。
+  - フルパック時の `--prefix-cache` 自動デフォルトを **2** から **4** チェックポイントに引き上げ（`--prefix-cache` で上書き可能）。
+  - サーバーのストリーミング／切断安定性 — thinking 中の `delta.reasoning_content` を SSE でリアルタイム配信し、長時間の推論でもクライアントのアイドル／ストールタイムアウトが発生しない。クライアント切断・停止時には `SIGUSR1` で進行中の `GEN` をクリーンにキャンセル（`DONE ... cancelled`）し、`stdout` パイプをドレインしてワーカーのパイプデッドロックを防止。
 
 ## 検証済みベンチマーク（Apple M4 Max, 64 GB）
 
@@ -29,6 +34,13 @@
 | デコードスループット（32 ステップ） | **45.33 tok/s** — `llama.cpp` Metal（**31.90 tok/s**）比 **+42.1%** |
 | オラクルとのグリーディ argmax 一致 | **9/9** |
 | スワップ増加量 | **0 MB** |
+
+### Q4_K_S 量子化（`Inkling-2-Mini-Q4_K_S`、パックサイズ 15.71 GiB）
+
+| 指標 | 結果 |
+| :--- | :--- |
+| デコードスループット（フル常駐 Metal） | **50.17 tok/s** — `Q8_0`（**43.80 tok/s**）比 **+14.5%** |
+| `--arena-gb 4`（`ctx=256`） | 常駐 **約 4.29 GB** で **23.29 tok/s** |
 
 ### メモリ上限付きストリーミング（`--arena-gb`）
 

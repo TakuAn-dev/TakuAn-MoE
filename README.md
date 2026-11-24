@@ -20,6 +20,12 @@ Repository: https://github.com/TakuAn-dev/TakuAn-MoE
 - **Inkling-2-Mini-Q8_0** (25.93 GiB / 680 tensors / 48 logical slots + MoE
   24x128 top-8) — full resident (`--arena-gb 0`) and bounded-memory NVMe
   streaming (`--arena-gb` + `pread`/`mtlio`).
+- **Inkling-2-Mini-Q4_K_S** (`15.71 GiB` `.m64pack`) — `Q4_K` / `Q5_0` /
+  `Q5_1` pack converter, dequantization, and Metal MoE kernels
+  (`k_gemv_gateup_batch8_q4k_f32in`, `k_gemv_down_reduce8_q5_{0,1}_f32in`,
+  `k_moe_grouped_f32in_sg_{q4k,q5_0,q5_1}`), with `F32` dense support
+  (`attn_sink_proj`, `attn_{k,v}_conv_proj`) and per-layer `ExpertArena`
+  stride.
 - **Up to 128K context** (`--ctx 131072`).
 - **Milestone 3C/3D optimizations** (measured):
   - Tensor-Core Grouped MoE (`B=128`) + FP32 SiTU — batch prefill
@@ -31,6 +37,19 @@ Repository: https://github.com/TakuAn-dev/TakuAn-MoE
   - OpenAI-compatible HTTP/SSE server — tool calling, continuous `: keepalive`
     heartbeats; verified with Hermes Agent (**45k+ tokens**, multi-turn
     continuous tool execution).
+- **Milestone 4A/4B/4C optimizations** (measured):
+  - Tiled FlashAttention prefill (`k_attn_f16_flash_prefill`,
+    `engine/kernels/m64_prefill.metal`) for `B >= 8` on both full (`is_swa=0`)
+    and SWA (`is_swa=1`) attention layers — up to **7.63x** faster attention
+    prefill @ `p=20000` (`B=128`; `5.93 ms` vs `45.25 ms/iter`), **3.44x** @
+    `B=32`, and **4.93x** @ `B=128` on SWA layers.
+  - Full-pack `--prefix-cache` auto-default raised from `2` to **4**
+    checkpoints (`--prefix-cache` still overrides).
+  - Server streaming & disconnect stability — live `delta.reasoning_content`
+    SSE streaming during the thinking state (no client idle / stale-stream
+    timeouts during extended reasoning), and clean `SIGUSR1` in-flight `GEN`
+    cancellation (`DONE ... cancelled`) with `stdout` pipe draining on client
+    disconnect/stop (no worker pipe deadlock).
 
 ## Verified benchmarks (Apple M4 Max, 64 GB)
 
@@ -46,6 +65,13 @@ Reference oracle: `llama.cpp` (Metal). Full data in
 | Decode throughput (32-step) | **45.33 tok/s** — **+42.1%** vs `llama.cpp` Metal (`31.90 tok/s`) |
 | Greedy argmax agreement vs oracle | **9/9** |
 | Swap growth | **0 MB** |
+
+### Q4_K_S quantization (`Inkling-2-Mini-Q4_K_S`, 15.71 GiB pack)
+
+| Metric | Result |
+| :--- | :--- |
+| Decode throughput, full resident Metal | **50.17 tok/s** — **+14.5%** vs `Q8_0` (`43.80 tok/s`) |
+| `--arena-gb 4` (`ctx=256`) | **23.29 tok/s** at **~4.29 GB** resident |
 
 ### Bounded streaming (`--arena-gb`)
 

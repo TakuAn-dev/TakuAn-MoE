@@ -17,7 +17,7 @@
 
 namespace m64 {
 
-enum class DType : uint8_t { F32, F16, BF16, Q8_0, Q8_1, Q4_K, Q6_K, IQ3_XXS, UNKNOWN };
+enum class DType : uint8_t { F32, F16, BF16, Q8_0, Q8_1, Q4_K, Q6_K, IQ3_XXS, Q5_0, Q5_1, UNKNOWN };
 
 inline DType dtype_from_name(const std::string &n) {
     if (n == "f32") return DType::F32;
@@ -28,6 +28,8 @@ inline DType dtype_from_name(const std::string &n) {
     if (n == "q4_k") return DType::Q4_K;
     if (n == "q6_k") return DType::Q6_K;
     if (n == "iq3_xxs") return DType::IQ3_XXS;
+    if (n == "q5_0") return DType::Q5_0;
+    if (n == "q5_1") return DType::Q5_1;
     return DType::UNKNOWN;
 }
 inline const char *dtype_name(DType d) {
@@ -35,14 +37,28 @@ inline const char *dtype_name(DType d) {
         case DType::F32: return "f32"; case DType::F16: return "f16"; case DType::BF16: return "bf16";
         case DType::Q8_0: return "q8_0"; case DType::Q8_1: return "q8_1"; case DType::Q4_K: return "q4_k";
         case DType::Q6_K: return "q6_k"; case DType::IQ3_XXS: return "iq3_xxs";
+        case DType::Q5_0: return "q5_0"; case DType::Q5_1: return "q5_1";
         default: return "unknown";
     }
 }
+// ggml block element counts: q8/q5/q4_0 groups are 32, super-block K formats are 256.
 inline int dtype_block_elems(DType d) {
     switch (d) {
         case DType::F32: case DType::F16: case DType::BF16: return 1;
-        case DType::Q8_0: case DType::Q8_1: case DType::Q4_K: case DType::IQ3_XXS: return 32;
-        case DType::Q6_K: return 16;
+        case DType::Q8_0: case DType::Q8_1: case DType::Q5_0: case DType::Q5_1: return 32;
+        case DType::Q4_K: case DType::Q6_K: case DType::IQ3_XXS: return 256;
+        default: return 0;
+    }
+}
+// ggml block byte size (type_size) per dtype.
+inline int dtype_type_size(DType d) {
+    switch (d) {
+        case DType::F32: return 4;
+        case DType::F16: case DType::BF16: return 2;
+        case DType::Q8_0: return 34; case DType::Q8_1: return 36;
+        case DType::Q5_0: return 22; case DType::Q5_1: return 24;
+        case DType::Q4_K: return 144; case DType::Q6_K: return 210;
+        case DType::IQ3_XXS: return 110;
         default: return 0;
     }
 }
@@ -60,6 +76,20 @@ struct TensorInfo {
     int64_t xxh64 = 0;
     // expert part shapes (gate|up|down per-expert shapes, row-major)
     std::vector<int64_t> part_gate, part_up, part_down;
+    // per-part dtype names (e.g. gate/up=q4_k, down=q5_0). Empty for legacy
+    // packs — callers fall back to the tensor-level dtype in that case.
+    std::string part_dtype_gate, part_dtype_up, part_dtype_down;
+    // per-part byte lengths (bytes per expert). Zero = unknown (legacy packs);
+    // derive from part shapes x block packing when absent.
+    int64_t part_bytes_gate = 0, part_bytes_up = 0, part_bytes_down = 0;
+    DType part_dtype(DType fallback, int part) const {
+        const std::string *s = part == 0 ? &part_dtype_gate : part == 1 ? &part_dtype_up : &part_dtype_down;
+        return s->empty() ? fallback : dtype_from_name(*s);
+    }
+    int64_t part_bytes(int64_t fallback, int part) const {
+        int64_t v = part == 0 ? part_bytes_gate : part == 1 ? part_bytes_up : part_bytes_down;
+        return v ? v : fallback;
+    }
 };
 
 struct ExpertIndex {
@@ -203,6 +233,16 @@ private:
                     for (auto &v : p->at("gate").arr) ti.part_gate.push_back(v->as_int());
                     for (auto &v : p->at("up").arr) ti.part_up.push_back(v->as_int());
                     for (auto &v : p->at("down").arr) ti.part_down.push_back(v->as_int());
+                }
+                if (const JValue *p = t.find("part_dtypes")) {
+                    if (const JValue *v = p->find("gate")) ti.part_dtype_gate = v->as_str();
+                    if (const JValue *v = p->find("up")) ti.part_dtype_up = v->as_str();
+                    if (const JValue *v = p->find("down")) ti.part_dtype_down = v->as_str();
+                }
+                if (const JValue *p = t.find("part_bytes")) {
+                    if (const JValue *v = p->find("gate")) ti.part_bytes_gate = v->as_int();
+                    if (const JValue *v = p->find("up")) ti.part_bytes_up = v->as_int();
+                    if (const JValue *v = p->find("down")) ti.part_bytes_down = v->as_int();
                 }
             }
             tensors_.push_back(ti);

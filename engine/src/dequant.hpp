@@ -1,5 +1,5 @@
 // dequant.hpp — bit-exact GGML dequantization reference (float32 outputs).
-// Phase 1 exactness scope: f32 / f16 / bf16 / q8_0 / q8_1.
+// Phase 1 exactness scope: f32 / f16 / bf16 / q8_0 / q8_1 / q5_0 / q5_1.
 // Q4_K / Q6_K are reference-complete (port of ggml dequantize_row_*_ref).
 // IQ3_XXS is scaffolding: requires ggml's iq3_tables (not vendored; Phase 1
 // model does not use it — calling it throws so no silent fallback exists).
@@ -49,8 +49,13 @@ inline float bf16_to_f32(uint16_t b) {
 struct BlockQ8_0 { uint16_t d; int8_t qs[32]; };          // 34 B
 struct BlockQ8_1 { uint16_t d, s; int8_t qs[32]; };       // 36 B
 struct BlockQ4_0 { uint16_t d; uint8_t qs[16]; };          // 18 B
-struct BlockQ4_K { uint8_t scales[12]; uint16_t d, dmin; uint8_t qs[128]; }; // 144 B
+struct BlockQ4_K { uint16_t d, dmin; uint8_t scales[12]; uint8_t qs[128]; }; // 144 B (ggml: d/dmin first)
+struct __attribute__((packed)) BlockQ5_0 { uint16_t d; uint8_t qh[4]; uint8_t qs[16]; };  // 22 B / 32 el
+struct __attribute__((packed)) BlockQ5_1 { uint16_t d, m; uint8_t qh[4]; uint8_t qs[16]; };// 24 B / 32 el
 struct BlockQ6_K { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; }; // 210 B
+static_assert(sizeof(BlockQ8_0) == 34 && sizeof(BlockQ8_1) == 36 && sizeof(BlockQ4_0) == 18, "ggml block layout");
+static_assert(sizeof(BlockQ4_K) == 144 && sizeof(BlockQ5_0) == 22 && sizeof(BlockQ5_1) == 24, "ggml block layout");
+static_assert(sizeof(BlockQ6_K) == 210, "ggml block layout");
 
 #define QK_K 256
 #define N_ADD_BLOCKS_4_K 8
@@ -97,6 +102,45 @@ inline void dequantize_row_q4_K_ref(const BlockQ4_K *x, float *y, int64_t k) {
             for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
             for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4) - m2;
             q += 32; is += 2;
+        }
+    }
+}
+
+inline void dequantize_row_q5_0_ref(const BlockQ5_0 *x, float *y, int64_t k) {
+    // bit-exact port of ggml dequantize_row_q5_0 (scalar reference)
+    const int qk = 32;
+    const int64_t nb = k / qk;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        uint32_t qh;
+        memcpy(&qh, x[i].qh, sizeof(qh));
+        for (int j = 0; j < qk / 2; ++j) {
+            const uint8_t xh_0 = ((qh >> (j +  0)) << 4) & 0x10;
+            const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
+            const int32_t x0 = ((x[i].qs[j] & 0xF) | xh_0) - 16;
+            const int32_t x1 = ((x[i].qs[j] >>   4) | xh_1) - 16;
+            y[i * qk + j] = x0 * d;
+            y[i * qk + j + qk / 2] = x1 * d;
+        }
+    }
+}
+
+inline void dequantize_row_q5_1_ref(const BlockQ5_1 *x, float *y, int64_t k) {
+    // bit-exact port of ggml dequantize_row_q5_1 (scalar reference)
+    const int qk = 32;
+    const int64_t nb = k / qk;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const float m = f16_to_f32(x[i].m);
+        uint32_t qh;
+        memcpy(&qh, x[i].qh, sizeof(qh));
+        for (int j = 0; j < qk / 2; ++j) {
+            const uint8_t xh_0 = ((qh >> (j +  0)) << 4) & 0x10;
+            const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
+            const int32_t x0 = (x[i].qs[j] & 0xF) | xh_0;
+            const int32_t x1 = (x[i].qs[j] >>   4) | xh_1;
+            y[i * qk + j] = x0 * d + m;
+            y[i * qk + j + qk / 2] = x1 * d + m;
         }
     }
 }
@@ -157,6 +201,14 @@ inline void dequant_row(DType dt, const void *blocks, float *y, int64_t n_elems)
         case DType::Q4_K:
             for (int64_t b = 0, nb = n_elems / QK_K; b < nb; b++)
                 dequantize_row_q4_K_ref((const BlockQ4_K *)blocks + b, y + b * QK_K, QK_K);
+            break;
+        case DType::Q5_0:
+            for (int64_t b = 0, nb = n_elems / 32; b < nb; b++)
+                dequantize_row_q5_0_ref((const BlockQ5_0 *)blocks + b, y + b * 32, 32);
+            break;
+        case DType::Q5_1:
+            for (int64_t b = 0, nb = n_elems / 32; b < nb; b++)
+                dequantize_row_q5_1_ref((const BlockQ5_1 *)blocks + b, y + b * 32, 32);
             break;
         case DType::Q6_K:
             for (int64_t b = 0, nb = n_elems / QK_K; b < nb; b++)

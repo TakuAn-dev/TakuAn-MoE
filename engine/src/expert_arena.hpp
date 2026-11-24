@@ -72,7 +72,13 @@ struct ArenaTelemetry {
 struct ExpertArenaCfg {
     std::string pack_path;
     std::vector<uint64_t> layer_base;  // absolute file byte offset per phys layer
-    uint64_t exp_stride = 0;           // bytes per expert blob (16 KiB aligned)
+    uint64_t exp_stride = 0;           // arena slot spacing = MAX pack stride over layers (16 KiB aligned)
+    // Optional per-layer PACK strides (Milestone 4B mixed-dtype packs). Empty —
+    // or a zero entry — means "use exp_stride for that layer", so uniform
+    // Q8_0 packs behave exactly as before. Streaming reads layer_base[layer]
+    // + exp * stride_at(layer) for stride_at(layer) bytes; arena slots stay
+    // fixed at exp_stride so kernel addressing never changes.
+    std::vector<uint64_t> layer_stride;
     int n_experts = 128;               // experts per layer
     size_t num_slots = 0;              // arena capacity (>= 8 required)
     std::string io_mode = "pread";     // "pread" | "mtlio" (mtlio falls back with warning)
@@ -89,6 +95,13 @@ public:
 
     void * base() const { return arena_.ptr(); }
     size_t slot_bytes() const { return cfg_.exp_stride; }
+    // PACK stride for one layer: per-layer override if set, else exp_stride.
+    uint64_t stride_at(int layer) const {
+        if (layer >= 0 && layer < (int)cfg_.layer_stride.size() &&
+            cfg_.layer_stride[(size_t)layer] != 0)
+            return cfg_.layer_stride[(size_t)layer];
+        return cfg_.exp_stride;
+    }
     size_t num_slots() const { return cfg_.num_slots; }
     size_t total_bytes() const { return arena_.bytes(); }
     bool mlocked() const { return arena_.mlocked(); }
