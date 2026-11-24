@@ -1,0 +1,11 @@
+build/
+/refs/
+models/
+*.pack
+*.m64pack
+*.strata
+*.gguf
+*.safetensors
+.DS_Store
+.antigravity/
+.venv-tools/
