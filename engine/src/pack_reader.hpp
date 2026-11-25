@@ -184,6 +184,28 @@ public:
         auto it = hdr_.hparams.find(key);
         return it == hdr_.hparams.end() ? fallback : it->second->as_str();
     }
+    // Per-layer int arrays (e.g. gemma4.attention.head_count_kv): empty when the
+    // key is absent; throws if present but not an array.
+    std::vector<int64_t> hparam_i64_arr(const std::string &key) const {
+        std::vector<int64_t> out;
+        auto it = hdr_.hparams.find(key);
+        if (it == hdr_.hparams.end()) return out;
+        const JValue * v = it->second.get();
+        if (v->type != JValue::Arr) throw std::runtime_error("json: hparam '" + key + "' is not an array");
+        for (auto &e : v->arr) out.push_back(e->as_int());
+        return out;
+    }
+    // Per-layer bool arrays (e.g. gemma4.attention.sliding_window_pattern, stored
+    // as [1, 1, ..., 0] ints in real Gemma 4 GGUF): accepts JSON bools and ints.
+    std::vector<bool> hparam_bool_arr(const std::string &key) const {
+        std::vector<bool> out;
+        auto it = hdr_.hparams.find(key);
+        if (it == hdr_.hparams.end()) return out;
+        const JValue * v = it->second.get();
+        if (v->type != JValue::Arr) throw std::runtime_error("json: hparam '" + key + "' is not an array");
+        for (auto &e : v->arr) out.push_back(e->as_bool());
+        return out;
+    }
 
 private:
     void parse_header(const std::string &json) {

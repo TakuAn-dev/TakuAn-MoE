@@ -81,6 +81,14 @@ def bytes_to_unicode():
     return dict(zip(bs, (chr(x) for x in c)))
 
 
+# SentencePiece-BPE (gemma4 / llama) pre-chunking: split ONLY at word
+# boundaries (before a space) and around newlines, so BPE merges can still
+# cross former piece edges while long prompts stay O(chunks) to tokenize.
+# The three alternatives cover every character: runs of "\n", optional single
+# leading space + word body, and pure space runs.
+_SPM_CHUNK_RE = re.compile(r"\n+| ?[^\n ]+| +")
+
+
 def _pre_tokenize(text):
     """Simplified GPT-2 split: contractions, ' +word, digit runs, alpha runs,
     space runs, punct runs."""
@@ -130,12 +138,22 @@ class BPE:
         self.eos_token_id = m.get("tokenizer.ggml.eos_token_id", None)
         self.eot_token_id = m.get("tokenizer.ggml.eot_token_id", None)
         self.chat_template = m.get("tokenizer.chat_template", "")
-        # GGUF token_type == 3 is CONTROL (special): e.g. <|endoftext|>,
-        # <|message_user|> ... Split encode() on these so chat-template
-        # control sequences tokenize to exactly one id.
+        self.model_type = m.get("tokenizer.ggml.model", "gpt2")
+        self.bos_token_id = m.get("tokenizer.ggml.bos_token_id", None)
+        self.add_bos_token = bool(m.get("tokenizer.ggml.add_bos_token", False))
+        # SentencePiece-BPE (Gemma 4 / Llama): word-space marker "▁" plus
+        # explicit <0xXX> byte-fallback tokens instead of GPT-2 byte-space.
+        self.is_spm_bpe = (self.model_type in ("gemma4", "llama")
+                           or ("\u2581" in self.id_of
+                               and "<0x20>" in self.id_of))
+        # GGUF token_type 3 is CONTROL (e.g. <|endoftext|>, <bos>, <eos>).
+        # SentencePiece-BPE GGUFs additionally carry USER_DEFINED (type 4)
+        # chat-template markers (e.g. <|channel>, <channel|>, <|turn>,
+        # <turn|>, <|think|>) that must tokenize to exactly one id.
+        sp_types = (3, 4) if self.is_spm_bpe else (3,)
         self.special_tokens = {t: i for i, t in enumerate(self.tokens)
                                if i < len(self.token_types)
-                               and self.token_types[i] == 3}
+                               and self.token_types[i] in sp_types}
         self.special_ids = set(self.special_tokens.values())
         if self.special_tokens:
             pat = "|".join(re.escape(t) for t in sorted(
@@ -143,6 +161,18 @@ class BPE:
             self._special_re = re.compile("(" + pat + ")")
         else:
             self._special_re = None
+        # Byte-fallback maps (<0x00>..<0xFF> token text -> id / id -> byte).
+        self._byte_tokens = {b: self.id_of["<0x%02X>" % b]
+                             for b in range(256)
+                             if "<0x%02X>" % b in self.id_of}
+        self._id_to_byte = {tid: bytes([b])
+                            for b, tid in self._byte_tokens.items()}
+
+    def _split_pieces(self, part):
+        """Chunk raw text into BPE pieces (never cuts inside a word)."""
+        if self.is_spm_bpe:
+            return [p for p in _SPM_CHUNK_RE.findall(part) if p]
+        return _pre_tokenize(part)
 
     def encode(self, text, allow_special=True):
         if allow_special and self._special_re is not None:
@@ -154,17 +184,16 @@ class BPE:
                 if sid is not None:
                     ids.append(sid)
                 else:
-                    for piece in _pre_tokenize(part):
+                    for piece in self._split_pieces(part):
                         ids += self._encode_piece(piece)
             return ids
         ids = []
-        for piece in _pre_tokenize(text):
+        for piece in self._split_pieces(text):
             ids += self._encode_piece(piece)
         return ids
 
-    def _encode_piece(self, piece):
-        s = "".join(self.b2u[b] for b in piece.encode("utf8"))
-        word = list(s)
+    def _merge(self, word):
+        """Greedy lowest-rank BPE merge loop (shared by both codecs)."""
         while len(word) > 1:
             best, br = -1, None
             for i in range(len(word) - 1):
@@ -174,6 +203,33 @@ class BPE:
             if best < 0:
                 break
             word[best:best + 2] = [word[best] + word[best + 1]]
+        return word
+
+    def _encode_piece(self, piece):
+        if self.is_spm_bpe:
+            piece = piece.replace(" ", "\u2581")
+            word = []
+            for ch in piece:
+                if ch in self.id_of:
+                    word.append(ch)
+                else:
+                    word.extend("<0x%02X>" % b
+                                for b in ch.encode("utf-8"))
+            word = self._merge(word)
+            out = []
+            for w in word:
+                i = self.id_of.get(w)
+                if i is not None:
+                    out.append(i)
+                else:  # unmerged symbol with no direct id -> byte fallback
+                    try:
+                        out.extend(self._byte_tokens[b]
+                                   for b in w.encode("utf-8"))
+                    except KeyError:
+                        raise ValueError(f"BPE: unknown token {w!r}")
+            return out
+        s = "".join(self.b2u[b] for b in piece.encode("utf8"))
+        word = self._merge(list(s))
         out = []
         for w in word:
             i = self.id_of.get(w)
@@ -186,7 +242,13 @@ class BPE:
         """Raw bytes of token id `tid` (GPT-2 byte-space chars reversed
         through u2b; any non-byte-space chars, e.g. the literal text of a
         special token like '<|endoftext|>', are appended as UTF-8 so nothing
-        is silently dropped)."""
+        is silently dropped). SentencePiece-BPE GGUFs instead map <0xXX>
+        byte tokens directly and turn the "▁" word marker back into " "."""
+        if self.is_spm_bpe:
+            b = self._id_to_byte.get(tid)
+            if b is not None:
+                return b
+            return self.tokens[tid].replace("\u2581", " ").encode("utf-8")
         t = self.tokens[tid]
         out = bytearray()
         buf = bytearray()

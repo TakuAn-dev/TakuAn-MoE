@@ -97,7 +97,9 @@ struct BenchCtx {
 static void run_bench(m64::MetalRuntime & rt) {
     using namespace m64;
     const uint32_t BE = 192;                    // bench expert nout
-    const size_t BPK = (size_t)26 * 1024 * 1024;
+    // 100 MiB: 26 MiB legacy Q8 pack + 27-82 MiB Milestone 7A f32-in regions.
+    // Still trivial next to Splash's resident pool on the shared 64 GB host.
+    const size_t BPK = (size_t)100 * 1024 * 1024;
     std::mt19937 g2(0xBEEF1234u);
     std::uniform_real_distribution<float> uf(-0.02f, 0.02f);
     std::vector<uint8_t> bp(BPK, 0);
@@ -453,6 +455,104 @@ static void run_bench(m64::MetalRuntime & rt) {
         bench("rms_mix_S8(2304)", IT, [&](id<MTLComputeCommandEncoder> en) {
             setl(en, "k_rms", &RM8, sizeof(RM8));
             [en dispatchThreadgroups:MTLSizeMake(8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+    }
+
+    // ---- 10. Milestone 7A: Q4_K gateup m1/m2 + Q5_0/Q5_1 down m1/m4 ----
+    // The Q8 lm_head span [pW2, pEX) (~10 MB, ~9.1 MB needed) is dead after
+    // the multi6/mix benches, so seed it with Q4_K / Q5_0 / Q5_1 expert blobs
+    // for timing only (parity is gated by tests 47-50, not the bench).
+    {
+        const uint64_t RQ4 = 9ull * 144ull;                    // Q4_K row bytes (k=2304)
+        const uint64_t R50 = 36ull * 22ull, R51 = 36ull * 24ull;  // Q5_0 / Q5_1 rows (k=1152)
+        auto al4k = [](uint64_t v) { return (v + 4095ull) & ~4095ull; };
+        const uint64_t pQ4G = pW2;
+        const uint64_t pQ4U = al4k(pQ4G + 8ull * BE * RQ4);
+        const uint64_t pQ50 = al4k(pQ4U + 8ull * BE * RQ4);
+        const uint64_t pQ51 = al4k(pQ50 + 8ull * BE * R50);
+        if (pQ51 + 8ull * BE * R51 > pEX) { fprintf(stderr, "bench: 7A blobs exceed pW2 span\n"); return; }
+        uint8_t * pp = (uint8_t *)pBuf.contents;
+        // Random bytes; mask f16 scale exponent bytes so no inf/nan/denormals.
+        auto seedq = [&](uint64_t off, uint64_t bytes, uint64_t blk, int f16n) {
+            for (uint64_t i = 0; i + 4 <= bytes; i += 4) { uint32_t r = g2(); memcpy(pp + off + i, &r, 4); }
+            for (uint64_t o = 0; o + blk <= bytes; o += blk) {
+                pp[off + o + 1] &= 0x3B;
+                if (f16n > 1) pp[off + o + 3] &= 0x3B;
+            }
+        };
+        seedq(pQ4G, 8ull * BE * RQ4, 144, 2);
+        seedq(pQ4U, 8ull * BE * RQ4, 144, 2);
+        seedq(pQ50, 8ull * BE * R50, 22, 1);
+        seedq(pQ51, 8ull * BE * R51, 24, 2);
+        MoeGateUpQ4KF32Args GQ{pQ4G, pQ4U, B.sX, B.sGate2, B.sU, B.sSel, 0u, BE, 2304u, (uint32_t)(BE * RQ4)};
+        bench("gateup_q4k_f32in_m1(BE=192)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_gateup_batch8_q4k_f32in", &GQ, sizeof(GQ));
+            [en dispatchThreadgroups:MTLSizeMake((8 * 2 * BE + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        bench("gateup_q4k_f32in_m2(BE=192)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_gateup_batch8_q4k_f32in_m2", &GQ, sizeof(GQ));
+            [en dispatchThreadgroups:MTLSizeMake((8 * BE + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        MoeDownQ5F32Args DQ0{pQ50, sStn, B.sAcc, B.sWt, B.sSel, 0u, 0u, BE, 1152u, (uint32_t)(BE * R50), 0u};
+        MoeDownQ5F32Args DQ1{pQ51, sStn, B.sAcc, B.sWt, B.sSel, 0u, 0u, BE, 1152u, (uint32_t)(BE * R51), 0u};
+        bench("down_q5_0_f32in_m1(BE=192)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_down_reduce8_q5_0_f32in", &DQ0, sizeof(DQ0));
+            [en dispatchThreadgroups:MTLSizeMake((BE + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        bench("down_q5_0_f32in_m4(BE=192)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_down_reduce8_q5_0_f32in_m4", &DQ0, sizeof(DQ0));
+            [en dispatchThreadgroups:MTLSizeMake((BE + 31) / 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        bench("down_q5_1_f32in_m1(BE=192)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_down_reduce8_q5_1_f32in", &DQ1, sizeof(DQ1));
+            [en dispatchThreadgroups:MTLSizeMake((BE + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        bench("down_q5_1_f32in_m4(BE=192)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_down_reduce8_q5_1_f32in_m4", &DQ1, sizeof(DQ1));
+            [en dispatchThreadgroups:MTLSizeMake((BE + 31) / 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+
+        // Real Inkling-2-Mini decode shapes (gate/up nout=1152 k=2304, down
+        // nout=2304 k=1152, 8 experts). At BE=192 the m4 grid starves the GPU
+        // (6 TGs); the parity-gated real shapes decide whether m2/m4 wins.
+        const uint32_t NR4 = 1152u, NR5 = 2304u;
+        const uint64_t pRG = (size_t)34ull * 1024 * 1024;         // past all legacy regions
+        const uint64_t pRU = al4k(pRG + 8ull * NR4 * RQ4);
+        const uint64_t pR0 = al4k(pRU + 8ull * NR4 * RQ4);
+        const uint64_t pR1 = al4k(pR0 + 8ull * NR5 * R50);
+        if (pR1 + 8ull * NR5 * R51 > BPK) { fprintf(stderr, "bench: 7A real-shape blobs exceed pack\n"); return; }
+        seedq(pRG, 8ull * NR4 * RQ4, 144, 2);
+        seedq(pRU, 8ull * NR4 * RQ4, 144, 2);
+        seedq(pR0, 8ull * NR5 * R50, 22, 1);
+        seedq(pR1, 8ull * NR5 * R51, 24, 2);
+        uint32_t sG2R = segf(8 * NR4), sUR = segf(8 * NR4), sHR = segf(8 * 1152);
+        if (c > (1u << 20)) { fprintf(stderr, "bench: scratch exhausted\n"); return; }
+        MoeGateUpQ4KF32Args GR{pRG, pRU, B.sX, sG2R, sUR, B.sSel, 0u, NR4, 2304u, (uint32_t)(NR4 * RQ4)};
+        bench("gateup_q4k_m1(real 8x1152)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_gateup_batch8_q4k_f32in", &GR, sizeof(GR));
+            [en dispatchThreadgroups:MTLSizeMake(8 * 2 * NR4 / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        bench("gateup_q4k_m2(real 8x1152)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_gateup_batch8_q4k_f32in_m2", &GR, sizeof(GR));
+            [en dispatchThreadgroups:MTLSizeMake(8 * NR4 / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        MoeDownQ5F32Args DR0{pR0, sHR, B.sAcc, B.sWt, B.sSel, 0u, 0u, NR5, 1152u, (uint32_t)(NR5 * R50), 0u};
+        MoeDownQ5F32Args DR1{pR1, sHR, B.sAcc, B.sWt, B.sSel, 0u, 0u, NR5, 1152u, (uint32_t)(NR5 * R51), 0u};
+        bench("down_q5_0_m1(real 2304)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_down_reduce8_q5_0_f32in", &DR0, sizeof(DR0));
+            [en dispatchThreadgroups:MTLSizeMake((NR5 + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        bench("down_q5_0_m4(real 2304)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_down_reduce8_q5_0_f32in_m4", &DR0, sizeof(DR0));
+            [en dispatchThreadgroups:MTLSizeMake((NR5 + 31) / 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        bench("down_q5_1_m1(real 2304)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_down_reduce8_q5_1_f32in", &DR1, sizeof(DR1));
+            [en dispatchThreadgroups:MTLSizeMake((NR5 + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        bench("down_q5_1_m4(real 2304)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_gemv_down_reduce8_q5_1_f32in_m4", &DR1, sizeof(DR1));
+            [en dispatchThreadgroups:MTLSizeMake((NR5 + 31) / 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         });
     }
 }
@@ -1654,6 +1754,148 @@ int main(int argc, char ** argv) {
                 printf("attn_f16 swa_ring p=1099 rel=%.3g mad=%.3g cos=%.8f %s\n",
                        rel, mad, cosv, pass ? "OK" : "FAIL");
             }
+
+            // ---- 39. Q8_0 KV cache (Milestone 5A): k_kv_write_q8 byte-exact
+            // 136 B/head encoding vs a host Q8 mirror (id = 127/amax, codes
+            // rint(x*id) clamp +-127, stored d = half(amax*(1/127)) — the
+            // kernel's EXACT arithmetic, which differs by 1 f32-ulp from
+            // amax/127), then k_attn_head_q8 vs the FP16 oracle: Q8 rounding
+            // noise dominates so the gate is isfinite + cos >= 0.999.
+            {
+                id<MTLBuffer> bKvQ8 = [rt.device() newBufferWithLength:(size_t)2u * RING_CAP * 1088u
+                                                               options:MTLResourceStorageModeShared];
+                CHECK(bKvQ8 != nil, "q8 kv buffer alloc");
+                const uint64_t kvv_u16_full = 20u * 544u;             // half-unit V base, ring_cap=20
+                const uint64_t kvv_u16_swa  = (uint64_t)RING_CAP * 544u;
+
+                auto q8_mirror = [&](const float * x128, uint8_t * at136) {
+                    for (uint32_t blk = 0; blk < 4u; blk++) {
+                        const float * xb = x128 + blk * 32u;
+                        float amax = 0.0f;
+                        for (uint32_t i = 0; i < 32u; i++) amax = std::max(amax, std::fabs(xb[i]));
+                        const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+                        for (uint32_t i = 0; i < 32u; i++) {
+                            int v = (int)std::rintf(xb[i] * id);
+                            v = v < -127 ? -127 : (v > 127 ? 127 : v);
+                            at136[blk * 32u + i] = (uint8_t)(int8_t)v;
+                        }
+                        const __fp16 hd = (__fp16)(amax * (1.0f / 127.0f));
+                        uint16_t hb; memcpy(&hb, &hd, 2);
+                        at136[128u + blk * 2u] = (uint8_t)hb;
+                        at136[129u + blk * 2u] = (uint8_t)(hb >> 8);
+                    }
+                };
+
+                id<MTLComputePipelineState> pWriteQ8 = rt.pipeline("k_kv_write_q8");
+                CHECK(pWriteQ8 != nil, "k_kv_write_q8 pipeline missing");
+
+                auto run_write_q8_range = [&](uint32_t count, uint32_t ring_cap) {
+                    if (!pWriteQ8 || !bKvQ8) { CHECK(false, "kv_write_q8 prerequisites"); return; }
+                    id<MTLCommandBuffer> cmd = [rt.queue() commandBuffer];
+                    id<MTLComputeCommandEncoder> en = [cmd computeCommandEncoder];
+                    [en setComputePipelineState:pWriteQ8];
+                    for (uint32_t j = 0; j < count; j++) {
+                        uint32_t slot = j % ring_cap;
+                        KVWriteF16Args kw{
+                            j * 2u * kKVD, j * 2u * kKVD + kKVD, kKVD, 0u,
+                            (uint64_t)slot * 544u,
+                            (uint64_t)ring_cap * 544u + (uint64_t)slot * 544u,
+                        };
+                        [en setBuffer:bStg offset:0 atIndex:0];
+                        [en setBytes:&kw length:sizeof(kw) atIndex:1];
+                        [en setBuffer:bKvQ8 offset:0 atIndex:2];
+                        [en dispatchThreadgroups:MTLSizeMake(8, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    }
+                    [en endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                    CHECK(cmd.status == MTLCommandBufferStatusCompleted,
+                          "k_kv_write_q8 status=%ld", (long)cmd.status);
+                    int bad = 0;
+                    const uint8_t * dev = (const uint8_t *)bKvQ8.contents;
+                    const uint64_t vbase_u16 = (uint64_t)ring_cap * 544u;
+                    uint8_t want[136];
+                    for (uint32_t j = 0; j < count; j++) {
+                        const uint32_t slot = j % ring_cap;
+                        if (j + ring_cap < count) continue; // overwritten by a later writer
+                        for (int s = 0; s < 2; s++) {
+                            const uint64_t byte_base =
+                                ((uint64_t)(s ? vbase_u16 : 0u) + (uint64_t)slot * 544u) * 2u;
+                            for (uint32_t kvh = 0; kvh < 8u; kvh++) {
+                                q8_mirror(stg + j * 2u * kKVD + (uint32_t)(s ? kKVD : 0) + kvh * kDH, want);
+                                if (memcmp(dev + byte_base + kvh * 136u, want, 136u) != 0) bad++;
+                            }
+                        }
+                    }
+                    CHECK(bad == 0, "k_kv_write_q8 rc=%u: %d head encodings vs host mirror", count, bad);
+                    printf("kv_write_q8 rc=%-5u       %d head mismatches (136B byte-exact) %s\n",
+                           ring_cap, bad, bad ? "FAIL" : "OK");
+                };
+
+                id<MTLComputePipelineState> pAttnQ8 = rt.pipeline("k_attn_head_q8");
+                CHECK(pAttnQ8 != nil, "k_attn_head_q8 pipeline missing");
+                auto run_attn_q8 = [&](const AttnF16Args & A) {
+                    if (!pAttnQ8 || !bKvQ8) { CHECK(false, "attn_q8 prerequisites"); return; }
+                    memcpy(bScr.contents, scr.data(), SCR_F * 4);
+                    memcpy(bPk.contents, pk.data(), PK_B);
+                    id<MTLCommandBuffer> cmd = [rt.queue() commandBuffer];
+                    id<MTLComputeCommandEncoder> en = [cmd computeCommandEncoder];
+                    [en setComputePipelineState:pAttnQ8];
+                    [en setBuffer:bScr offset:0 atIndex:0];
+                    [en setBytes:&A length:sizeof(A) atIndex:1];
+                    [en setBuffer:bPk offset:0 atIndex:2];
+                    [en setBuffer:bKvQ8 offset:0 atIndex:3];
+                    [en dispatchThreadgroups:MTLSizeMake(kNH, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    [en endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                    CHECK(cmd.status == MTLCommandBufferStatusCompleted,
+                          "k_attn_head_q8 status=%ld", (long)cmd.status);
+                    memcpy(scr.data(), bScr.contents, SCR_F * 4);
+                };
+
+                auto q8_gate = [&](const char * nm, const std::vector<float> & ref) {
+                    const float * got = scr.data() + sOut;
+                    bool fin = true;
+                    for (uint32_t i = 0; i < kNH * kDH; i++) if (!std::isfinite(got[i])) fin = false;
+                    double rel = max_rel(ref.data(), got, kNH * kDH), cosv = cosine(ref.data(), got, kNH * kDH);
+                    const bool pass = fin && cosv >= 0.999; // rel printed for visibility only
+                    CHECK(pass, "%s finite=%d rel=%.3g cos=%.8f", nm, (int)fin, rel, cosv);
+                    printf("%-26s finite=%d rel=%.3g cos=%.8f %s\n",
+                           nm, (int)fin, rel, cosv, pass ? "OK" : "FAIL");
+                };
+
+                // 39a: full attention (pos=19) at tau=1.0 / 1.25
+                run_write_q8_range(20u, 20u);
+                for (float tau : {1.0f, 1.25f}) {
+                    AttnF16Args aa{};
+                    aa.relbiaspack = rb;
+                    aa.kvkoff = 0u; aa.kvvoff = kvv_u16_full;
+                    aa.qoff = sQh; aa.rout = sRout; aa.sinkoff = sSink; aa.outoff = sOut;
+                    aa.pos = 19u; aa.is_swa = 0u; aa.n_swa = 1024u; aa.ring_cap = 20u;
+                    aa.scale = scale; aa.tau = tau;
+                    run_attn_q8(aa);
+                    std::vector<float> ref(kNH * kDH);
+                    ref_attn_f16(19u, 0u, 1024u, tau, ref);
+                    char nm[48];
+                    snprintf(nm, sizeof(nm), "attn_q8 full tau=%.2f", tau);
+                    q8_gate(nm, ref);
+                }
+                // 39b: SWA ring wrap-around (1100 writes into ring_cap=1025,
+                // pos=1099 -> attends j=75..1099 through the wrapped slots)
+                run_write_q8_range(N_WRITE, RING_CAP);
+                {
+                    AttnF16Args aa{};
+                    aa.relbiaspack = rb;
+                    aa.kvkoff = 0u; aa.kvvoff = kvv_u16_swa;
+                    aa.qoff = sQh; aa.rout = sRout; aa.sinkoff = sSink; aa.outoff = sOut;
+                    aa.pos = N_WRITE - 1u; aa.is_swa = 1u; aa.n_swa = 1024u; aa.ring_cap = RING_CAP;
+                    aa.scale = scale; aa.tau = 1.0f;
+                    run_attn_q8(aa);
+                    std::vector<float> ref(kNH * kDH);
+                    ref_attn_f16(N_WRITE - 1u, 1u, 1024u, 1.0f, ref);
+                    q8_gate("attn_q8 swa_ring p=1099", ref);
+                }
+                bKvQ8 = nil;
+            }
         }
 
         // ============ Milestone 4B: decode Q4_K / Q5_0 / Q5_1 (FP32-input MoE) ============
@@ -1965,6 +2207,87 @@ int main(int argc, char ** argv) {
                 CHECK(bad == 0, "down q5_1 zero-x %d nonzero outputs", bad);
                 printf("%-38s zero-x bitwise %s\n", "down_reduce8_q5_1_f32in zero-x", bad ? "FAIL" : "OK");
                 memcpy(h, save.data(), 8u * 1152u * 4);
+            }
+
+            // ============ Milestone 7A: _m2 / _m4 bitwise parity vs m1 ============
+            // The optimized kernels keep per-row FMA order, lane block iteration
+            // and simd_sum trees identical, so parity is exact-bit (stronger than
+            // the fp64 1024-ulp gate; poison-filled outputs catch unwritten slots).
+            {
+                auto cmp_bits = [&](const char * nm, const std::vector<float> & ref,
+                                    uint32_t off, size_t n) {
+                    const uint32_t * pa = (const uint32_t *)ref.data();
+                    const uint32_t * pb = (const uint32_t *)(scr.data() + off);
+                    size_t bad = 0, widx = 0;
+                    for (size_t i = 0; i < n; i++) if (pa[i] != pb[i]) { if (!bad) widx = i; bad++; }
+                    CHECK(bad == 0, "%s %zu bitwise mismatches (first @ %zu)", nm, bad, widx);
+                    printf("%-38s bitwise vs m1 %s\n", nm, bad ? "FAIL" : "OK");
+                };
+                auto cmp_gateup = [&](uint32_t nout, uint32_t wtab_on) {
+                    for (uint32_t e = 0; e < 8u; e++) sel[e] = wtab_on ? expids[e] : e;
+                    MoeGateUpQ4KF32Args A{};
+                    A.woff = wgt; A.woff2 = wup; A.xoff = sx; A.yoff = sgy; A.yoff2 = suy;
+                    A.seloff = ssel; A.wtab_off = wtab_on ? swtab : 0u; A.nout = nout; A.k = 2304u;
+                    A.stride = (size_t)NO4 * NB4 * 144;
+                    run("k_gemv_gateup_batch8_q4k_f32in", true, 2u * nout, 1, 256, &A, sizeof(A));
+                    std::vector<float> rg(scr.data() + sgy, scr.data() + sgy + 8u * nout);
+                    std::vector<float> ru(scr.data() + suy, scr.data() + suy + 8u * nout);
+                    memset(scr.data() + sgy, 0x7F, 8u * nout * 4);
+                    memset(scr.data() + suy, 0x7F, 8u * nout * 4);
+                    run("k_gemv_gateup_batch8_q4k_f32in_m2", true, 2u * ((nout + 1u) >> 1u), 1, 256, &A, sizeof(A));
+                    char nm[64];
+                    snprintf(nm, sizeof(nm), "gateup q4k m2 nout=%u %s gate", nout, wtab_on ? "wtab" : "direct");
+                    cmp_bits(nm, rg, sgy, 8u * nout);
+                    snprintf(nm, sizeof(nm), "gateup q4k m2 nout=%u %s up", nout, wtab_on ? "wtab" : "direct");
+                    cmp_bits(nm, ru, suy, 8u * nout);
+                };
+                auto cmp_down = [&](bool q51, uint32_t nout, uint32_t wtab_on, const uint32_t * slots) {
+                    for (uint32_t e = 0; e < 8u; e++) sel[e] = wtab_on ? expids[e] : e;
+                    for (uint32_t e = 0; e < 8u; e++) wts[e] = R.f(-1.5f, 1.5f);
+                    if (slots) wts[2] = 0.0f;   // zero-weight expert must drop out
+                    MoeDownQ5F32Args A{};
+                    A.woff = wdn; A.hoff = sh; A.accoff = sacc; A.wtoff = swt; A.seloff = ssel;
+                    A.wtab_off = wtab_on ? swtab : 0u; A.nout = nout; A.k = 1152u;
+                    A.stride = (size_t)NO5 * NB5 * (q51 ? 24 : 22);
+                    run(q51 ? "k_gemv_down_reduce8_q5_1_f32in" : "k_gemv_down_reduce8_q5_0_f32in",
+                        true, (nout + 7u) / 8u, 1, 256, &A, sizeof(A));
+                    std::vector<float> ref(scr.data() + sacc, scr.data() + sacc + nout);
+                    memset(scr.data() + sacc, 0x7F, nout * 4);
+                    run(q51 ? "k_gemv_down_reduce8_q5_1_f32in_m4" : "k_gemv_down_reduce8_q5_0_f32in_m4",
+                        true, (nout + 31u) / 32u, 1, 256, &A, sizeof(A));
+                    char nm[64];
+                    snprintf(nm, sizeof(nm), "down %s m4 nout=%u %s", q51 ? "q5_1" : "q5_0", nout,
+                             wtab_on ? "wtab" : "direct");
+                    cmp_bits(nm, ref, sacc, nout);
+                };
+
+                // Test 47: gateup q4_k m2 == m1, Inkling dims (nout=1152) direct
+                cmp_gateup(NO4, 0);
+
+                // Test 48: gateup q4_k m2 == m1, odd tail nout=173 + wtab indirection
+                cmp_gateup(173u, 0);
+                {
+                    const uint32_t gslots[8] = {5u, 2u, 7u, 0u, 3u, 6u, 1u, 4u};
+                    for (uint32_t s = 0; s < 1024u; s++) wt[s] = 0u;
+                    for (uint32_t e = 0; e < 8u; e++) wt[expids[e]] = gslots[e];
+                    cmp_gateup(NO4, 1);
+                }
+
+                // Test 49: down q5_0 m4 == m1, full nout=2304 + odd tail 173
+                fill_q5_blobs(false);
+                cmp_down(false, NO5, 0, nullptr);
+                cmp_down(false, 173u, 0, nullptr);
+
+                // Test 50: down q5_1 m4 == m1, full + wtab slots + zero-weight expert
+                fill_q5_blobs(true);
+                cmp_down(true, NO5, 0, nullptr);
+                {
+                    const uint32_t slots[8] = {7u, 0u, 3u, 7u, 1u, 5u, 6u, 4u};
+                    for (uint32_t s = 0; s < 1024u; s++) wt[s] = 0u;
+                    for (uint32_t e = 0; e < 8u; e++) wt[expids[e]] = slots[e];
+                    cmp_down(true, 100u, 1, slots);
+                }
+                set_sel(modsel8);
             }
         }
 

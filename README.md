@@ -50,6 +50,36 @@ Repository: https://github.com/TakuAn-dev/TakuAn-MoE
     timeouts during extended reasoning), and clean `SIGUSR1` in-flight `GEN`
     cancellation (`DONE ... cancelled`) with `stdout` pipe draining on client
     disconnect/stop (no worker pipe deadlock).
+- **Milestone 5 — KV cache dtype**: `--kv-type f16|q8_0` selects the Metal
+  KV cache format (`q8_0` roughly halves KV memory at long contexts;
+  Metal-only, `f16` default).
+- **Milestone 6 — Multi-model architecture dispatch** (`gemma-4-26B-A4B`,
+  `arch = gemma4`, alongside Inkling-2-Mini): `tools/m64pack.py` pack
+  converter, `m64run` CPU oracle + Metal FP16/Q8_0 KV kernels, and
+  `takuan_server.py` Gemma 4 support — SentencePiece-BPE tokenizer
+  (`tokenizer.ggml.model == "gemma4"`, `▁` word marker + `<0xXX>` byte
+  fallback) and the `<|turn>role ... <turn|>` chat template with
+  `<|channel>thought\n…<channel|>` thinking channels streamed live as
+  `delta.reasoning_content`.
+- **Milestone 7 — Decode & serving optimizations** (measured):
+  - Inkling `Q4_K` / `Q5_0` / `Q5_1` decode MoE kernels: activation-register
+    sharing across 2 rows (`k_gemv_gateup_batch8_q4k_f32in_m2`) / 4 rows
+    (`k_gemv_down_reduce8_q5_{0,1}_f32in_m4`) — **1.12–1.22x** faster MoE
+    gemv at real Inkling shapes, bitwise-identical to the m1 kernels.
+  - Prompt-lookup speculative decoding (`--speculative N` / `--draft-tokens N`,
+    0..8, default `0` = off): n-gram draft lookup + batch verify with
+    snapshot/restore rollback — no draft model, no extra memory, and verify
+    argmax bitwise-equal to plain greedy (Metal, Inkling, `temp==0`).
+    Includes branch re-verify elimination, early anchor streaming and adaptive
+    cooldown.
+  - Smooth SSE streaming: the sampler pre-filters top-p candidates
+    (`prob >= 1e-6 * prob[max]`, full-sort fallback on flat rows keeps the
+    distribution exact) instead of sorting all 201k vocab entries per token —
+    **2.09 → 0.825 ms/tok** sampler cost (`nv=201,024`) — plus `TCP_NODELAY`
+    on SSE connections so per-token chunks stream without Nagle burstiness.
+  - RAM prefix stash: when interrupting short prompts would evict the active
+    conversation KV, the longest live checkpoint is stashed in RAM and
+    restored on resume, avoiding long-context re-prefill (automatic, no flags).
 
 ## Verified benchmarks (Apple M4 Max, 64 GB)
 
@@ -95,9 +125,11 @@ make
 
 `make test` (invoked by `scripts/check.sh`) generates a tiny synthetic pack +
 golden file in `build/fixture/` with `tools/make_test_fixture.py` (Python 3
-stdlib only) and runs `test_dequant`, `test_metal_parity`, `test_p2a_kernels`,
-`test_prefill_kernels`, `test_arena`, `test_prefix_disk` and the server test
-suite.
+stdlib only; plus a tiny Gemma 4 fixture via `tools/make_gemma4_fixture.py`)
+and runs `test_dequant`, `test_gemma4_cpu`, `test_gemma4_metal`,
+`test_metal_parity`, `test_p2a_kernels`, `test_prefill_kernels`,
+`test_sampler`, `test_spec_decode`, `test_arena`, `test_prefix_disk`,
+`test_prefix_stash` and the server test suite.
 
 ## Server
 
@@ -120,6 +152,10 @@ Connect any OpenAI SDK client with:
 - **Model:** `takuan-inkling-2-mini`
 - **API Key:** any non-empty string
 
+Gemma 4 packs (`--pack <MODEL_DIR>/gemma-4-26b-a4b*.m64pack` with the
+matching Gemma 4 GGUF via `--gguf`) are served the same way — the chat
+template and tokenizer are auto-selected from the GGUF metadata.
+
 ## Layout
 
 ```
@@ -127,7 +163,7 @@ engine/src      C++20 core + ObjC++ Metal host
 engine/kernels  MSL kernels (compiled at load, cached via MTLBinaryArchive)
 engine/tests    parity/unit tests
 tools/          m64pack.py, bpe_gguf.py, takuan_server.py, test_server.py,
-                make_test_fixture.py
+                make_test_fixture.py, make_gemma4_fixture.py
 scripts/        check.sh, swap_check.sh, gpu_validation_suite.sh
 docs/           DESIGN.md, BENCHMARKS.md
 ```

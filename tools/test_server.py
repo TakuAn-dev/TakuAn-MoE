@@ -14,11 +14,13 @@ Exit code 0 = all checks pass.
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -144,6 +146,40 @@ def test_worker(fix):
                              stdin=subprocess.DEVNULL, capture_output=True, text=True)
         check("m64run rejects unknown flag (rc=2)", bad.returncode == 2, bad.returncode)
 
+        # Milestone 5B --kv-type: q8_0 is a real flag (reaches init, rc=5 on
+        # tiny pack), invalid dtype / Metal-only violation are usage errors (rc=2).
+        kvq = subprocess.run([exe, pack, "--worker", "--ctx", "128",
+                              "--kv-type", "q8_0"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        check("m64run accepts --kv-type q8_0",
+              kvq.returncode == 5 and "unexpected hparams" in kvq.stderr,
+              (kvq.returncode, kvq.stderr.strip()[:80]))
+        kvbad = subprocess.run([exe, pack, "--kv-type", "foo"],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        check("m64run rejects --kv-type foo (rc=2)", kvbad.returncode == 2,
+              (kvbad.returncode, kvbad.stderr.strip()[:80]))
+        kvcpu = subprocess.run([exe, pack, "--backend", "cpu", "--kv-type", "q8_0"],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        check("m64run rejects --backend cpu --kv-type q8_0 (rc=2)",
+              kvcpu.returncode == 2, (kvcpu.returncode, kvcpu.stderr.strip()[:80]))
+
+        # Milestone 7B --speculative / --draft-tokens: valid values reach init
+        # (rc=5 hparams on tiny pack), out-of-range are usage errors (rc=2).
+        sp = subprocess.run([exe, pack, "--worker", "--ctx", "128",
+                             "--speculative", "4"],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        check("m64run accepts --speculative 4",
+              sp.returncode == 5 and "unexpected hparams" in sp.stderr,
+              (sp.returncode, sp.stderr.strip()[:80]))
+        spbad = subprocess.run([exe, pack, "--speculative", "9"],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        check("m64run rejects --speculative 9 (rc=2)", spbad.returncode == 2,
+              (spbad.returncode, spbad.stderr.strip()[:80]))
+        dpbad = subprocess.run([exe, pack, "--draft-tokens", "9"],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        check("m64run rejects --draft-tokens 9 (rc=2)", dpbad.returncode == 2,
+              (dpbad.returncode, dpbad.stderr.strip()[:80]))
+
     # Always test the full line protocol against MOCK_WORKER (no 26 GiB pack needed).
     tmp = tempfile.mkdtemp(prefix="takuan_worker_")
     mock_py = os.path.join(tmp, "mock_worker.py")
@@ -174,6 +210,29 @@ def test_worker(fix):
     _, err2 = w.gen("nope")
     check("bad_command", err2 == "ERR bad_command", err2)
     check("QUIT exits 0", w.close() == 0)
+
+    # ---- Milestone 7B: the SPEC accept-rate stats line before DONE must be
+    # ignored by the protocol parser (toks/DONE unchanged).
+    spec_py = os.path.join(tmp, "spec_mock.py")
+    with open(spec_py, "w") as f:
+        f.write(
+            'import sys\n'
+            'sys.stdout.write("READY vocab=32 ctx=64\\n"); sys.stdout.flush()\n'
+            'while True:\n'
+            '    line = sys.stdin.readline()\n'
+            '    if not line or line.strip() == "QUIT": break\n'
+            '    n = int(line.split()[1])\n'
+            '    for t in range(1, n + 1):\n'
+            '        sys.stdout.write("TOK %d\\n" % t); sys.stdout.flush()\n'
+            '    sys.stdout.write("SPEC drafted=8 accepted=6 rounds=2 '
+            'rollbacks=1 accept_rate=0.7500\\n"); sys.stdout.flush()\n'
+            '    sys.stdout.write("DONE %d 12.5 length\\n" % n); sys.stdout.flush()\n')
+    sw = PWorker([sys.executable, spec_py])
+    check("spec mock READY", sw.line().startswith("READY"))
+    stok, sdone = sw.gen("GEN 4 0 1.0 42 -1 -- 1 2 3")
+    check("SPEC line skipped; toks/DONE intact",
+          stok == [1, 2, 3, 4] and sdone.startswith("DONE 4"), (stok, sdone))
+    check("spec mock QUIT exits 0", sw.close() == 0)
 
     real_pack = os.environ.get("TAKUAN_REAL_PACK")
     if real_pack and os.path.exists(real_pack) and os.path.exists(exe):
@@ -770,6 +829,15 @@ def test_prefix_cache(fix):
     check("takuan_server exposes --cache-dir",
           help_res.returncode == 0 and "--cache-dir" in help_res.stdout,
           help_res.returncode)
+    check("takuan_server exposes --kv-type",
+          help_res.returncode == 0 and "--kv-type" in help_res.stdout,
+          help_res.returncode)
+    check("takuan_server exposes --speculative",
+          help_res.returncode == 0 and "--speculative" in help_res.stdout,
+          help_res.returncode)
+    check("takuan_server exposes --draft-tokens",
+          help_res.returncode == 0 and "--draft-tokens" in help_res.stdout,
+          help_res.returncode)
 
     # ---- legacy worker: warm() swallows ERR bad_command, worker stays usable
     tmp = tempfile.mkdtemp(prefix="takuan_prefix_")
@@ -783,6 +851,87 @@ def test_prefix_cache(fix):
     check("worker usable after legacy WARM",
           sum(1 for g in got if g[0] == "tok") == 4, got)
     ew.close()
+
+    # ---- Milestone 7B: takuan_server validates --speculative range.
+    spbad = subprocess.run(
+        [sys.executable, os.path.join(HERE, "takuan_server.py"),
+         "--gguf", os.path.join(fix, "tiny.gguf"),
+         "--worker-cmd", sys.executable + " -c pass",
+         "--speculative", "9"],
+        capture_output=True, text=True)
+    check("takuan_server rejects --speculative 9 (rc=2)",
+          spbad.returncode == 2 and "--speculative must be 0..8" in spbad.stderr,
+          (spbad.returncode, spbad.stderr.strip()[-80:]))
+    dpbad = subprocess.run(
+        [sys.executable, os.path.join(HERE, "takuan_server.py"),
+         "--gguf", os.path.join(fix, "tiny.gguf"),
+         "--worker-cmd", sys.executable + " -c pass",
+         "--draft-tokens", "42"],
+        capture_output=True, text=True)
+    check("takuan_server rejects --draft-tokens 42 (rc=2)",
+          dpbad.returncode == 2 and "--draft-tokens must be 0..8" in dpbad.stderr,
+          (dpbad.returncode, dpbad.stderr.strip()[-80:]))
+
+    # ---- Milestone 5B: EngineWorker takes kv_type and the worker_cmd
+    # pass-through preserves explicit --kv-type tokens in the argv list.
+    ewk = takuan_server.EngineWorker(None, None, "metal", 64, 0.0, "pread",
+                                     kv_type="q8_0",
+                                     worker_cmd=sys.executable + " " + mock_py
+                                                + " --kv-type q8_0")
+    ki = ewk.cmd.index("--kv-type")
+    check("EngineWorker cmd carries --kv-type q8_0",
+          ewk.cmd[ki:ki + 2] == ["--kv-type", "q8_0"], ewk.cmd)
+    ewk.close()
+
+    # ---- regression: --kv-type CLI arg must reach EngineWorker.cmd via main()
+    # (bug: main() built EngineWorker without kv_type=, so the real m64run
+    # subprocess always got the default f16). A fake engine binary echoes its
+    # argv to a file so we can inspect the exact subprocess command line.
+    fake_engine = os.path.join(tmp, "fake_engine.py")
+    with open(fake_engine, "w") as f:
+        f.write(
+            '#!%s\n' % sys.executable +
+            'import os, sys\n'
+            'with open(os.environ["FAKE_ENGINE_ARGV"], "w") as fh:\n'
+            '    fh.write("\\n".join(sys.argv[1:]))\n'
+            'sys.stdout.write("READY vocab=32 ctx=64\\n"); sys.stdout.flush()\n'
+            'while True:\n'
+            '    line = sys.stdin.readline()\n'
+            '    if not line or line.strip() == "QUIT": break\n'
+        )
+    os.chmod(fake_engine, 0o755)
+    argv_file = os.path.join(tmp, "engine_argv.txt")
+    srv = subprocess.Popen(
+        [sys.executable, os.path.join(HERE, "takuan_server.py"),
+         "--gguf", os.path.join(fix, "tiny.gguf"),
+         "--engine", fake_engine, "--pack", os.path.join(tmp, "fake.m64pack"),
+         "--kv-type", "q8_0", "--port", "0", "--host", "127.0.0.1"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        env=dict(os.environ, FAKE_ENGINE_ARGV=argv_file))
+    ready_line = ""
+    try:
+        ready_line = srv.stderr.readline()
+    except Exception:
+        pass
+    check("server starts with fake engine + --kv-type q8_0",
+          "serving" in ready_line, ready_line.strip())
+    deadline = time.time() + 10
+    argv_lines = []
+    while time.time() < deadline:
+        if os.path.exists(argv_file):
+            with open(argv_file) as fh:
+                argv_lines = fh.read().split("\n")
+            break
+        time.sleep(0.05)
+    srv.terminate()
+    try:
+        srv.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        srv.kill()
+    ki = argv_lines.index("--kv-type") if "--kv-type" in argv_lines else -1
+    check("main() forwards --kv-type q8_0 into worker subprocess argv",
+          ki >= 0 and argv_lines[ki:ki + 2] == ["--kv-type", "q8_0"],
+          argv_lines)
 
     # ---- disk-warm worker: WARMED <n> disk -> EngineWorker.warm() True
     disk_mock = os.path.join(tmp, "disk_mock.py")
@@ -837,6 +986,34 @@ def test_prefix_cache(fix):
     exec(STUB_BPE_SRC, empty_ns)
     pb, pi = takuan_server.split_static_chat_prefix(hist, empty_ns["BPE"]())
     check("no-inkling bpe yields empty prefix", pb == "" and pi == [], repr(pb))
+
+    # _maybe_warm_static_prefix directly: a <64-token prefix (below the 64
+    # floor) with a 1024+ long warm pinned must flag warm_needs_sync before
+    # bailing — the GEN it accompanies resets the worker's warm_state, so
+    # the next long turn has to re-pin the warm prefix (the <512 guard
+    # already did this; the <64 early return skipped it before).
+    cfgw = types.SimpleNamespace(
+        bpe=tbpe, ctx=2048, warm_lock=threading.Lock(), last_warm_len=1500,
+        warm_needs_sync=False, last_warm_prefix=None, last_warm_ids=None,
+        warm=None)
+    takuan_server.Handler._maybe_warm_static_prefix(
+        types.SimpleNamespace(cfg=cfgw),
+        [{"role": "system", "content": "S"},
+         {"role": "user", "content": "title?"}],
+        {"reasoning_effort": "none"}, None)
+    check("micro (<64 tok) prefix flags warm re-sync",
+          cfgw.warm_needs_sync is True, repr(cfgw.warm_needs_sync))
+    cfgw2 = types.SimpleNamespace(
+        bpe=tbpe, ctx=2048, warm_lock=threading.Lock(), last_warm_len=0,
+        warm_needs_sync=False, last_warm_prefix=None, last_warm_ids=None,
+        warm=None)
+    takuan_server.Handler._maybe_warm_static_prefix(
+        types.SimpleNamespace(cfg=cfgw2),
+        [{"role": "system", "content": "S"},
+         {"role": "user", "content": "title?"}],
+        {"reasoning_effort": "none"}, None)
+    check("micro prompt without pinned warm stays unflagged",
+          cfgw2.warm_needs_sync is False, repr(cfgw2.warm_needs_sync))
 
     # ---- HTTP: WARM-supporting worker warmed ONCE across 2 turns sharing
     #      the same static system + tools prefix (warm_count == 1)
@@ -926,6 +1103,27 @@ def test_prefix_cache(fix):
         warm_calls, warm_lens = read_warm_log()
         check("consecutive long turn avoids redundant WARM",
               st == 200 and warm_calls == 3, (st, warm_calls, warm_lens))
+
+        # ---- ultra-tiny background request (<64-token static prefix):
+        #      skipped by WARM entirely, but it still GENs and resets the
+        #      worker's warm_state, so the NEXT long turn must re-pin the
+        #      warm prefix (warm call #4).
+        micro_bg = [{"role": "system", "content": "S"},
+                    {"role": "user", "content": "title?"}]
+        st, raw, _ = http("POST", base + "/v1/chat/completions",
+                          {"messages": micro_bg, "max_tokens": 64})
+        warm_calls, warm_lens = read_warm_log()
+        check("micro background prompt skips WARM",
+              st == 200 and warm_calls == 3, (st, warm_calls, warm_lens))
+        long_turn4 = long_turn3 + [{"role": "assistant", "content": "Hi there"},
+                                   {"role": "user", "content": "fourth"}]
+        st, raw, _ = http("POST", base + "/v1/chat/completions",
+                          {"messages": long_turn4, "tools": tools,
+                           "max_tokens": 64})
+        warm_calls, warm_lens = read_warm_log()
+        check("long prefix re-syncs after <64 tok micro prompt",
+              st == 200 and warm_calls == 4 and warm_lens[-1] >= 1024,
+              (st, warm_calls, warm_lens))
     finally:
         proc.terminate()
         try:
@@ -1208,6 +1406,278 @@ def test_disconnect_drain(fix):
             proc.kill()
 
 
+# --------------------------------------------------------------------------
+# 9. Gemma 4 multi-model arch dispatch (real tiny_gemma4.m64pack, no mock)
+# --------------------------------------------------------------------------
+def test_gemma4_worker(fix):
+    print("[9] Gemma 4 m64run multi-model dispatch (tiny_gemma4.m64pack)")
+    exe = os.path.join(ROOT, "build", "m64run")
+    g4pack = os.path.join(ROOT, "build", "fixture", "tiny_gemma4.m64pack")
+    if not os.path.exists(g4pack):
+        print("  skip tiny_gemma4.m64pack missing (run `make test` to generate)")
+        return
+    check("tiny_gemma4.m64pack exists", os.path.exists(g4pack), g4pack)
+
+    # 1. Metal FP16 worker: READY + WARM-disabled + greedy GEN + clean QUIT.
+    w = PWorker([exe, g4pack, "--worker", "--backend", "metal", "--ctx", "32"])
+    check("gemma4 metal READY vocab=32 ctx=32",
+          w.line() == "READY vocab=32 ctx=32")
+    w.proc.stdin.write("WARM 1 2 3\n")
+    w.proc.stdin.flush()
+    check("gemma4 WARM cleanly disabled", w.line() == "WARMED 0 disabled")
+    toks_m, done_m = w.gen("GEN 4 0.0 1.0 1 -1 -- 5 10")
+    check("gemma4 metal GEN emits 4 tokens",
+          toks_m is not None and len(toks_m) == 4, (toks_m, done_m))
+    check("gemma4 metal tokens in vocab range",
+          toks_m is not None and all(0 <= t < 32 for t in toks_m), toks_m)
+    check("gemma4 metal DONE 4 length",
+          done_m.split()[1] == "4" and done_m.split()[3] == "length", done_m)
+    check("gemma4 metal QUIT exits 0", w.close() == 0)
+
+    # 2. CPU oracle worker: greedy tokens bitwise-identical to Metal FP16.
+    wc = PWorker([exe, g4pack, "--worker", "--backend", "cpu", "--ctx", "32"])
+    check("gemma4 cpu READY vocab=32 ctx=32",
+          wc.line() == "READY vocab=32 ctx=32")
+    toks_c, done_c = wc.gen("GEN 4 0.0 1.0 1 -1 -- 5 10")
+    check("gemma4 cpu==metal greedy parity", toks_c == toks_m, (toks_c, toks_m))
+    check("gemma4 cpu DONE 4 length",
+          done_c.split()[1] == "4" and done_c.split()[3] == "length", done_c)
+    check("gemma4 cpu QUIT exits 0", wc.close() == 0)
+
+    # 3. Metal Q8_0 KV worker: valid 4-token greedy stream.
+    wq = PWorker([exe, g4pack, "--worker", "--backend", "metal",
+                  "--kv-type", "q8_0", "--ctx", "32"])
+    check("gemma4 q8_0 KV READY vocab=32 ctx=32",
+          wq.line() == "READY vocab=32 ctx=32")
+    toks_q, done_q = wq.gen("GEN 4 0.0 1.0 1 -1 -- 5 10")
+    check("gemma4 q8_0 KV emits 4 valid tokens",
+          toks_q is not None and len(toks_q) == 4
+          and all(0 <= t < 32 for t in toks_q), (toks_q, done_q))
+    check("gemma4 q8_0 KV DONE 4 length",
+          done_q.split()[1] == "4" and done_q.split()[3] == "length", done_q)
+    check("gemma4 q8_0 KV QUIT exits 0", wq.close() == 0)
+
+    # 4. Arena streaming is not implemented for gemma4: clean init failure rc=5.
+    res = subprocess.run([exe, g4pack, "--worker", "--backend", "metal",
+                          "--arena-gb", "4", "--ctx", "32"],
+                         stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    check("gemma4 arena-gb rejected (rc=5)",
+          res.returncode == 5 and "arena streaming not yet implemented" in res.stderr,
+          (res.returncode, res.stderr.strip()[:120]))
+
+    # 5. Plain (non-worker) CLI mode on the gemma4 pack.
+    tmp = tempfile.mkdtemp(prefix="takuan_g4_")
+    ids_f = os.path.join(tmp, "ids.txt")
+    with open(ids_f, "w") as f:
+        f.write("5\n10\n")
+    res = subprocess.run([exe, g4pack, "--ids-file", ids_f, "--steps", "3",
+                          "--backend", "metal"],
+                         stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    check("gemma4 plain CLI prints prefill_argmax",
+          res.returncode == 0 and "prefill_argmax=" in res.stdout,
+          (res.returncode, res.stdout.strip()[:120]))
+
+
+# --------------------------------------------------------------------------
+# 10. Gemma 4 tokenizer (SentencePiece-BPE) + chat template + channel stream
+# --------------------------------------------------------------------------
+def _write_gemma4_gguf(path):
+    """Metadata-only GGUF v3 (0 tensors) with a minimal Gemma 4
+    SentencePiece-BPE vocab: <0xXX> byte-fallback tokens (split around
+    <eos> so <eos> lands exactly at id 106), the "▁" word marker, CONTROL +
+    USER_DEFINED specials, and a merge chain spelling "▁world"."""
+    toks = ["<pad>", "<unk>", "<bos>"]
+    types = [1, 3, 3]
+    for b in range(0x67):                       # ids 3..105  <0x00>..<0x66>
+        toks.append("<0x%02X>" % b)
+        types.append(6)                          # GGUF BYTE
+    toks += ["<eos>", "<|turn>", "<turn|>", "<|channel>", "<channel|>",
+             "<|think|>", "\u2581", "Hello", "w", "o", "r", "l", "d",
+             "wo", "wor", "worl", "world", "\u2581world"]
+    types += [3, 4, 4, 4, 4, 4] + [1] * 12      # CONTROL, USER_DEFINED, NORMAL
+    for b in range(0x67, 0x100):                 # tail bytes <0x67>..<0xFF>
+        toks.append("<0x%02X>" % b)
+        types.append(6)
+    merges = ["w o", "wo r", "wor l", "worl d", "\u2581 world"]
+
+    def wstr(buf, s):
+        e = s.encode()
+        return buf + struct.pack("<Q", len(e)) + e
+
+    def kv(buf, k, t, payload):
+        return wstr(buf, k) + struct.pack("<I", t) + payload
+
+    def sarr(items):
+        p = struct.pack("<I", 8) + struct.pack("<Q", len(items))
+        for it in items:
+            p = wstr(p, it)
+        return p
+
+    kvs = b""
+    kvs = kv(kvs, "general.architecture", 8, struct.pack("<Q", 6) + b"gemma4")
+    kvs = kv(kvs, "tokenizer.ggml.model", 8, struct.pack("<Q", 6) + b"gemma4")
+    kvs = kv(kvs, "tokenizer.ggml.add_bos_token", 7, struct.pack("<?", True))
+    kvs = kv(kvs, "tokenizer.ggml.bos_token_id", 4, struct.pack("<I", 2))
+    kvs = kv(kvs, "tokenizer.ggml.eos_token_id", 4, struct.pack("<I", 106))
+    kvs = kv(kvs, "tokenizer.ggml.tokens", 9, sarr(toks))
+    kvs = kv(kvs, "tokenizer.ggml.token_type", 9,
+             struct.pack("<I", 4) + struct.pack("<Q", len(types))
+             + struct.pack("<%dI" % len(types), *types))
+    kvs = kv(kvs, "tokenizer.ggml.merges", 9, sarr(merges))
+    with open(path, "wb") as f:
+        f.write(b"GGUF" + struct.pack("<I", 3)
+                + struct.pack("<QQ", 0, 8) + kvs)
+
+
+def test_gemma4_tokenizer(fix):
+    print("[10] Gemma 4 tokenizer & chat template (unit + stream)")
+    from bpe_gguf import BPE, StreamDecoder
+    import takuan_server
+    tmp = tempfile.mkdtemp(prefix="takuan_g4_tok_")
+    g4gguf = os.path.join(tmp, "tiny_gemma4.gguf")
+    _write_gemma4_gguf(g4gguf)
+    b = BPE(g4gguf)
+
+    # --- tokenizer ---
+    check("gemma4 model_type + spm detection",
+          b.model_type == "gemma4" and b.is_spm_bpe,
+          (b.model_type, b.is_spm_bpe))
+    check("bos/eos metadata", b.add_bos_token and b.bos_token_id == 2
+          and b.eos_token_id == 106,
+          (b.add_bos_token, b.bos_token_id, b.eos_token_id))
+    check("USER_DEFINED specials get exact ids",
+          all(b.special_tokens.get(t) == i for t, i in (
+              ("<|turn>", 107), ("<turn|>", 108), ("<|channel>", 109),
+              ("<channel|>", 110), ("<|think|>", 111))),
+          {t: i for t, i in b.special_tokens.items() if t.startswith("<|")})
+    ids = b.encode("Hello world")
+    check("spm ASCII+space roundtrip", b.decode(ids) == "Hello world",
+          repr(b.decode(ids)))
+    check("word-space merge: ' world' -> single '▁world' id",
+          b.encode(" world") == [123], b.encode(" world"))
+    ja = b.encode("\u3053\u3093\u306b\u3061\u306f")  #こんにちは
+    check("UTF-8 byte fallback: 15 <0xXX> ids",
+          len(ja) == 15 and all(b.tokens[t].startswith("<0x") for t in ja),
+          [b.tokens[t] for t in ja][:4])
+    check("UTF-8 byte fallback roundtrip",
+          b.decode(ja) == "\u3053\u3093\u306b\u3061\u306f", repr(b.decode(ja)))
+    sd = StreamDecoder(b)
+    got = "".join(sd.push(t) for t in ja) + sd.flush()
+    check("incremental UTF-8 across <0xXX> (no U+FFFD)",
+          got == "\u3053\u3093\u306b\u3061\u306f" and "\ufffd" not in got,
+          repr(got))
+    turn = "<|turn>user\nHello<turn|>\n"
+    sids = b.encode(turn)
+    check("chat markers -> exact single ids",
+          sids[0] == 107 and 108 in sids, sids)
+    check("special roundtrip decode", b.decode(sids) == turn,
+          repr(b.decode(sids)))
+    check("skip_special_tokens decode",
+          b.decode(sids, skip_special_tokens=True) == "user\nHello\n",
+          repr(b.decode(sids, skip_special_tokens=True)))
+
+    # --- chat template ---
+    check("gemma4 template detected", takuan_server.has_gemma4_template(b))
+    msgs = [{"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"}]
+    p0 = takuan_server.format_chat_prompt(msgs, b, reasoning_effort="none")
+    check("none: BOS + system turn",
+          p0.startswith("<bos><|turn>system\nYou are helpful.<turn|>\n"),
+          repr(p0))
+    check("none: user turn", "<|turn>user\nHi<turn|>\n" in p0, repr(p0))
+    check("none: empty-thought generation prompt",
+          p0.endswith("<|turn>model\n<|channel>thought\n<channel|>"),
+          repr(p0[-48:]))
+    p1 = takuan_server.format_chat_prompt(msgs, b, reasoning_effort="medium")
+    check("medium: <|think|> injected in system turn",
+          p1.startswith("<bos><|turn>system\n<|think|>You are helpful."
+                        "<turn|>\n"), repr(p1))
+    check("medium: open model-turn generation prompt",
+          p1.endswith("<|turn>model\n"), repr(p1[-32:]))
+    hist = [{"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Yo",
+             "reasoning_content": "greet back"},
+            {"role": "tool", "tool_call_id": "x", "content": "res"}]
+    ph = takuan_server.format_chat_prompt(hist, b, reasoning_effort="none")
+    check("assistant history keeps thought channel",
+          "<|turn>model\n<|channel>thought\ngreet back\n<channel|>Yo"
+          "<turn|>\n" in ph, repr(ph))
+    check("tool role maps to user turn",
+          "<|turn>user\nres<turn|>\n" in ph, repr(ph))
+    eos = takuan_server.resolve_eos_ids(b)
+    check("resolve_eos_ids includes <turn|> and <eos>",
+          108 in eos and 106 in eos, eos)
+
+    # --- _make_stream_fn: <|channel>thought ... <channel|> routing ---
+    class FakeWorker:
+        def __init__(self, seq):
+            self.seq = seq
+
+        def generate(self, prompt_ids, max_tokens, temperature, top_p,
+                     seed, eos_ids):
+            for tid in self.seq:
+                yield ("tok", tid)
+            yield ("done", len(self.seq), 1.0, "stop")
+
+    seq = ([b.id_of["<|channel>"]] + b.encode("thought\nPlan\n")
+           + [b.id_of["<channel|>"]] + b.encode("Answer"))
+    events = []
+    res = takuan_server._make_stream_fn(FakeWorker(seq), b, 2048)(
+        [0], 512, 1.0, 1.0, 0, [],
+        lambda kind, payload: events.append((kind, payload)),
+        structured=False)
+    kinds = [k for k, _ in events]
+    rds = [p for k, p in events if k == "reasoning_delta"]
+    dls = [p for k, p in events if k == "delta"]
+    check("gemma4 thinking streams live as reasoning_delta",
+          "".join(rds) == "Plan\n", repr("".join(rds)))
+    check("channel header 'thought' never reaches text stream",
+          "".join(dls) == "Answer", repr("".join(dls)))
+    check("all reasoning_delta precede any text delta",
+          rds and dls
+          and max(i for i, k in enumerate(kinds) if k == "reasoning_delta")
+              < min(i for i, k in enumerate(kinds) if k == "delta"),
+          kinds[:14])
+    check("gemma4 result.reasoning accumulated", res["reasoning"] == "Plan\n",
+          repr(res["reasoning"]))
+    check("gemma4 result.text", res["text"] == "Answer", repr(res["text"]))
+    check("gemma4 finish_reason from DONE", res["finish"] == "stop",
+          res["finish"])
+
+
+def test_sse_tcp_nodelay():
+    print("[11] SSE writes bypass Nagle (Handler.disable_nagle_algorithm)")
+    import socketserver
+    import takuan_server
+
+    check("Handler disables Nagle",
+          takuan_server.Handler.disable_nagle_algorithm is True)
+
+    # socketserver applies the flag in StreamRequestHandler.setup() (the base
+    # class setup() is a no-op), so drive that and read the option back.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    cli = socket.create_connection(srv.getsockname(), timeout=5)
+    peer, _addr = srv.accept()
+    try:
+        # setup() only touches .request/.connection and the flag, so the
+        # handler is built without __init__ (which would need a real server).
+        handler = takuan_server.Handler.__new__(takuan_server.Handler)
+        handler.request = peer
+        socketserver.StreamRequestHandler.setup(handler)
+        # macOS reports a non-zero int for a set boolean option, not 1.
+        check("accepted connection gets TCP_NODELAY",
+              peer.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != 0)
+        check("setup() left the socket blocking for the reader loop",
+              peer.getblocking())
+    finally:
+        cli.close()
+        peer.close()
+        srv.close()
+
+
 def main():
     fix = _fixture_dir()
     t0 = time.time()
@@ -1219,6 +1689,9 @@ def main():
     test_sse_keepalive(fix)
     test_reasoning_stream(fix)
     test_disconnect_drain(fix)
+    test_gemma4_worker(fix)
+    test_gemma4_tokenizer(fix)
+    test_sse_tcp_nodelay()
     print("----")
     print("%d passed, %d failed (%.1fs)" % (PASSED, len(FAILED), time.time() - t0))
     if FAILED:

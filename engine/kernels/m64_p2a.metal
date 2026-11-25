@@ -621,6 +621,170 @@ kernel void k_attn_head_f16_reduce(device float * SCR [[buffer(0)]],
     m64_attn_f16_finish(SCR + A.outoff + h * 128u, t, oh, M, S);
 }
 
+// ---------------- Milestone 5A: Q8_0 KV cache (write + attention + split-K) --
+// Per KV head 136 B (8 B aligned): int8 qs[128] = 4 contiguous Q8_0 blocks of
+// 32 (d[blk] = amax_blk / 127 for elements [blk*32, blk*32+32)), then 4 half
+// scales d[4]. Per token slot 8 KV heads x 136 B = 1088 B (46.9% of FP16).
+// A.dst_k / A.dst_v / A.kvkoff / A.kvvoff KEEP their HALF-unit units ->
+// byte offsets via *2. Head base at KV + off*2 + slot*1088 + kvh*136.
+// Quant math mirrors k_quant/k_kv_write_q8_batch: d pre-rounding (codes use
+// the full-float id = 127/amax), stored d is f16-rounded, rint ties-to-even,
+// clamp +-127. dst bases must be multiples of 4 half units (8 B) for the
+// char4 stores.
+static inline char q8_c8(float x, float id) {
+    int v = (int)metal::rint(x * id);
+    v = (v < -127) ? -127 : ((v > 127) ? 127 : v);
+    return (char)v;
+}
+
+// grid = (8, 1, 1), threadgroup = (32, 1, 1): kvh from TGPG.x. Lanes 0..7,
+// 8..15, 16..23, 24..31 are the independent 8-lane quant groups of the 4
+// 32-element blocks (xor masks 1/2/4 never cross a group).
+kernel void k_kv_write_q8(const device float * SCR [[buffer(0)]],
+                          constant KVWriteF16Args & A [[buffer(1)]],
+                          device uchar * KV [[buffer(2)]],
+                          uint3 M64_TITG [[thread_position_in_threadgroup]],
+                          uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    const uint kvh = M64_TGPG.x, lane = M64_TITG.x;
+    const uint t = lane * 4u;
+    const uint blk = lane >> 3u;
+    const device float * src[2] = {SCR + A.koff + kvh * 128u + t,
+                                   SCR + A.voff + kvh * 128u + t};
+    device uchar * dst[2] = {KV + (size_t)A.dst_k * 2ul + (size_t)kvh * 136ul,
+                             KV + (size_t)A.dst_v * 2ul + (size_t)kvh * 136ul};
+    #pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const device float * x = src[s];
+        const float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+        float amax = fmax(fmax(fabs(x0), fabs(x1)), fmax(fabs(x2), fabs(x3)));
+        amax = fmax(amax, simd_shuffle_xor(amax, 1u));
+        amax = fmax(amax, simd_shuffle_xor(amax, 2u));
+        amax = fmax(amax, simd_shuffle_xor(amax, 4u));
+        const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        char4 q;
+        q.x = q8_c8(x0, id); q.y = q8_c8(x1, id);
+        q.z = q8_c8(x2, id); q.w = q8_c8(x3, id);
+        *(device char4 *)(dst[s] + t) = q;
+        if ((lane & 7u) == 0u)
+            ((device half *)(dst[s] + 128u))[blk] = half(amax * (1.0f / 127.0f));
+    }
+}
+
+// Attention over the Q8_0 KV buffer. Numerics mirror m64_attn_f16_range with
+// K/V dequantized on the fly: the 4-lane-per-block layout puts ONE Q8_0
+// block under each 8-lane group, so the block scale folds into kq per lane
+// BEFORE simd_sum (kd/vscale are lane-dependent: blk = lane >> 3).
+static inline void m64_attn_q8_range(
+    const device float * q, const device float * rout, float sink,
+    unsigned long relbiaspack, unsigned long kvkoff, unsigned long kvvoff,
+    uint pos, uint is_swa, uint ring_cap, float scale, float tau,
+    uint h, uint lane, uint j0, uint j1,
+    const device uchar * PACK, const device uchar * KV,
+    thread float * oh, thread float & M, thread float & S) {
+    const uint t = lane * 4u;
+    const uint kvh = h / 3u;
+    const uint blk = lane >> 3u;
+    half qh[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) { float qf = q[t + i] * tau; qh[i] = half(qf); }
+    const device uchar * kbase = KV + (size_t)kvkoff * 2ul + (size_t)kvh * 136ul;
+    const device uchar * vbase = KV + (size_t)kvvoff * 2ul + (size_t)kvh * 136ul;
+    for (uint j = j0; j < j1; j++) {
+        const uint slot_idx = is_swa ? (j % ring_cap) : j;
+        const device uchar * kh = kbase + (size_t)slot_idx * 1088ul;
+        const float kd = float(((const device half *)(kh + 128u))[blk]);
+        const char4 kq = *(const device char4 *)(kh + t);
+        float d = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) d = fma(float(qh[i]), float(kq[i]) * kd, d);
+        d = simd_sum(d);
+        uint dist = pos - j;
+        float bv = 0.0f;
+        if (dist < M64_EXT) {
+            const device float * brow = ((const device float *)(PACK + relbiaspack)) + (size_t)dist * 16u;
+            // split dot over 16 channels across lanes 0..15 (else simd_sum = 32x dot)
+            float v = (lane < 16u) ? (brow[lane] * (rout[lane] * tau)) : 0.0f;
+            bv = simd_sum(v);
+        }
+        float s = d * scale + f16r(bv - sink);
+        float ms = 1.0f, vs;
+        if (s > M) {
+            ms = metal::exp(M - s);
+            oh[0] *= ms; oh[1] *= ms; oh[2] *= ms; oh[3] *= ms;
+            M = s; vs = 1.0f;
+        } else {
+            vs = metal::exp(s - M);
+        }
+        const device uchar * vh = vbase + (size_t)slot_idx * 1088ul;
+        const float vscale = vs * float(((const device half *)(vh + 128u))[blk]);
+        const char4 vq = *(const device char4 *)(vh + t);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) oh[i] = fma(vscale, float(vq[i]), oh[i]);
+        S = S * (float)ms + (float)vs;
+    }
+}
+
+kernel void k_attn_head_q8(device float * SCR [[buffer(0)]],
+                           constant AttnF16Args & A [[buffer(1)]],
+                           const device uchar * PACK [[buffer(2)]],
+                           const device uchar * KV [[buffer(3)]],
+                           uint3 M64_TITG [[thread_position_in_threadgroup]],
+                           uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    uint h = M64_TGPG.x;
+    uint lane = M64_TITG.x;
+    const uint t = lane * 4u;
+    const device float * q = SCR + A.qoff + h * 128u;
+    const device float * rout = SCR + A.rout + h * 16u;
+    const float sink = SCR[A.sinkoff + h];
+    float oh[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float M = -INFINITY;
+    float S = 0.0f;
+    const uint j_start = (A.is_swa && A.pos > A.n_swa) ? (A.pos - A.n_swa) : 0u;
+    m64_attn_q8_range(q, rout, sink, A.relbiaspack, A.kvkoff, A.kvvoff,
+                      A.pos, A.is_swa, A.ring_cap, A.scale, A.tau,
+                      h, lane, j_start, A.pos + 1u, PACK, KV, oh, M, S);
+    m64_attn_f16_finish(SCR + A.outoff + h * 128u, t, oh, M, S);
+}
+
+// Split-K FlashDecoding over the Q8_0 KV cache: grid = (kNH, n_splits, 1),
+// tg = (32, 1, 1). k_attn_head_f16_reduce (SCR-only) reduces the partials.
+kernel void k_attn_head_q8_split(device float * SCR [[buffer(0)]],
+                                 constant AttnF16SplitArgs & A [[buffer(1)]],
+                                 const device uchar * PACK [[buffer(2)]],
+                                 const device uchar * KV [[buffer(3)]],
+                                 uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                 uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    const uint h = M64_TGPG.x;
+    const uint sp = M64_TGPG.y;
+    const uint lane = M64_TITG.x;
+    if (h >= 24u || sp >= A.n_splits) return;
+    const uint t = lane * 4u;
+    const uint j_start = (A.is_swa && A.pos > A.n_swa) ? (A.pos - A.n_swa) : 0u;
+    const uint total = A.pos + 1u - j_start;
+    const uint chunk = (total + A.n_splits - 1u) / A.n_splits;
+    const uint j0 = j_start + sp * chunk;
+    const uint j1 = (j0 < A.pos + 1u) ? min(j0 + chunk, A.pos + 1u) : j0;
+    float oh[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float M = -INFINITY;
+    float S = 0.0f;
+    if (j0 < j1) {
+        const device float * q = SCR + A.qoff + h * 128u;
+        const device float * rout = SCR + A.rout + h * 16u;
+        const float sink = SCR[A.sinkoff + h];
+        m64_attn_q8_range(q, rout, sink, A.relbiaspack, A.kvkoff, A.kvvoff,
+                          A.pos, A.is_swa, A.ring_cap, A.scale, A.tau,
+                          h, lane, j0, j1, PACK, KV, oh, M, S);
+    }
+    const uint pidx = h * A.n_splits + sp;
+    device float * po = SCR + A.part_o_off + pidx * 128u;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) po[t + i] = oh[i];
+    if (lane == 0u) {
+        SCR[A.part_ms_off + pidx * 2u] = M;
+        SCR[A.part_ms_off + pidx * 2u + 1u] = S;
+    }
+}
+
 // ------------------------------------------------------------ gate sigmoid mul
 kernel void k_gate_mul(device float * SCR [[buffer(0)]],
                        constant GateMulArgs & A [[buffer(1)]], uint3 M64_TIG [[thread_position_in_grid]]) {
@@ -1700,4 +1864,214 @@ kernel void k_gemv_down_reduce8_q5_1_f32in(device float * SCR [[buffer(0)]],
         acc = acc + SCR[A.wtoff + e] * ea;
     }
     if (lane == 0u) SCR[A.accoff + r] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 7A: FP32-input MoE decode kernels, Q8 _m2/_m4 activation-sharing
+// pattern ported to Q4_K / Q5_0 / Q5_1. Every warp of the warp-per-row
+// kernels re-reads the same fp32 activations from SCR; pairing 2 gate/up rows
+// per warp halves that traffic and 4 down rows per warp quarters it. Per-row
+// FMA order, lane block iteration and simd_sum trees are kept identical to
+// the m1 kernels, so outputs are bitwise-equal (parity tests 47-50).
+// ---------------------------------------------------------------------------
+
+// One 64-elem Q4_K sub-block dot into `a`, verbatim order from
+// k_gemv_gateup_batch8_q4k_f32in (x passed pre-loaded as float4[16]).
+static inline void m64_q4k_sub_dot(const device uchar * b, uint u,
+                                   const device float4 * xv, float & a) {
+    const uint q = m64_ld32(b + 4u), q2 = m64_ld32(b + 8u), q3 = m64_ld32(b + 12u);
+    float d1, m1, d2, m2;
+    m64_scale_min_k4(2u * (u & 3u), q, q2, q3, d1, m1);
+    m64_scale_min_k4(2u * (u & 3u) + 1u, q, q2, q3, d2, m2);
+    const float vd1 = f16b(m64_ld16(b)) * d1, vm1 = f16b(m64_ld16(b + 2u)) * m1;
+    const float vd2 = f16b(m64_ld16(b)) * d2, vm2 = f16b(m64_ld16(b + 2u)) * m2;
+    const device uint * qs = (const device uint *)(b + 16u + (u & 3u) * 32u);
+    #pragma unroll
+    for (uint t = 0u; t < 8u; t++) {
+        const uint v = qs[t];
+        const float4 xlo = xv[t], xhi = xv[8u + t];
+        a = fma(fma(vd1, float(v & 0xFu), -vm1), xlo.x, a);
+        a = fma(fma(vd1, float((v >> 8) & 0xFu), -vm1), xlo.y, a);
+        a = fma(fma(vd1, float((v >> 16) & 0xFu), -vm1), xlo.z, a);
+        a = fma(fma(vd1, float((v >> 24) & 0xFu), -vm1), xlo.w, a);
+        a = fma(fma(vd2, float((v >> 4) & 0xFu), -vm2), xhi.x, a);
+        a = fma(fma(vd2, float((v >> 12) & 0xFu), -vm2), xhi.y, a);
+        a = fma(fma(vd2, float((v >> 20) & 0xFu), -vm2), xhi.z, a);
+        a = fma(fma(vd2, float(v >> 28), -vm2), xhi.w, a);
+    }
+}
+
+// Batch-8 Q4_K gate|up, 2 rows/warp, shared x float4s. Pair index rr in
+// [0, 8*2*pp): pp = ceil(nout/2) pairs per (expert, half);
+//   e = rr / (2*pp); rem = rr - e*2*pp; up = rem >= pp; r0 = 2*(rem - pp*up).
+// Odd tails clamp r1 = r0 (duplicate weight reads, guarded write).
+// grid.x = ceil(16*pp / 8) of 256 (nout even -> 8*nout/8 = nout TGs... nout=1152).
+kernel void k_gemv_gateup_batch8_q4k_f32in_m2(device float * SCR [[buffer(0)]],
+                                              constant MoeGateUpQ4KF32Args & A [[buffer(1)]],
+                                              const device uchar * PACK [[buffer(2)]],
+                                              uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                              uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    uint tid = M64_TITG.x;
+    const uint pp = (A.nout + 1u) >> 1u;
+    uint rr = M64_TGPG.x * 8u + (tid >> 5);
+    if (rr >= 16u * pp) return;
+    uint lane = tid & 31u;
+    uint e = rr / (2u * pp);
+    uint rem = rr - e * (2u * pp);
+    bool up = rem >= pp;
+    uint r0 = (up ? rem - pp : rem) * 2u;
+    uint r1 = r0 + 1u < A.nout ? r0 + 1u : r0;
+    const uint exp_id = ((const device uint *)(SCR + A.seloff))[e];
+    const uint slot = A.wtab_off != 0u ? ((const device uint *)(SCR + A.wtab_off))[exp_id] : exp_id;
+    const size_t rstride = (size_t)(A.k >> 8) * 144u;
+    const device uchar * wb = PACK + (up ? A.woff2 : A.woff) + (size_t)slot * A.stride;
+    const device float * x = SCR + A.xoff;
+    float a0 = 0.0f, a1 = 0.0f;
+    for (uint u = lane; u < A.k / 64u; u += 32u) {
+        const device uchar * b0 = wb + (size_t)r0 * rstride + (u >> 2) * 144u;
+        const device uchar * b1 = wb + (size_t)r1 * rstride + (u >> 2) * 144u;
+        const device float4 * xv = (const device float4 *)(x + u * 64u);
+        m64_q4k_sub_dot(b0, u, xv, a0);
+        if (r1 != r0) m64_q4k_sub_dot(b1, u, xv, a1);
+    }
+    a0 = simd_sum(a0); a1 = simd_sum(a1);
+    device float * y = SCR + (up ? A.yoff2 : A.yoff) + e * A.nout;
+    if (lane == 0u) y[r0] = a0;
+    if (lane == 1u && r0 + 1u < A.nout) y[r1] = a1;
+}
+
+// One 32-elem Q5_0/Q5_1 block dot into `a`, verbatim order from
+// m64_gemv_q5_row (x passed as vlo/vhi float4 pair for index t).
+template <bool Q51>
+static inline void m64_q5_block_dot(uint v, uint qh, float d, float m, uint t,
+                                    const float4 & vlo, const float4 & vhi, float & a) {
+    #pragma unroll
+    for (uint u = 0u; u < 4u; u++) {
+        const uint jj = 4u * t + u;
+        float x0 = float(((v >> (8u * u)) & 0xFu) | (((qh >> jj) << 4) & 0x10u));
+        float x1 = float(((v >> (8u * u + 4u)) & 0xFu) | ((qh >> (jj + 12u)) & 0x10u));
+        if (!Q51) { x0 -= 16.0f; x1 -= 16.0f; }
+        float s0 = d * x0, s1 = d * x1;
+        if (Q51) { s0 += m; s1 += m; }
+        if (u == 0u) { a = fma(s0, vlo.x, a); a = fma(s1, vhi.x, a); }
+        if (u == 1u) { a = fma(s0, vlo.y, a); a = fma(s1, vhi.y, a); }
+        if (u == 2u) { a = fma(s0, vlo.z, a); a = fma(s1, vhi.z, a); }
+        if (u == 3u) { a = fma(s0, vlo.w, a); a = fma(s1, vhi.w, a); }
+    }
+}
+
+// Four Q5_0/Q5_1 rows vs one h slab, h float4s loaded once per block.
+// Lane block order (i = lane, lane+32, ...) and per-row FMA order match
+// m64_gemv_q5_row exactly; simd_sum stays a per-row warp collective in the
+// caller, so each ea is bitwise-equal to the m1 kernel's.
+template <bool Q51>
+static inline void m64_gemv_q5_rows4(const device uchar * w0, const device uchar * w1,
+                                     const device uchar * w2, const device uchar * w3,
+                                     const device float * h, uint nb, uint lane,
+                                     float & a0, float & a1, float & a2, float & a3) {
+    const uint blk = Q51 ? 24u : 22u;
+    for (uint i = lane; i < nb; i += 32u) {
+        const size_t bo = (size_t)i * blk;
+        const device float4 * hlo = (const device float4 *)(h + (size_t)i * 32u);
+        const device uchar * b0 = w0 + bo, * b1 = w1 + bo, * b2 = w2 + bo, * b3 = w3 + bo;
+        const uint qh0 = Q51 ? m64_ld32(b0 + 4u) : m64_ld32(b0 + 2u);
+        const uint qh1 = Q51 ? m64_ld32(b1 + 4u) : m64_ld32(b1 + 2u);
+        const uint qh2 = Q51 ? m64_ld32(b2 + 4u) : m64_ld32(b2 + 2u);
+        const uint qh3 = Q51 ? m64_ld32(b3 + 4u) : m64_ld32(b3 + 2u);
+        const float d0 = f16b(m64_ld16(b0)), d1 = f16b(m64_ld16(b1));
+        const float d2 = f16b(m64_ld16(b2)), d3 = f16b(m64_ld16(b3));
+        const float m0 = Q51 ? f16b(m64_ld16(b0 + 2u)) : 0.0f;
+        const float m1 = Q51 ? f16b(m64_ld16(b1 + 2u)) : 0.0f;
+        const float m2 = Q51 ? f16b(m64_ld16(b2 + 2u)) : 0.0f;
+        const float m3 = Q51 ? f16b(m64_ld16(b3 + 2u)) : 0.0f;
+        const ushort * q0 = (const ushort *)(b0 + (Q51 ? 8u : 6u));
+        const ushort * q1 = (const ushort *)(b1 + (Q51 ? 8u : 6u));
+        const ushort * q2 = (const ushort *)(b2 + (Q51 ? 8u : 6u));
+        const ushort * q3 = (const ushort *)(b3 + (Q51 ? 8u : 6u));
+        #pragma unroll
+        for (uint t = 0u; t < 4u; t++) {
+            const float4 vlo = hlo[t], vhi = hlo[4u + t];   // shared across rows
+            m64_q5_block_dot<Q51>(uint(q0[2u * t]) | (uint(q0[2u * t + 1u]) << 16), qh0, d0, m0, t, vlo, vhi, a0);
+            m64_q5_block_dot<Q51>(uint(q1[2u * t]) | (uint(q1[2u * t + 1u]) << 16), qh1, d1, m1, t, vlo, vhi, a1);
+            m64_q5_block_dot<Q51>(uint(q2[2u * t]) | (uint(q2[2u * t + 1u]) << 16), qh2, d2, m2, t, vlo, vhi, a2);
+            m64_q5_block_dot<Q51>(uint(q3[2u * t]) | (uint(q3[2u * t + 1u]) << 16), qh3, d3, m3, t, vlo, vhi, a3);
+        }
+    }
+}
+
+// Batch-8 MoE down-proj + weighted reduce over Q5_0, 4 rows/warp (h rows in
+// registers shared by the 4 output rows). grid.x = ceil(nout / 32) of 256;
+// lanes 0..3 own rows rbase..rbase+3 (clamped tail reads, guarded writes).
+// Expert loop / accumulator order identical to k_gemv_down_reduce8_q5_0_f32in.
+kernel void k_gemv_down_reduce8_q5_0_f32in_m4(device float * SCR [[buffer(0)]],
+                                              constant MoeDownQ5F32Args & A [[buffer(1)]],
+                                              const device uchar * PACK [[buffer(2)]],
+                                              uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                              uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    uint rbase = (M64_TGPG.x * 8u + (M64_TITG.x >> 5)) * 4u;
+    if (rbase >= A.nout) return;
+    uint lane = M64_TITG.x & 31u;
+    const device float * h = SCR + A.hoff;
+    const uint nb = A.k >> 5;
+    const size_t rowb = (size_t)nb * 22ull;
+    uint r1 = rbase + 1u < A.nout ? rbase + 1u : rbase;
+    uint r2 = rbase + 2u < A.nout ? rbase + 2u : rbase;
+    uint r3 = rbase + 3u < A.nout ? rbase + 3u : rbase;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint e = 0u; e < 8u; e++) {
+        const uint exp_id = ((const device uint *)(SCR + A.seloff))[e];
+        const uint slot = A.wtab_off != 0u ? ((const device uint *)(SCR + A.wtab_off))[exp_id] : exp_id;
+        const device uchar * wp = PACK + A.woff + (size_t)slot * A.stride;
+        float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f, e3 = 0.0f;
+        m64_gemv_q5_rows4<false>(wp + (size_t)rbase * rowb, wp + (size_t)r1 * rowb,
+                                 wp + (size_t)r2 * rowb, wp + (size_t)r3 * rowb,
+                                 h + (size_t)e * A.k, nb, lane, e0, e1, e2, e3);
+        e0 = simd_sum(e0); e1 = simd_sum(e1); e2 = simd_sum(e2); e3 = simd_sum(e3);
+        const float w = SCR[A.wtoff + e];
+        acc0 = acc0 + w * e0;   // oracle: acc = acc + w*dbuf
+        acc1 = acc1 + w * e1;
+        acc2 = acc2 + w * e2;
+        acc3 = acc3 + w * e3;
+    }
+    if (lane == 0u) SCR[A.accoff + rbase] = acc0;
+    if (lane == 1u && rbase + 1u < A.nout) SCR[A.accoff + rbase + 1u] = acc1;
+    if (lane == 2u && rbase + 2u < A.nout) SCR[A.accoff + rbase + 2u] = acc2;
+    if (lane == 3u && rbase + 3u < A.nout) SCR[A.accoff + rbase + 3u] = acc3;
+}
+
+// Same with Q5_1 blocks (24 B, shared min-offset m; no -16 bias).
+kernel void k_gemv_down_reduce8_q5_1_f32in_m4(device float * SCR [[buffer(0)]],
+                                              constant MoeDownQ5F32Args & A [[buffer(1)]],
+                                              const device uchar * PACK [[buffer(2)]],
+                                              uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                              uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    uint rbase = (M64_TGPG.x * 8u + (M64_TITG.x >> 5)) * 4u;
+    if (rbase >= A.nout) return;
+    uint lane = M64_TITG.x & 31u;
+    const device float * h = SCR + A.hoff;
+    const uint nb = A.k >> 5;
+    const size_t rowb = (size_t)nb * 24ull;
+    uint r1 = rbase + 1u < A.nout ? rbase + 1u : rbase;
+    uint r2 = rbase + 2u < A.nout ? rbase + 2u : rbase;
+    uint r3 = rbase + 3u < A.nout ? rbase + 3u : rbase;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint e = 0u; e < 8u; e++) {
+        const uint exp_id = ((const device uint *)(SCR + A.seloff))[e];
+        const uint slot = A.wtab_off != 0u ? ((const device uint *)(SCR + A.wtab_off))[exp_id] : exp_id;
+        const device uchar * wp = PACK + A.woff + (size_t)slot * A.stride;
+        float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f, e3 = 0.0f;
+        m64_gemv_q5_rows4<true>(wp + (size_t)rbase * rowb, wp + (size_t)r1 * rowb,
+                                wp + (size_t)r2 * rowb, wp + (size_t)r3 * rowb,
+                                h + (size_t)e * A.k, nb, lane, e0, e1, e2, e3);
+        e0 = simd_sum(e0); e1 = simd_sum(e1); e2 = simd_sum(e2); e3 = simd_sum(e3);
+        const float w = SCR[A.wtoff + e];
+        acc0 = acc0 + w * e0;
+        acc1 = acc1 + w * e1;
+        acc2 = acc2 + w * e2;
+        acc3 = acc3 + w * e3;
+    }
+    if (lane == 0u) SCR[A.accoff + rbase] = acc0;
+    if (lane == 1u && rbase + 1u < A.nout) SCR[A.accoff + rbase + 1u] = acc1;
+    if (lane == 2u && rbase + 2u < A.nout) SCR[A.accoff + rbase + 2u] = acc2;
+    if (lane == 3u && rbase + 3u < A.nout) SCR[A.accoff + rbase + 3u] = acc3;
 }

@@ -1,6 +1,10 @@
-// main.cpp — m64run CLI: run the resident Inkling-2-Mini forward on a .m64pack,
-// optionally comparing per-step logits against a llama.cpp oracle dump, or
-// serving as a persistent line-protocol worker for tools/takuan_server.py.
+// main.cpp — m64run CLI: run the resident model forward on a .m64pack,
+// dispatching on the pack's architecture header: "inkling2_loop" (Inkling
+// resident forward, CPU oracle or Metal GPU) or "gemma4" (Gemma 4 dense-MoE,
+// CPU oracle or Metal GPU; prefix caching and arena streaming are not
+// implemented for it yet). Any other arch fails init with a clear message.
+// Optionally compares per-step logits against a llama.cpp oracle dump, or
+// serves as a persistent line-protocol worker for tools/takuan_server.py.
 //
 //   build/m64run <pack.m64pack> [--ids-file F | --text "..."] [--steps N]
 //                [--out-prefix P] [--bench] [--compare ref_logits.bin ref_tokens.bin]
@@ -21,7 +25,8 @@
 // "WARMED <n> {computed|cached|disk|disabled}", "ERR <reason>".
 // All diagnostics stay on stderr so stdout is machine-parseable.
 //
-// With --prefix-cache N (N>0, Metal backend) GEN reuses bitwise-exact KV +
+// With --prefix-cache N (N>0, Metal backend, inkling2_loop packs only) GEN
+// reuses bitwise-exact KV +
 // ShortConv checkpoints: a warm prefix (WARM) plus up to N LRU conversation
 // checkpoints. A hit restores the checkpoint (~memcpy) and prefills ONLY the
 // remaining tail tokens, so a growing chat re-prefills just the new turn.
@@ -51,8 +56,13 @@
 
 #include "forward.hpp"
 #include "forward_metal.hpp"
+#include "spec_decode.hpp"
+#include "gemma4_forward.hpp"
+#include "gemma4_forward_metal.hpp"
 #include "pack_reader.hpp"
 #include "prefix_disk.hpp"
+#include "prefix_stash.hpp"
+#include "sampler.hpp"
 
 namespace {
 
@@ -128,53 +138,8 @@ bool write_logits(const std::string & prefix, const std::vector<std::vector<floa
     return f.good();
 }
 
-// Temperature-scaled softmax + top-p nucleus sampling over logits[0..nv).
-// temp <= 0 is greedy (returns the precomputed argmax). Stable softmax:
-// p_i ∝ exp((logit_i - max) / temp). When top_p < 1 the probs are sorted
-// descending and truncated at the nucleus whose cumulative mass >= top_p;
-// the kept mass is renormalized during a uniform [0, sum) scan.
-int32_t sample_token(const float * logits, int64_t nv, float temp, float top_p,
-                     int32_t argmax, std::mt19937_64 & rng) {
-    if (temp <= 0.0f) return argmax;
-    if (nv <= 0) return argmax;
-    float mx = logits[0];
-    for (int64_t i = 1; i < nv; i++) mx = std::max(mx, logits[i]);
-    std::vector<double> prob((size_t)nv);
-    double sum = 0.0;
-    const double inv_t = 1.0 / (double)temp;
-    for (int64_t i = 0; i < nv; i++) {
-        double p = std::exp(((double)logits[i] - (double)mx) * inv_t);
-        prob[(size_t)i] = p;
-        sum += p;
-    }
-    if (!(sum > 0.0)) return argmax;
-    std::vector<size_t> keep;
-    if (top_p < 1.0f) {
-        std::vector<size_t> idx((size_t)nv);
-        std::iota(idx.begin(), idx.end(), (size_t)0);
-        std::sort(idx.begin(), idx.end(),
-                  [&](size_t a, size_t b) { return prob[a] > prob[b]; });
-        double cum = 0.0;
-        for (size_t i : idx) {
-            keep.push_back(i);
-            cum += prob[i] / sum;
-            if (cum >= top_p) break;
-        }
-    } else {
-        keep.resize((size_t)nv);
-        std::iota(keep.begin(), keep.end(), (size_t)0);
-    }
-    double ksum = 0.0;
-    for (size_t i : keep) ksum += prob[i];
-    std::uniform_real_distribution<double> uni(0.0, ksum);
-    const double target = uni(rng);
-    double acc = 0.0;
-    for (size_t i : keep) {
-        acc += prob[i];
-        if (acc >= target) return (int32_t)i;
-    }
-    return (int32_t)keep.back();
-}
+// Temperature-scaled softmax + top-p nucleus sampling lives in sampler.hpp
+// (unit-tested by engine/tests/test_sampler.cpp).
 
 int usage() {
     std::fprintf(stderr,
@@ -182,10 +147,21 @@ int usage() {
         "              [--out-prefix P] [--bench] [--compare ref_logits.bin ref_tokens.bin]\n"
         "              [--backend metal|cpu] [--arena-gb N] [--io pread|mtlio]\n"
         "              [--ctx N] [--worker] [--prefix-cache N] [--cache-dir DIR]\n"
+        "              [--kv-type f16|q8_0] [--speculative N] [--draft-tokens N]\n"
         "  --prefix-cache N  worker LRU prefix checkpoints (0=off; -1/auto: 4 full-pack,\n"
         "                    1 when --arena-gb > 6, else 0); pinned via the WARM command\n"
+        "  --speculative N   greedy prompt-lookup speculative decode, max N draft tokens\n"
+        "                    per verify pass (1..8; 0=off; temp==0 + Metal only; token\n"
+        "                    sequences are identical to --speculative 0; auto-throttles\n"
+        "                    via cooldown while drafts keep missing)\n"
+        "  --draft-tokens N  override the --speculative draft depth (0=use --speculative)\n"
         "  --cache-dir DIR   persist WARM prefixes as .m64kv files on SSD (Metal only);\n"
-        "                    restores warmed state across restarts (WARMED <n> disk)\n");
+        "                    restores warmed state across restarts (WARMED <n> disk)\n"
+        "  --kv-type T       KV cache dtype: f16 (default) or q8_0 (Metal only, ~47%% of\n"
+        "                    the FP16 bytes; .m64kv files are per-dtype)\n"
+        "Pack architectures: inkling2_loop (full feature set) and gemma4\n"
+        "                    (gemma4: WARM replies 'WARMED 0 disabled' (no prefix cache);\n"
+        "                    --arena-gb > 0 rejected at init)\n");
     return 2;
 }
 
@@ -204,6 +180,9 @@ int main(int argc, char ** argv) {
     std::string io_mode = "pread";  // pread | mtlio
     int prefix_cache = -1;            // -1 = auto, else explicit N >= 0 (clamped below)
     std::string cache_dir;            // "" = SSD prefix cache off; DIR = .m64kv store
+    std::string kv_type = "f16";      // KV cache dtype: f16 | q8_0 (Metal only)
+    int spec_K = 0;                 // Milestone 7B: 0=off, else max draft tokens (1..8)
+    int draft_tokens = 0;             // optional depth override for --speculative
     const char * cmp_logits = nullptr, * cmp_tokens = nullptr;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
@@ -219,6 +198,9 @@ int main(int argc, char ** argv) {
         else if (a == "--io" && i + 1 < argc) io_mode = argv[++i];
         else if (a == "--prefix-cache" && i + 1 < argc) prefix_cache = std::atoi(argv[++i]);
         else if (a == "--cache-dir" && i + 1 < argc) cache_dir = argv[++i];
+        else if (a == "--kv-type" && i + 1 < argc) kv_type = argv[++i];
+        else if (a == "--speculative" && i + 1 < argc) spec_K = std::atoi(argv[++i]);
+        else if (a == "--draft-tokens" && i + 1 < argc) draft_tokens = std::atoi(argv[++i]);
         else if (a == "--compare" && i + 2 < argc) { cmp_logits = argv[++i]; cmp_tokens = argv[++i]; }
         else { std::fprintf(stderr, "unknown/complete flag: %s\n", a.c_str()); return usage(); }
     }
@@ -229,6 +211,23 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "error: --io must be pread|mtlio\n");
         return 2;
     }
+    if (kv_type != "f16" && kv_type != "q8_0") {
+        std::fprintf(stderr, "error: --kv-type must be f16|q8_0\n");
+        return 2;
+    }
+    if (kv_type == "q8_0" && backend == "cpu") {
+        std::fprintf(stderr, "error: --kv-type q8_0 requires Metal backend\n");
+        return 2;
+    }
+    if (spec_K < 0 || spec_K > 8) {
+        std::fprintf(stderr, "error: --speculative must be 0..8\n");
+        return 2;
+    }
+    if (draft_tokens < 0 || draft_tokens > 8) {
+        std::fprintf(stderr, "error: --draft-tokens must be 0..8\n");
+        return 2;
+    }
+    if (draft_tokens > 0) spec_K = draft_tokens;
     // --prefix-cache auto defaults: full-pack keeps 4 checkpoints, a big
     // arena (>6 GiB) keeps 1, a tight arena (<=6 GiB) stays off. An explicit
     // --cache-dir forces at least 1 (WARM needs the RAM prefix path alive),
@@ -257,25 +256,67 @@ int main(int argc, char ** argv) {
     struct Backend {
         m64::InklingForward cpu;
         m64::InklingForwardMetal metal;
+        m64::Gemma4Forward g4_cpu;
+        m64::Gemma4ForwardMetal g4_metal;
         bool use_metal = true;
+        bool is_gemma4 = false;          // init() dispatches on pack header arch
         double arena_gb = 0.0;
         std::string io_mode = "pread";
+        std::string kv_type = "f16";
+        // Prefix caching (WARM pins, LRU checkpoints, .m64kv SSD store) is
+        // implemented only for the Inkling Metal forward; every fwd.metal.*
+        // prefix-cache call site must be guarded by this (never true for
+        // gemma4, so fwd.metal is never touched there).
+        bool supports_prefix_cache() const { return !is_gemma4 && use_metal; }
         bool init(m64::PackReader & p, int ctx, std::string & e) {
-            return use_metal ? metal.init(p, ctx, e, arena_gb, io_mode) : cpu.init(p, ctx, e);
+            const std::string arch = p.header().arch;
+            if (arch == "inkling2_loop") {
+                is_gemma4 = false;
+                return use_metal ? metal.init(p, ctx, e, arena_gb, io_mode,
+                                              kv_type == "q8_0")
+                                 : cpu.init(p, ctx, e);
+            } else if (arch == "gemma4") {
+                is_gemma4 = true;
+                return use_metal ? g4_metal.init(p, ctx, e, arena_gb, io_mode,
+                                                 kv_type == "q8_0")
+                                 : g4_cpu.init(p, ctx, e);
+            }
+            e = "unsupported model architecture '" + arch + "'";
+            return false;
         }
-        m64::StepResult step(int32_t t) { return use_metal ? metal.step(t) : cpu.step(t); }
+        m64::StepResult step(int32_t t) {
+            if (is_gemma4) return use_metal ? g4_metal.step(t) : g4_cpu.step(t);
+            return use_metal ? metal.step(t) : cpu.step(t);
+        }
         m64::StepResult prefill(const std::vector<int32_t> & v) {
+            if (is_gemma4) return use_metal ? g4_metal.prefill(v) : g4_cpu.prefill(v);
             return use_metal ? metal.prefill(v) : cpu.prefill(v);
         }
-        void reset() { if (use_metal) metal.reset(); else cpu.reset(); }
-        int64_t vocab_effective() const { return use_metal ? metal.vocab_effective() : cpu.vocab_effective(); }
-        int64_t vocab_logit_rows() const { return use_metal ? metal.vocab_logit_rows() : cpu.vocab_logit_rows(); }
-        size_t resident_bytes() const { return use_metal ? metal.resident_bytes() : cpu.resident_bytes(); }
-        std::string arena_report() const { return use_metal ? metal.arena_report() : std::string(); }
+        void reset() {
+            if (is_gemma4) { if (use_metal) g4_metal.reset(); else g4_cpu.reset(); }
+            else if (use_metal) metal.reset(); else cpu.reset();
+        }
+        int64_t vocab_effective() const {
+            if (is_gemma4) return use_metal ? g4_metal.vocab_effective() : g4_cpu.vocab_effective();
+            return use_metal ? metal.vocab_effective() : cpu.vocab_effective();
+        }
+        int64_t vocab_logit_rows() const {
+            if (is_gemma4) return use_metal ? g4_metal.vocab_logit_rows() : g4_cpu.vocab_logit_rows();
+            return use_metal ? metal.vocab_logit_rows() : cpu.vocab_logit_rows();
+        }
+        size_t resident_bytes() const {
+            if (is_gemma4) return use_metal ? g4_metal.resident_bytes() : g4_cpu.resident_bytes();
+            return use_metal ? metal.resident_bytes() : cpu.resident_bytes();
+        }
+        std::string arena_report() const {
+            if (is_gemma4) return use_metal ? g4_metal.arena_report() : std::string();
+            return use_metal ? metal.arena_report() : std::string();
+        }
     } fwd;
     fwd.use_metal = backend != "cpu";
     fwd.arena_gb = arena_gb;
     fwd.io_mode = io_mode;
+    fwd.kv_type = kv_type;
     if (!fwd.init(pk, /*context_len=*/ctx, err)) {
         std::fprintf(stderr, "init failed: %s\n", err.c_str());
         return 5;
@@ -305,6 +346,13 @@ int main(int argc, char ** argv) {
         bool has_warm = false;
         m64::PrefixState warm_state;
         std::vector<m64::PrefixState> lru_states;
+        // One self-contained RAM stash slot: the longest live conversation
+        // checkpoint captured (PrefixState::full_kv) right BEFORE a
+        // no-hit GEN resets kvBuf, so an interrupting short prompt does not
+        // cost the next long turn a full re-prefill. Survives
+        // invalidate_after() and WARM (it no longer references kvBuf).
+        bool has_stash = false;
+        m64::PrefixState stashed_state;
         // Longest cached entry whose tokens are a STRICT prefix of prompt
         // (strict so at least prompt.back() flows through prefill and
         // r.logits / r.argmax are always freshly produced).
@@ -319,6 +367,7 @@ int main(int argc, char ** argv) {
             };
             if (has_warm) consider(warm_state);
             for (const auto & st : lru_states) consider(st);
+            if (has_stash) consider(stashed_state);
             return best;
         };
         // Full-attention KV slots [start_pos..ctx) are about to be overwritten
@@ -333,7 +382,7 @@ int main(int argc, char ** argv) {
                 lru_states.end());
         };
         auto save_lru_checkpoint = [&](const std::vector<int32_t> & toks) {
-            if (prefix_cache_slots == 0 || !fwd.use_metal) return;
+            if (prefix_cache_slots == 0 || !fwd.supports_prefix_cache()) return;
             if (toks.empty() || toks.size() >= (size_t)ctx) return;
             if (toks.size() != (size_t)fwd.metal.current_pos()) return;
             m64::PrefixState st;
@@ -346,6 +395,40 @@ int main(int argc, char ** argv) {
             else lru_states.insert(lru_states.begin(), std::move(st));
             if (lru_states.size() > prefix_cache_slots)
                 lru_states.resize(prefix_cache_slots);
+        };
+        // A GEN with prefix_hit == 0 is about to fwd.reset() +
+        // invalidate_after(0), wiping every in-place checkpoint. Before that,
+        // copy the LONGEST stashable conversation checkpoint's full-attention
+        // KV out of kvBuf so the next long turn restores it whole. Never
+        // replaces an existing stash with a SHORTER one (two short prompts
+        // back to back keep the long conversation's capture alive).
+        auto stash_active_checkpoint = [&]() {
+            if (fwd.arena_gb != 0.0) return;  // full-pack path only
+            std::vector<size_t> lens;
+            std::vector<uint64_t> bytes;
+            lens.reserve(lru_states.size());
+            bytes.reserve(lru_states.size());
+            for (const auto & st : lru_states) {
+                lens.push_back(st.tokens.size());
+                bytes.push_back((uint64_t)fwd.metal.full_kv_elems(st.pos) *
+                                sizeof(uint16_t));
+            }
+            const long sel = m64::select_stash(lens, bytes);
+            if (sel < 0) return;
+            if (has_stash &&
+                !m64::stash_should_replace(stashed_state.tokens.size(),
+                                           lens[(size_t)sel]))
+                return;
+            m64::PrefixState st = lru_states[(size_t)sel];
+            fwd.metal.capture_full_kv(st);
+            if (st.full_kv.empty()) return;  // guard failed; nothing captured
+            stashed_state = std::move(st);
+            has_stash = true;
+            const double mib = (double)(stashed_state.full_kv.size() +
+                                        stashed_state.swa_kv.size()) *
+                               sizeof(uint16_t) / 1048576.0;
+            std::fprintf(stderr, "prefix cache: stashed %zu tokens in RAM (%.1f MiB)\n",
+                         stashed_state.tokens.size(), mib);
         };
         std::string line;
         while (std::getline(std::cin, line)) {
@@ -363,7 +446,7 @@ int main(int argc, char ** argv) {
             }
             // ---------- WARM [-- ]<id0> <id1> ...: pin a static prefix -------
             if (cmd == "WARM") {
-                if (prefix_cache_slots == 0 || !fwd.use_metal) {
+                if (prefix_cache_slots == 0 || !fwd.supports_prefix_cache()) {
                     std::printf("WARMED 0 disabled\n");
                     std::fflush(stdout);
                     continue;
@@ -409,7 +492,7 @@ int main(int argc, char ** argv) {
                 // SSD persistent prefix cache: one .m64kv per (pack, tokens).
                 // A hit restores pos + rs + SWA rings + used full KV bit-for-bit
                 // in a single read — no prefill at all.
-                if (!cache_dir.empty() && fwd.use_metal) {
+                if (!cache_dir.empty() && fwd.supports_prefix_cache()) {
                     const std::string dpath =
                         m64::prefix_cache_path(cache_dir, fwd.metal.pack_fingerprint(), ids);
                     std::error_code dec;
@@ -452,7 +535,7 @@ int main(int argc, char ** argv) {
                     has_warm = true;
                     std::fprintf(stderr, "prefix cache: warmed %zu tokens (restored %zu)\n",
                                  ids.size(), restored);
-                    if (!cache_dir.empty() && fwd.use_metal) {
+                    if (!cache_dir.empty() && fwd.supports_prefix_cache()) {
                         const std::string dpath =
                             m64::prefix_cache_path(cache_dir, fwd.metal.pack_fingerprint(), ids);
                         std::string d_err;
@@ -535,22 +618,49 @@ int main(int argc, char ** argv) {
             auto t0 = std::chrono::steady_clock::now();
             // ---- prefix cache reuse: restore + prefill ONLY the tail -------
             size_t prefix_hit = 0;
-            if (prefix_cache_slots > 0 && fwd.use_metal) {
+            if (prefix_cache_slots > 0 && fwd.supports_prefix_cache()) {
                 const m64::PrefixState * hit = find_best_prefix(prompt);
+                const bool stash_hit = hit != nullptr && has_stash &&
+                                       hit == &stashed_state;
+                const auto t_rs = std::chrono::steady_clock::now();
                 if (hit && fwd.metal.restore_prefix_state(*hit)) {
                     prefix_hit = hit->tokens.size();
-                    std::fprintf(stderr, "prefix cache: hit %zu / %zu tokens\n",
-                                 prefix_hit, prompt.size());
-                    // LRU bump AFTER restore (rotating would invalidate `hit`).
-                    for (size_t i = 0; i < lru_states.size(); i++) {
-                        if (&lru_states[i] == hit) {
-                            if (i > 0)
-                                std::rotate(lru_states.begin(), lru_states.begin() + (long)i,
-                                            lru_states.begin() + (long)i + 1);
-                            break;
+                    if (stash_hit) {
+                        const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_rs).count();
+                        std::fprintf(stderr,
+                                     "prefix cache: restored %zu tokens from RAM stash"
+                                     " in %.1f ms\n",
+                                     prefix_hit, ms);
+                        // Self-contained restore rewrote kvBuf [0, pos): every
+                        // in-place LRU checkpoint is dead. The pinned warm
+                        // prefix survives only when its tokens are a prefix of
+                        // the stash. Free the stash RAM; the
+                        // save_lru_checkpoint(prompt) right after prefill
+                        // hands the conversation back to the normal LRU.
+                        lru_states.clear();
+                        if (has_warm && !m64::tokens_are_prefix(
+                                warm_state.tokens, stashed_state.tokens))
+                            has_warm = false;
+                        has_stash = false;
+                        stashed_state = m64::PrefixState{};
+                    } else {
+                        std::fprintf(stderr, "prefix cache: hit %zu / %zu tokens\n",
+                                     prefix_hit, prompt.size());
+                        // LRU bump AFTER restore (rotating would invalidate `hit`).
+                        for (size_t i = 0; i < lru_states.size(); i++) {
+                            if (&lru_states[i] == hit) {
+                                if (i > 0)
+                                    std::rotate(lru_states.begin(), lru_states.begin() + (long)i,
+                                                lru_states.begin() + (long)i + 1);
+                                break;
+                            }
                         }
                     }
                 } else {
+                    // prefix_hit == 0 from here on: capture the longest live
+                    // conversation checkpoint BEFORE the reset wipes kvBuf.
+                    stash_active_checkpoint();
                     fwd.reset();
                 }
                 invalidate_after(prefix_hit);
@@ -575,6 +685,115 @@ int main(int argc, char ** argv) {
             // token actually consumed by fwd.step() (NOT the last sampled
             // token when we stop before stepping it).
             std::vector<int32_t> processed = prompt;
+            // ---- Milestone 7B/7C: greedy prompt-lookup speculative decode ----
+            // Only entered when --speculative N > 0 AND temp == 0 AND the
+            // Metal Inkling engine is live. Every emitted token is still an
+            // exact model argmax at the identical position as the plain path,
+            // so the TOK sequence is bitwise identical to --speculative 0.
+            // 7C: the anchor is emitted BEFORE the GPU verify (it was already
+            // decided last round), Branch rounds replay the accepted prefix
+            // with zero LM head rows, and an adaptive cooldown skips
+            // speculation while drafts keep missing.
+            m64::SpecStats spec_stats;
+            m64::SpecController spec_ctrl;
+            const bool spec_on = spec_K > 0 && temp == 0.0f &&
+                                 fwd.supports_prefix_cache();
+            if (spec_on) {
+                std::vector<int32_t> hist = prompt;   // invariant: tokens in engine
+                std::vector<float> lg_scratch;        // verify logits (greedy ignores)
+                bool spec_disabled = false;
+                while (n_gen < limit) {
+                    if (g_cancel_gen) { finish = "cancelled"; break; }
+                    const int32_t anchor = r.argmax;
+                    // The anchor was confirmed by the PREVIOUS round's model
+                    // argmax: stream it immediately (7C early streaming), the
+                    // GPU round only decides which DRAFTS ride along with it.
+                    if (eos_set.count(anchor)) { finish = "stop"; break; }
+                    std::printf("TOK %d\n", anchor);
+                    std::fflush(stdout);
+                    n_gen++;
+
+                    // Emissions per round <= 1 + cap (anchor + drafts): keep
+                    // the token budget AND pos + cap + 1 <= ctx for the verify.
+                    size_t cap = (size_t)spec_K;
+                    const size_t slots = (size_t)(limit - n_gen);
+                    if (cap > slots) cap = slots;
+                    const int avail = ctx - (int)fwd.metal.current_pos();
+                    const size_t ctx_cap = avail > 1 ? (size_t)avail - 1u : 0u;
+                    if (cap > ctx_cap) cap = ctx_cap;
+
+                    bool used_round = false;
+                    std::vector<int32_t> emitted;
+                    int32_t next_argmax = -1;
+                    m64::PrefixState snap;
+                    const size_t base = hist.size();
+                    const bool cooling = !spec_disabled && m64::spec_cooling_tick(spec_ctrl);
+                    if (cap > 0u && !spec_disabled && !cooling &&
+                        fwd.metal.save_prefix_state(snap, hist)) {
+                        std::string spec_err;
+                        bool restore_failed = false;
+                        m64::SpecHooks hooks;
+                        hooks.restore = [&]() {
+                            if (!fwd.metal.restore_prefix_state(snap)) restore_failed = true;
+                        };
+                        hooks.verify = [&](const std::vector<int32_t> & toks,
+                                           std::vector<int32_t> & amax) {
+                            return fwd.metal.verify_batch(toks, amax, lg_scratch, spec_err);
+                        };
+                        hooks.advance_no_logits = [&](const std::vector<int32_t> & toks) {
+                            return fwd.metal.advance_no_logits(toks, spec_err);
+                        };
+                        m64::SpecRound rd;
+                        const m64::SpecOutcome oc =
+                            m64::spec_round(hist, anchor, cap, 4, 3, hooks, rd,
+                                            spec_stats, spec_ctrl);
+                        if (oc == m64::SpecOutcome::Accepted ||
+                            oc == m64::SpecOutcome::Branch) {
+                            emitted = std::move(rd.emitted);
+                            next_argmax = rd.next_argmax;
+                            used_round = true;
+                        } else {
+                            hooks.restore();  // Failed: engine may sit mid-batch
+                            if (restore_failed) spec_disabled = true;
+                        }
+                    }
+                    if (!used_round) {
+                        // plain greedy step — identical to --speculative 0
+                        // (anchor already streamed above)
+                        if (n_gen < limit) {
+                            r = fwd.step(anchor);
+                            hist.push_back(anchor);
+                        }
+                        continue;
+                    }
+                    // Round used: the engine consumed EVERY emitted row already
+                    // (verify batch, or Branch replay). Anchor = emitted[0] was
+                    // streamed before the round; only draft emissions print now.
+                    bool rew = false;
+                    for (size_t j = 0; j < emitted.size(); j++) {
+                        const int32_t t = emitted[j];
+                        if (j > 0u) {
+                            if (g_cancel_gen) { finish = "cancelled"; rew = true; break; }
+                            if (eos_set.count(t)) { finish = "stop"; rew = true; break; }
+                            std::printf("TOK %d\n", t);
+                            std::fflush(stdout);
+                            n_gen++;
+                        }
+                        hist.push_back(t);
+                    }
+                    if (rew) {
+                        // verify already fed ALL emitted rows; rewind to the
+                        // round snapshot and replay only the emitted prefix.
+                        if (!fwd.metal.restore_prefix_state(snap)) spec_disabled = true;
+                        for (size_t j = base; j < hist.size() && !spec_disabled; j++)
+                            fwd.step(hist[j]);
+                        break;
+                    }
+                    if ((size_t)next_argmax >= (size_t)vocab) { spec_disabled = true; break; }
+                    r = m64::StepResult{nullptr, vocab, next_argmax};
+                }
+                processed = hist;
+            } else {
             for (int k = 0; k < limit; k++) {
                 if (g_cancel_gen) { finish = "cancelled"; break; }
                 int32_t tok = sample_token(r.logits, vocab, temp, top_p, r.argmax, rng);
@@ -587,6 +806,18 @@ int main(int argc, char ** argv) {
                     processed.push_back(tok);
                 }
             }
+            }
+            if (spec_K > 0)
+                std::printf("SPEC drafted=%llu accepted=%llu rounds=%llu "
+                            "rollbacks=%llu branch_fast=%llu cooldowns=%llu "
+                            "accept_rate=%.4f\n",
+                            (unsigned long long)spec_stats.drafted,
+                            (unsigned long long)spec_stats.accepted,
+                            (unsigned long long)spec_stats.rounds,
+                            (unsigned long long)spec_stats.rollbacks,
+                            (unsigned long long)spec_stats.branch_fast,
+                            (unsigned long long)spec_stats.cooldowns,
+                            spec_stats.accept_rate());
             double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0).count();
             std::printf("DONE %d %.1f %s\n", n_gen, ms, finish);

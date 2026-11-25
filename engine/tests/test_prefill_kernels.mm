@@ -1715,6 +1715,303 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // ================= 11b. Milestone 5A: Q8_0 KV prefill + FlashAttention + Split-K ====
+        // k_kv_write_q8_batch byte-exact vs the host mirror (same arithmetic as
+        // k_kv_write_q8: id = 127/amax, rint ties-to-even codes, d stored as
+        // half(amax*(1/127))). Q8 attention/flash vs the FP16 batch kernel is
+        // gated on the FP16 outputs, so Q8 rounding noise dominates -> GATE_XQ
+        // (cos >= 0.999). Flash (tensor-core mma, f16-rounded P) vs the scalar
+        // Q8 batch kernel -> GATE_SG. k_attn_head_q8_split + k_attn_head_f16_reduce
+        // vs k_attn_head_q8 see the IDENTICAL quantized KV, only the reduction
+        // order differs -> strict same-KV split parity (cos >= 0.99999).
+        {
+            cur = cur9; pcur = pcur9;
+            const float scale = 1.0f / sqrtf((float)kDH);
+            size_t rbQ = psegs(1200u * kNREL * sizeof(float));
+            for (uint32_t d = 0; d < 1200u * kNREL; d++)
+                ((float *)(pk.data() + rbQ))[d] = (d < 1024u * kNREL) ? R.f(-0.5f, 0.5f) : 100.0f;
+
+            auto q8_pack136 = [&](const float * x128, uint8_t * at) {
+                for (uint32_t blk = 0; blk < 4u; blk++) {
+                    const float * xb = x128 + blk * 32u;
+                    float amax = 0.0f;
+                    for (uint32_t i = 0; i < 32u; i++) amax = std::max(amax, std::fabs(xb[i]));
+                    const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+                    for (uint32_t i = 0; i < 32u; i++) {
+                        int v = (int)std::rintf(xb[i] * id);
+                        v = v < -127 ? -127 : (v > 127 ? 127 : v);
+                        at[blk * 32u + i] = (uint8_t)(int8_t)v;
+                    }
+                    const __fp16 hd = (__fp16)(amax * (1.0f / 127.0f));
+                    uint16_t hb; memcpy(&hb, &hd, 2);
+                    at[128u + blk * 2u] = (uint8_t)hb;
+                    at[129u + blk * 2u] = (uint8_t)(hb >> 8);
+                }
+            };
+            auto allfin = [](const float * p, size_t n) {
+                for (size_t i = 0; i < n; i++) if (!std::isfinite(p[i])) return false;
+                return true;
+            };
+
+            const uint32_t BQ = 16;
+            const uint32_t BQMAX = 128;
+            uint32_t sQq = seg(BQMAX * kNH * kDH), sRq = seg(BQMAX * kNH * kNREL),
+                     sSq = seg(BQMAX * kNH + 4), sOq = seg(BQMAX * kNH * kDH),
+                     sKq = seg(BQ * 2u * kKVD);
+            for (uint32_t i = 0; i < BQMAX * kNH * kDH; i++) scr[sQq + i] = R.f(-1.5f, 1.5f);
+            for (uint32_t i = 0; i < BQMAX * kNH * kNREL; i++) scr[sRq + i] = R.f(-0.5f, 0.5f);
+            for (uint32_t i = 0; i < BQMAX * kNH; i++) scr[sSq + i] = R.f(-1.5f, 1.5f);
+
+            // ---- buffers: FULL Q8+FP16 pair, SWA Q8+FP16 pair ----
+            const uint32_t FULLN = 20128u;             // covers pos0+B-1=20126 (b128 p19999)
+            const size_t full_bytes = (size_t)FULLN * 2u * 1088u;
+            id<MTLBuffer> bQ8F = [rt.device() newBufferWithLength:full_bytes
+                                                         options:MTLResourceStorageModeShared];
+            const uint64_t q8vF = (uint64_t)FULLN * 544u;          // Q8 V base (half units)
+            const size_t f16hF = (size_t)FULLN * kKVD;             // FP16 slot stride (halfs)
+            id<MTLBuffer> bKvFB = [rt.device() newBufferWithLength:f16hF * 2u * sizeof(uint16_t)
+                                                          options:MTLResourceStorageModeShared];
+            const uint64_t f16vF = f16hF;
+            const uint32_t SRING = 1025u;
+            id<MTLBuffer> bQ8S = [rt.device() newBufferWithLength:(size_t)SRING * 2u * 1088u
+                                                         options:MTLResourceStorageModeShared];
+            const uint64_t q8vS = (uint64_t)SRING * 544u;
+            const size_t f16hS = (size_t)SRING * kKVD;
+            id<MTLBuffer> bKvSB = [rt.device() newBufferWithLength:f16hS * 2u * sizeof(uint16_t)
+                                                          options:MTLResourceStorageModeShared];
+            const uint64_t f16vS = f16hS;
+            CHECK(bQ8F && bKvFB && bQ8S && bKvSB, "q8 prefill KV allocs");
+
+            // pre-populate float K/V, then write BOTH encodings from the same
+            // source: FP16 = r16(x), Q8 = host mirror (bitwise-checked against
+            // the batch kernel below).
+            std::vector<float> mq((size_t)FULLN * kKVD), mv((size_t)FULLN * kKVD);
+            for (auto & v : mq) v = R.f(-2.0f, 2.0f);
+            for (auto & v : mv) v = R.f(-2.0f, 2.0f);
+            {
+                uint16_t * devF = (uint16_t *)bKvFB.contents;
+                uint8_t * devQ = (uint8_t *)bQ8F.contents;
+                for (size_t p = 0; p < FULLN; p++) {
+                    const float * kf = mq.data() + p * kKVD;
+                    const float * vf = mv.data() + p * kKVD;
+                    for (uint32_t c = 0; c < kKVD; c++) {
+                        devF[p * kKVD + c] = h16bits(kf[c]);
+                        devF[f16vF + p * kKVD + c] = h16bits(vf[c]);
+                    }
+                    for (uint32_t kvh = 0; kvh < 8u; kvh++) {
+                        q8_pack136(kf + kvh * kDH, devQ + p * 1088u + kvh * 136u);
+                        q8_pack136(vf + kvh * kDH, devQ + (q8vF * 2u) + p * 1088u + kvh * 136u);
+                    }
+                }
+            }
+            std::vector<float> smq((size_t)SRING * kKVD), smv((size_t)SRING * kKVD);
+            for (auto & v : smq) v = R.f(-2.0f, 2.0f);
+            for (auto & v : smv) v = R.f(-2.0f, 2.0f);
+            {
+                uint16_t * devF = (uint16_t *)bKvSB.contents;
+                uint8_t * devQ = (uint8_t *)bQ8S.contents;
+                for (size_t p = 0; p < SRING; p++) {
+                    const float * kf = smq.data() + p * kKVD;
+                    const float * vf = smv.data() + p * kKVD;
+                    for (uint32_t c = 0; c < kKVD; c++) {
+                        devF[p * kKVD + c] = h16bits(kf[c]);
+                        devF[f16vS + p * kKVD + c] = h16bits(vf[c]);
+                    }
+                    for (uint32_t kvh = 0; kvh < 8u; kvh++) {
+                        q8_pack136(kf + kvh * kDH, devQ + p * 1088u + kvh * 136u);
+                        q8_pack136(vf + kvh * kDH, devQ + (q8vS * 2u) + p * 1088u + kvh * 136u);
+                    }
+                }
+            }
+
+            // ---- Test 1: k_kv_write_q8_batch byte-exact vs host mirror ----
+            auto kv_write_q8 = [&](id<MTLBuffer> bKv, uint32_t pos0, uint32_t is_swa,
+                                   uint32_t ring_cap, uint64_t kvv_base,
+                                   id<MTLBuffer> bF16, uint64_t f16v_base) {
+                for (uint32_t i = 0; i < BQ * 2u * kKVD; i++) scr[sKq + i] = R.f(-2.0f, 2.0f);
+                KVWriteBatchF16Args kw{};
+                kw.kvk_base = 0; kw.kvv_base = kvv_base;
+                kw.koff = sKq; kw.voff = sKq + kKVD;
+                kw.k_stride = 2 * kKVD; kw.v_stride = 2 * kKVD;
+                kw.n = kKVD; kw.B = BQ; kw.pos0 = pos0; kw.is_swa = is_swa;
+                kw.ring_cap = ring_cap; kw.pad0 = 0;
+                memcpy(bScr.contents, scr.data(), SCR_F * 4);
+                id<MTLComputePipelineState> p = rt.pipeline("k_kv_write_q8_batch");
+                CHECK(p != nil, "pipeline k_kv_write_q8_batch missing");
+                if (!p || !bKv || !bF16) { CHECK(false, "kv_write_q8_batch prerequisites"); return; }
+                auto cmd = [rt.queue() commandBuffer];
+                auto en = [cmd computeCommandEncoder];
+                [en setComputePipelineState:p];
+                [en setBuffer:bScr offset:0 atIndex:0];
+                [en setBytes:&kw length:sizeof(kw) atIndex:1];
+                [en setBuffer:bKv offset:0 atIndex:2];
+                [en dispatchThreadgroups:MTLSizeMake(8, BQ, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                [en endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                CHECK(cmd.status == MTLCommandBufferStatusCompleted,
+                      "k_kv_write_q8_batch status=%ld", (long)cmd.status);
+                int bad = 0;
+                const uint8_t * dev = (const uint8_t *)bKv.contents;
+                uint16_t * devF = (uint16_t *)bF16.contents;
+                uint8_t want[136];
+                for (uint32_t b = 0; b < BQ; b++) {
+                    const uint32_t pos = pos0 + b;
+                    const uint32_t slot = is_swa ? (pos % ring_cap) : pos;
+                    for (int s = 0; s < 2; s++) {
+                        const uint64_t byte_base =
+                            ((uint64_t)(s ? kvv_base : 0u) + (uint64_t)slot * 544u) * 2u;
+                        // keep the FP16 reference buffer in sync: the batch
+                        // kernel rewrote these slots in bKv only, so mirror
+                        // the same sKq source into bF16 (same h16bits rounding
+                        // as the pre-population above) — otherwise attn_case
+                        // compares Q8 vs FP16 buffers holding DIFFERENT K/V.
+                        const uint64_t half_base =
+                            (uint64_t)(s ? f16v_base : 0u) + (uint64_t)slot * kKVD;
+                        const float * srcf = scr.data() + sKq + b * 2u * kKVD
+                                           + (uint32_t)(s ? kKVD : 0);
+                        for (uint32_t c = 0; c < kKVD; c++) devF[half_base + c] = h16bits(srcf[c]);
+                        for (uint32_t kvh = 0; kvh < 8u; kvh++) {
+                            q8_pack136(scr.data() + sKq + b * 2u * kKVD + (uint32_t)(s ? kKVD : 0)
+                                       + kvh * kDH, want);
+                            if (memcmp(dev + byte_base + kvh * 136u, want, 136u) != 0) bad++;
+                        }
+                    }
+                }
+                CHECK(bad == 0, "k_kv_write_q8_batch p0=%u: %d head encodings vs host mirror", pos0, bad);
+                printf("kv_write_q8_batch p0=%-6u  %d head mismatches (136B byte-exact) %s\n",
+                       pos0, bad, bad ? "FAIL" : "OK");
+            };
+            kv_write_q8(bQ8F, 70u,   0u, FULLN, q8vF, bKvFB, f16vF);
+            kv_write_q8(bQ8S, 1020u, 1u, SRING, q8vS, bKvSB, f16vS);
+
+            // Q8 attention + FP16 cross-run, then flash; identical staging.
+            // attn args are encoding-agnostic — only kvvoff units differ.
+            auto attn_args_q = [&](uint32_t pos0, uint32_t Bb, uint32_t is_swa, uint32_t ring,
+                                   uint64_t kvv_off) {
+                AttnBatchF16Args A{};
+                A.relbiaspack = rbQ; A.kvkoff = 0; A.kvvoff = kvv_off;
+                A.qoff = sQq; A.rout = sRq; A.sinkoff = sSq; A.outoff = sOq;
+                A.q_stride = kNH * kDH; A.rout_stride = kNH * kNREL;
+                A.sink_stride = kNH; A.out_stride = kNH * kDH;
+                A.pos0 = pos0; A.B = Bb; A.is_swa = is_swa; A.n_swa = 1024;
+                A.ring_cap = ring; A.pad0 = 0;
+                A.scale = scale; A.log_scale_floor = 8192.0f; A.log_scale_alpha = 0.25f; A.pad1 = 0;
+                return A;
+            };
+
+            auto attn_case = [&](const char * nm, uint32_t pos0, uint32_t Bb, uint32_t is_swa,
+                                 uint32_t ring, uint64_t q8v, uint64_t f16v,
+                                 id<MTLBuffer> bQ8, id<MTLBuffer> bF16) {
+                if (!bQ8 || !bF16) { CHECK(false, "attn_q8 case buffers"); return; }
+                const size_t n = (size_t)Bb * kNH * kDH;
+                auto Af = attn_args_q(pos0, Bb, is_swa, ring, f16v);
+                auto Aq = attn_args_q(pos0, Bb, is_swa, ring, q8v);
+                std::vector<float> reff(n), refq(n);
+                run("k_attn_head_f16_batch", true, kNH, Bb, 32, 1, &Af, sizeof(Af), bF16);
+                memcpy(reff.data(), scr.data() + sOq, n * 4);
+                std::fill(scr.begin() + sOq, scr.begin() + sOq + n, -9999.0f);
+                run("k_attn_head_q8_batch", true, kNH, Bb, 32, 1, &Aq, sizeof(Aq), bQ8);
+                const bool fq = allfin(scr.data() + sOq, n);
+                memcpy(refq.data(), scr.data() + sOq, n * 4);
+                char lbl[64];
+                snprintf(lbl, sizeof(lbl), "attn q8 vs f16 %s", nm);
+                gate(lbl, reff.data(), scr.data() + sOq, n, GATE_XQ);
+                CHECK(fq, "attn q8 batch %s non-finite output", nm);
+                CHECK(allfin(reff.data(), n), "attn f16 batch %s non-finite output", nm);
+                std::fill(scr.begin() + sOq, scr.begin() + sOq + n, -9999.0f);
+                run("k_attn_q8_flash_prefill", true, kNH, (Bb + 31u) / 32u, 32, 4, &Aq, sizeof(Aq), bQ8);
+                snprintf(lbl, sizeof(lbl), "flashq8 vs q8b %s", nm);
+                gate(lbl, refq.data(), scr.data() + sOq, n, GATE_SG);
+                snprintf(lbl, sizeof(lbl), "flashq8 vs f16b %s", nm);
+                gate(lbl, reff.data(), scr.data() + sOq, n, GATE_XQ);
+                CHECK(allfin(scr.data() + sOq, n), "flash q8 %s non-finite output", nm);
+            };
+            attn_case("full b8 p0",     0u,     8u,   0u, FULLN,  q8vF, f16vF, bQ8F, bKvFB);
+            attn_case("full b32 p7",    7u,     32u,  0u, FULLN,  q8vF, f16vF, bQ8F, bKvFB);
+            attn_case("full b128 p19999", 19999u, 128u, 0u, FULLN, q8vF, f16vF, bQ8F, bKvFB);
+            attn_case("swa b8 p1020",   1020u,  8u,   1u, SRING,  q8vS, f16vS, bQ8S, bKvSB);
+            attn_case("swa b32 p1000",  1000u,  32u,  1u, SRING,  q8vS, f16vS, bQ8S, bKvSB);
+            attn_case("swa b128 p1900", 1900u,  128u, 1u, SRING,  q8vS, f16vS, bQ8S, bKvSB);
+
+            // ---- Test 3: k_attn_head_q8_split + reduce vs k_attn_head_q8
+            // (identical quantized KV, reduction-order-only delta; same buffer
+            // layout as section 11: slot = pos, V base = splitKvLen slots)
+            CHECK(bKvSplit != nil, "bKvSplit alive for q8 split");
+            if (bKvSplit) {
+                uint8_t * dq = (uint8_t *)bKvSplit.contents;
+                const uint64_t q8vHalf = (uint64_t)splitKvLen * 544u;
+                for (uint32_t p = 0; p < splitKvLen; p++) {
+                    for (int s = 0; s < 2; s++) {
+                        for (uint32_t kvh = 0; kvh < 8u; kvh++) {
+                            const uint64_t at = ((uint64_t)(s ? q8vHalf : 0u) + (uint64_t)p * 544u) * 2u
+                                              + kvh * 136u;
+                            // random-but-valid Q8 blocks (int8 codes + finite
+                            // f16 scales): both kernels read the SAME bytes,
+                            // so this isolates the split-reduction delta.
+                            for (uint32_t i = 0; i < 128u; i++) dq[at + i] = (uint8_t)R.u32();
+                            for (uint32_t blk = 0; blk < 4u; blk++) {
+                                const uint16_t hb = (uint16_t)((R.u32() & 0x3B00u) | (R.u32() & 0xFFu));
+                                dq[at + 128u + blk * 2u] = (uint8_t)hb;
+                                dq[at + 129u + blk * 2u] = (uint8_t)(hb >> 8);
+                            }
+                        }
+                    }
+                }
+
+                const uint32_t MAX_SP = 32u;
+                const uint32_t sQ2 = seg(kNH * kDH), sR2 = seg(kNH * kNREL), sS2 = seg(kNH);
+                const uint32_t sPO2 = seg(kNH * MAX_SP * kDH), sPM2 = seg(kNH * MAX_SP * 2u);
+                const uint32_t sRef2 = seg(kNH * kDH), sGot2 = seg(kNH * kDH);
+                for (uint32_t i = 0; i < kNH * kDH; i++) scr[sQ2 + i] = R.f(-1.2f, 1.2f);
+                for (uint32_t i = 0; i < kNH * kNREL; i++) scr[sR2 + i] = R.f(-0.5f, 0.5f);
+                for (uint32_t i = 0; i < kNH; i++) scr[sS2 + i] = R.f(-1.0f, 1.0f);
+
+                struct QSplitCase { uint32_t pos, is_swa, n_swa, ring_cap, n_splits; const char * label; };
+                const QSplitCase qcases[] = {
+                    {511u,   0u, 0u,    0u,    4u,  "attn_q8split full p=511"},
+                    {2048u,  0u, 0u,    0u,    16u, "attn_q8split full p=2048"},
+                    {20000u, 0u, 0u,    0u,    32u, "attn_q8split full p=20000"},
+                    {2048u,  1u, 1024u, 1025u, 9u,  "attn_q8split swa  p=2048"},
+                };
+                for (const auto & tc : qcases) {
+                    const float tau = tc.is_swa ? 1.0f
+                        : (float)(std::log(std::max(1.0, ((double)tc.pos + 1.0) / 8192.0)) * 0.25 + 1.0);
+                    AttnF16Args ref_a{splitRb, 0ull, q8vHalf, sQ2, sR2, sS2, sRef2,
+                                      tc.pos, tc.is_swa, tc.n_swa, tc.ring_cap, scale, tau};
+                    for (uint32_t i = 0; i < kNH * kDH; i++) {
+                        scr[sRef2 + i] = -99.0f;
+                        scr[sGot2 + i] = 99.0f;
+                    }
+                    for (uint32_t i = 0; i < kNH * MAX_SP * kDH; i++) scr[sPO2 + i] = 77.0f;
+                    for (uint32_t i = 0; i < kNH * MAX_SP * 2u; i++) scr[sPM2 + i] = 77.0f;
+                    run("k_attn_head_q8", true, kNH, 1, 32, 1, &ref_a, sizeof(ref_a), bKvSplit);
+                    const std::vector<float> ref_out(scr.begin() + sRef2, scr.begin() + sRef2 + kNH * kDH);
+                    CHECK(allfin(ref_out.data(), ref_out.size()), "%s ref non-finite", tc.label);
+
+                    AttnF16SplitArgs sp_a{splitRb, 0ull, q8vHalf, sQ2, sR2, sS2, sGot2,
+                                          sPO2, sPM2, tc.pos, tc.is_swa, tc.n_swa, tc.ring_cap,
+                                          tc.n_splits, 0u, scale, tau};
+                    run("k_attn_head_q8_split", true, kNH, tc.n_splits, 32, 1, &sp_a, sizeof(sp_a), bKvSplit);
+                    run("k_attn_head_f16_reduce", true, kNH, 1, 32, 1, &sp_a, sizeof(sp_a));
+                    double mad = 0, maxabs = 0;
+                    const float * got = scr.data() + sGot2;
+                    for (size_t i = 0; i < ref_out.size(); i++) {
+                        mad = std::max(mad, std::fabs((double)ref_out[i] - got[i]));
+                        maxabs = std::max(maxabs, std::fabs((double)ref_out[i]));
+                    }
+                    const double relscale = mad / std::max(1e-30, maxabs);
+                    const double cosv = cosine(ref_out.data(), got, ref_out.size());
+                    const bool strict_ok = allfin(got, ref_out.size()) && cosv >= 0.99999;
+                    CHECK(strict_ok, "%s strict split parity cos=%.8f relscale=%.3g", tc.label, cosv, relscale);
+                    printf("%-26s cos=%.8f relscale=%.3g mad=%.3g %s\n",
+                           tc.label, cosv, relscale, mad, strict_ok ? "OK" : "FAIL");
+                }
+                bKvSplit = nil;
+            }
+            bQ8F = nil; bKvFB = nil; bQ8S = nil; bKvSB = nil;
+            cur = cur9; pcur = pcur9;
+        }
+
         // ================= optional microbenchmark (--bench) =================
         if (do_bench) {
             cur = cur9; pcur = pcur9;

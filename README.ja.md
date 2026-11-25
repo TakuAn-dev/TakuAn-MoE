@@ -22,6 +22,13 @@
   - タイル化 FlashAttention プリフィル（`k_attn_f16_flash_prefill`、`engine/kernels/m64_prefill.metal`）を `B >= 8` でフルアテンション層（`is_swa=0`）と SWA 層（`is_swa=1`）の両方に有効化 — `p=20000`（`B=128`）でアテンションのプリフィルが最大 **7.63 倍**高速化（`5.93 ms` vs `45.25 ms/iter`）、`B=32` で **3.44 倍**、SWA 層の `B=128` で **4.93 倍**。
   - フルパック時の `--prefix-cache` 自動デフォルトを **2** から **4** チェックポイントに引き上げ（`--prefix-cache` で上書き可能）。
   - サーバーのストリーミング／切断安定性 — thinking 中の `delta.reasoning_content` を SSE でリアルタイム配信し、長時間の推論でもクライアントのアイドル／ストールタイムアウトが発生しない。クライアント切断・停止時には `SIGUSR1` で進行中の `GEN` をクリーンにキャンセル（`DONE ... cancelled`）し、`stdout` パイプをドレインしてワーカーのパイプデッドロックを防止。
+- **Milestone 5 — KV キャッシュ dtype**: `--kv-type f16|q8_0` で Metal の KV キャッシュ形式を選択（`q8_0` は長いコンテキストで KV メモリを約半分に。Metal 限定、デフォルト `f16`）。
+- **Milestone 6 — マルチモデル アーキテクチャディスパッチ**（Inkling-2-Mini に加え `gemma-4-26B-A4B`、`arch = gemma4` に対応）: `tools/m64pack.py` のパック変換、`m64run` の CPU オラクル + Metal FP16/Q8_0 KV カーネル、`takuan_server.py` の Gemma 4 サポート — SentencePiece-BPE トークナイザー（`tokenizer.ggml.model == "gemma4"`、`▁` 単語マーカー + `<0xXX>` バイトフォールバック）と、`<|turn>role ... <turn|>` チャットテンプレート、`<|channel>thought\n…<channel|>` の思考チャネルを `delta.reasoning_content` としてリアルタイム配信。
+- **Milestone 7 — デコード・サービング最適化**（実測値）:
+  - Inkling の `Q4_K` / `Q5_0` / `Q5_1` デコード用 MoE カーネル: アクティベーションレジスタ共有を 2 行（`k_gemv_gateup_batch8_q4k_f32in_m2`）/ 4 行（`k_gemv_down_reduce8_q5_{0,1}_f32in_m4`）へ拡張 — 実 Inkling シェイプで MoE gemv が **1.12〜1.22 倍**高速化し、m1 カーネルとビット単位で完全一致。
+  - Prompt-lookup 投機的デコーディング（`--speculative N` / `--draft-tokens N`、0..8、デフォルト `0` = 無効）: n-gram 下書き検索 + バッチ検証 + スナップショット/リストアによるロールバック — 下書きモデルも追加メモリも不要で、検証時の argmax は通常グリーディとビット単位一致（Metal・Inkling・`temp==0`）。分岐トークンの再検証排除、アンカーの早期ストリーミング、適応的クールダウンも収録。
+  - なめらかな SSE ストリーミング: サンプラーが top-p 候補を事前フィルタ（`prob >= 1e-6 * prob[max]`、平坦な分布では全語彙フォールバックで分布形状を厳密維持）し、語彙 201k 件の毎トークン全ソートを廃止 — サンプルコスト **2.09 → 0.825 ms/tok**（`nv=201,024`）。さらに SSE 接続へ `TCP_NODELAY` を設定し、トークン毎チャンクの Nagle 由来のバースト性を解消。
+  - RAM プレフィックススタッシュ: 割り込む短いプロンプトで稼働中の会話 KV が破棄される場面では、最長の生きているチェックポイントを RAM に一時退避し、会話再開時に復元して長いコンテキストの再プリフィルを回避（自動動作、フラグ不要）。
 
 ## 検証済みベンチマーク（Apple M4 Max, 64 GB）
 
@@ -85,6 +92,8 @@ python3 tools/takuan_server.py --pack <MODEL_DIR>/inkling-2-mini-q8_0.m64pack \
 - **Base URL:** `http://127.0.0.1:8080/v1`
 - **Model:** `takuan-inkling-2-mini`
 - **API Key:** 空でない任意の文字列
+
+Gemma 4 パック（`--pack <MODEL_DIR>/gemma-4-26b-a4b*.m64pack` に対応する Gemma 4 GGUF を `--gguf` で指定）も同じ方法で提供できます — チャットテンプレートとトークナイザーは GGUF のメタデータから自動選択されます。
 
 ## ディレクトリ構成
 

@@ -463,8 +463,8 @@ class Packer:
                                 "offset": lay_base, "length": rec_len, "group_size": gbs,
                                 "residency": "cold", "xxh64": rec_hash.hexdigest(), "expert_stride": stride})
                 continue
-            if n.startswith("blk.") and ".ffn_down_exps." in n:
-                continue  # folded into merged record
+            if n.startswith("blk.") and n.endswith(".ffn_down_exps.weight"):
+                continue  # merged into ffn_experts.weight; keep sibling tensors (e.g. .scale)
             align = GPU_ALIGN
             pad = (align - pos % align) % align
             if pad:
@@ -487,7 +487,9 @@ class Packer:
                             "shape": [int(d) for d in reversed(t["dims"])],
                             "region": "gpu", "layout": "rowmajor", "offset": pos - nbytes,
                             "length": nbytes, "group_size": DTYPES[t["dtype"]][1],
-                            "residency": "hot" if "norm" in n or "gate_inp" in n or "embd" in n or n == "output.weight" else "warm",
+                            "residency": "hot" if ("norm" in n or "gate_inp" in n or "embd" in n
+                                           or "scale" in n or n == "rope_freqs.weight"
+                                           or n == "output.weight") else "warm",
                             "xxh64": h.hexdigest()})
         # blob pad to alignment then header
         blob_end = pos

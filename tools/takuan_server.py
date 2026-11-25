@@ -137,6 +137,14 @@ def has_inkling_template(bpe):
     return all(t in bpe.special_tokens for t in INKLING_REQUIRED)
 
 
+# Gemma 4 chat-template markers (GGUF USER_DEFINED / CONTROL tokens).
+GEMMA4_REQUIRED = ("<|turn>", "<turn|>", "<|channel>", "<channel|>")
+
+
+def has_gemma4_template(bpe):
+    return all(t in bpe.id_of for t in GEMMA4_REQUIRED)
+
+
 def has_inkling_tools(bpe):
     return has_inkling_template(bpe) and all(
         t in bpe.special_tokens for t in INKLING_TOOL_TOKENS)
@@ -218,6 +226,40 @@ def format_chat_prompt(messages, bpe, reasoning_effort="none", tools=None):
         else:
             out.append("<|message_model|><|content_text|>")
         return "".join(out)
+    elif has_gemma4_template(bpe):
+        # Gemma 4: "<|turn>ROLE\n<text><turn|>\n" turns; thinking rides in a
+        # "<|channel>thought\n...<channel|>" channel inside the model turn.
+        think_on = _thinking_level(reasoning_effort) > 0.0
+        out = []
+        if getattr(bpe, "add_bos_token", False) and "<bos>" in bpe.id_of:
+            out.append("<bos>")
+        i = 0
+        sys_parts = []
+        while i < len(messages) and str(messages[i].get("role", "user")) \
+                in ("system", "developer"):
+            sys_parts.append(_flatten_content(messages[i].get("content")))
+            i += 1
+        if sys_parts or think_on:
+            out.append("<|turn>system\n")
+            if think_on and "<|think|>" in bpe.id_of:
+                out.append("<|think|>")
+            out.append("\n\n".join(sys_parts))
+            out.append("<turn|>\n")
+        for msg in messages[i:]:
+            role = str(msg.get("role", "user"))
+            text = _flatten_content(msg.get("content"))
+            g_role = "model" if role == "assistant" else "user"
+            rc = msg.get("reasoning_content")
+            if role == "assistant" and isinstance(rc, str) and rc:
+                out.append("<|turn>model\n<|channel>thought\n" + rc
+                           + "\n<channel|>" + text + "<turn|>\n")
+            else:
+                out.append("<|turn>" + g_role + "\n" + text + "<turn|>\n")
+        out.append("<|turn>model\n")
+        if not think_on:
+            # Empty thought channel == "answer directly, no thinking".
+            out.append("<|channel>thought\n<channel|>")
+        return "".join(out)
     # Fallback template: works with any tokenizer (no special tokens needed).
     out = []
     for msg in messages:
@@ -278,6 +320,8 @@ def resolve_eos_ids(bpe, structured=False):
     if not structured:
         add(end_msg_id)
     add(bpe.id_of.get("<|endoftext|>"))
+    add(bpe.id_of.get("<turn|>"))   # Gemma 4 end-of-turn
+    add(bpe.id_of.get("<eos>"))     # Gemma 4 / llama EOS
     add(bpe.eos_token_id)
     add(bpe.eot_token_id)
     return ids
@@ -288,12 +332,13 @@ class EngineWorker:
     commands so concurrent HTTP requests never interleave on the KV cache."""
 
     def __init__(self, engine, pack, backend, ctx, arena_gb, io_mode,
-                 worker_cmd=None, extra_args=None):
+                 kv_type="f16", worker_cmd=None, extra_args=None):
         if worker_cmd:
             cmd = shlex.split(worker_cmd)
         else:
             cmd = [engine, pack, "--worker", "--backend", backend,
-                   "--ctx", str(ctx), "--arena-gb", str(arena_gb), "--io", io_mode]
+                   "--ctx", str(ctx), "--arena-gb", str(arena_gb), "--io", io_mode,
+                   "--kv-type", kv_type]
             if extra_args:
                 cmd += list(extra_args)
         self.cmd = cmd
@@ -491,6 +536,11 @@ def _make_stream_fn(worker, bpe, ctx):
     tid_tool_json = bpe.id_of.get("<|content_invoke_tool_json|>")
     tid_end_msg = bpe.id_of.get("<|end_message|>")
     tid_msg_model = bpe.id_of.get("<|message_model|>")
+    # Gemma 4 channel routing: <|channel>NAME\n ... <channel|> (thinking
+    # arrives live as reasoning_delta, exactly like the Inkling path).
+    g4 = has_gemma4_template(bpe)
+    tid_ch_open = bpe.id_of.get("<|channel>")
+    tid_ch_close = bpe.id_of.get("<channel|>")
 
     def run(prompt_ids, max_tokens, temperature, top_p, seed, stop_strings,
             yield_fn, structured=False):
@@ -511,6 +561,9 @@ def _make_stream_fn(worker, bpe, ctx):
         header_buf = []
         header_name = ""
         tool_buf = []
+        # Gemma 4 channel state: "text" | "ch_header" | "thinking" | "other"
+        g4_state = "text"
+        g4_ch_buf = []
 
         def emit_text(piece):
             if piece:
@@ -578,8 +631,47 @@ def _make_stream_fn(worker, bpe, ctx):
                     break
                 tid = ev[1]
                 if not structured:
-                    if 0 <= tid < len(bpe.tokens) and tid not in bpe.special_ids:
-                        push_text(dec.push(tid))
+                    if not g4:
+                        if 0 <= tid < len(bpe.tokens) \
+                                and tid not in bpe.special_ids:
+                            push_text(dec.push(tid))
+                        continue
+                    # Gemma 4 channel routing by exact token id.
+                    if tid == tid_ch_open:
+                        tail = dec.flush()
+                        if tail:
+                            push_text(tail)
+                        reset_seg()
+                        g4_state = "ch_header"
+                        g4_ch_buf = []
+                    elif tid == tid_ch_close:
+                        tail = dec.flush()
+                        if g4_state == "thinking" and tail:
+                            emit_reasoning(tail)
+                        reset_seg()
+                        g4_state = "text"
+                    elif tid in bpe.special_ids:
+                        continue
+                    else:
+                        piece = dec.push(tid)
+                        if not piece:
+                            continue
+                        if g4_state == "ch_header":
+                            g4_ch_buf.append(piece)
+                            joined = "".join(g4_ch_buf)
+                            if "\n" in joined:
+                                hdr, rest = joined.split("\n", 1)
+                                g4_ch_buf = []
+                                g4_state = ("thinking"
+                                            if hdr.strip() == "thought"
+                                            else "other")
+                                if g4_state == "thinking" and rest:
+                                    emit_reasoning(rest)
+                        elif g4_state == "thinking":
+                            emit_reasoning(piece)
+                        elif g4_state == "text":
+                            push_text(piece)
+                        # "other": non-thinking channel -> content ignored.
                     continue
 
                 # Structured Inkling segment routing by exact token id.
@@ -632,7 +724,14 @@ def _make_stream_fn(worker, bpe, ctx):
 
             # Drain final incremental decoder bytes on DONE.
             tail = dec.flush()
-            if not structured or state == "text":
+            if g4:
+                if g4_state == "thinking" and tail:
+                    emit_reasoning(tail)
+                elif g4_state == "text":
+                    push_text(tail)
+                    flush_text()
+                # "ch_header"/"other": incomplete channel header or ignored.
+            elif not structured or state == "text":
                 push_text(tail)
                 flush_text()
             elif state == "thinking" and tail:
@@ -667,6 +766,10 @@ def _make_stream_fn(worker, bpe, ctx):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "TakuAn-MoE/0.1"
+    # SSE per-token chunks are tiny (< MTU): with Nagle on, the kernel holds
+    # each chunk waiting for the peer's ACK of the previous one, which makes
+    # the stream visibly bursty in clients. TCP_NODELAY sends every write now.
+    disable_nagle_algorithm = True
     cfg = None  # injected namespace: model, ctx, bpe, worker, run_stream
 
     # ---------------- plumbing ----------------
@@ -804,6 +907,12 @@ class Handler(BaseHTTPRequestHandler):
         prefix_text, prefix_ids = split_static_chat_prefix(
             msgs, self.cfg.bpe, p["reasoning_effort"], tools=tools)
         if len(prefix_ids) < 64 or len(prefix_ids) >= self.cfg.ctx:
+            # Ultra-tiny prefixes bail before the <512 guard below; if a long
+            # static warm is pinned, flag re-sync anyway — this GEN resets
+            # the worker's warm_state, so the next long turn must re-WARM.
+            if len(prefix_ids) < 64 and \
+                    getattr(self.cfg, "last_warm_len", 0) >= 1024:
+                self.cfg.warm_needs_sync = True
             return
         with self.cfg.warm_lock:
             last_len = getattr(self.cfg, "last_warm_len", 0)
@@ -1045,6 +1154,8 @@ def main():
     ap.add_argument("--arena-gb", type=float, default=0.0)
     ap.add_argument("--io", choices=["pread", "mtlio"], default="mtlio")
     ap.add_argument("--backend", choices=["metal", "cpu"], default="metal")
+    ap.add_argument("--kv-type", choices=["f16", "q8_0"], default="f16",
+                    help="worker KV cache dtype (q8_0: Metal only, ~47%% of FP16 bytes)")
     ap.add_argument("--prefix-cache", type=int, default=None,
                     help="worker LRU prefix checkpoints (0=off); default: "
                          "let m64run auto-select. Sent to m64run only.")
@@ -1052,6 +1163,11 @@ def main():
                     help="SSD-persistent prefix cache dir (.m64kv files kept "
                          "across restarts); sent to m64run only.")
     ap.add_argument("--model-name", default="takuan-inkling-2-mini")
+    ap.add_argument("--speculative", type=int, default=0,
+                    help="prompt-lookup speculative decoding draft cap "
+                         "0..8; 0 = disabled (greedy parity)")
+    ap.add_argument("--draft-tokens", type=int, default=0,
+                    help="alias for --speculative (overrides it when > 0)")
     ap.add_argument("--worker-cmd",
                     help="override worker command (shlex-split; for mock testing)")
     a = ap.parse_args()
@@ -1065,7 +1181,15 @@ def main():
         else ["--prefix-cache", str(a.prefix_cache)]
     if a.cache_dir:
         prefix_extra += ["--cache-dir", a.cache_dir]
+    if not 0 <= a.speculative <= 8:
+        ap.error("--speculative must be 0..8")
+    if not 0 <= a.draft_tokens <= 8:
+        ap.error("--draft-tokens must be 0..8")
+    spec_k = a.draft_tokens if a.draft_tokens > 0 else a.speculative
+    if spec_k > 0:
+        prefix_extra += ["--speculative", str(spec_k)]
     worker = EngineWorker(a.engine, a.pack, a.backend, a.ctx, a.arena_gb, a.io,
+                          kv_type=a.kv_type,
                           worker_cmd=a.worker_cmd, extra_args=prefix_extra)
     atexit.register(worker.close)
 

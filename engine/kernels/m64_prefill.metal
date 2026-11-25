@@ -538,6 +538,393 @@ kernel void k_attn_f16_flash_prefill(device float * SCR [[buffer(0)]],
     }
 }
 
+// ---------------- Milestone 5A: Q8_0 KV cache batch write / attention / flash
+// Q8_0 KV layout (see k_kv_write_q8 in m64_p2a.metal): per KV head 136 B =
+// int8 qs[128] (4 Q8_0 blocks of 32) + half d[4] (d[blk] = amax_blk/127);
+// per token slot 8 heads x 136 B = 1088 B. A.kvk_base/kvv_base/kvkoff/kvvoff
+// KEEP half-unit units -> byte offsets via *2. Bases must be multiples of 4
+// half units (8 B) for the char4 accesses.
+
+// grid = dispatchThreadgroups (8, B, 1), threadgroup = (32, 1, 1): kvh from
+// TGPG.x, batch row b from TGPG.y. Lanes 0..7/8..15/16..23/24..31 quantize
+// blocks 0..3 (xor masks 1/2/4 stay inside the 8-lane group).
+kernel void k_kv_write_q8_batch(const device float * SCR [[buffer(0)]],
+                                constant KVWriteBatchF16Args & A [[buffer(1)]],
+                                device uchar * KV [[buffer(2)]],
+                                uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    const uint kvh = M64_TGPG.x, b = M64_TGPG.y, lane = M64_TITG.x;
+    const uint t = lane * 4u;
+    const uint blk = lane >> 3u;
+    const uint pos = A.pos0 + b;
+    const uint slot = A.is_swa ? (pos % A.ring_cap) : pos;
+    const device float * src[2] = {SCR + A.koff + (size_t)b * A.k_stride + kvh * 128u + t,
+                                   SCR + A.voff + (size_t)b * A.v_stride + kvh * 128u + t};
+    device uchar * dst[2] = {KV + (size_t)A.kvk_base * 2ul + (size_t)slot * 1088ul + (size_t)kvh * 136ul,
+                             KV + (size_t)A.kvv_base * 2ul + (size_t)slot * 1088ul + (size_t)kvh * 136ul};
+    #pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const device float * x = src[s];
+        const float x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+        float amax = fmax(fmax(fabs(x0), fabs(x1)), fmax(fabs(x2), fabs(x3)));
+        amax = fmax(amax, simd_shuffle_xor(amax, 1u));
+        amax = fmax(amax, simd_shuffle_xor(amax, 2u));
+        amax = fmax(amax, simd_shuffle_xor(amax, 4u));
+        const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        char4 q;
+        q.x = q8_c8(x0, id); q.y = q8_c8(x1, id);
+        q.z = q8_c8(x2, id); q.w = q8_c8(x3, id);
+        *(device char4 *)(dst[s] + t) = q;
+        if ((lane & 7u) == 0u)
+            ((device half *)(dst[s] + 128u))[blk] = half(amax * (1.0f / 127.0f));
+    }
+}
+
+// Batched causal attention over the Q8_0 KV cache. Numerics mirror
+// k_attn_head_f16_batch exactly except K/V come from Q8_0 (dequantized per
+// lane: the 8-lane groups each cover one 32-element block, so the block
+// scale folds into kq BEFORE simd_sum).
+kernel void k_attn_head_q8_batch(device float * SCR [[buffer(0)]],
+                                 constant AttnBatchF16Args & A [[buffer(1)]],
+                                 const device uchar * PACK [[buffer(2)]],
+                                 const device uchar * KV [[buffer(3)]],
+                                 uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                 uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    const uint h = M64_TGPG.x, b = M64_TGPG.y, lane = M64_TITG.x;
+    const uint pos = A.pos0 + b;
+    const float tau = A.is_swa ? 1.0f
+        : (metal::log(fmax(1.0f, ((float)pos + 1.0f) / A.log_scale_floor)) *
+               A.log_scale_alpha + 1.0f);
+    const uint t = lane * 4u;
+    const device float * q = SCR + A.qoff + (size_t)b * A.q_stride + h * 128u;
+    half qh[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) { float qf = q[t + i] * tau; qh[i] = half(qf); }
+    const device float * rout = SCR + A.rout + (size_t)b * A.rout_stride + h * 16u;
+    const float sink = SCR[A.sinkoff + (size_t)b * A.sink_stride + h];
+    const uint kvh = h / 3u;
+    const uint blk = lane >> 3u;
+    const device uchar * kbase = KV + (size_t)A.kvkoff * 2ul + (size_t)kvh * 136ul;
+    const device uchar * vbase = KV + (size_t)A.kvvoff * 2ul + (size_t)kvh * 136ul;
+    float oh[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float M = -INFINITY;
+    float S = 0.0;
+    const uint j_start = (A.is_swa && pos > A.n_swa) ? (pos - A.n_swa) : 0u;
+    for (uint j = j_start; j <= pos; j++) {
+        const uint slot_idx = A.is_swa ? (j % A.ring_cap) : j;
+        const device uchar * kh = kbase + (size_t)slot_idx * 1088ul;
+        const float kd = float(((const device half *)(kh + 128u))[blk]);
+        const char4 kq = *(const device char4 *)(kh + t);
+        float d = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) d = fma(float(qh[i]), float(kq[i]) * kd, d);
+        d = simd_sum(d);
+        uint dist = pos - j;
+        float bv = 0.0f;
+        if (dist < M64_EXT) {
+            const device float * brow = ((const device float *)(PACK + A.relbiaspack)) +
+                                        (size_t)dist * 16u;
+            // split dot over 16 channels across lanes 0..15 (else simd_sum = 32x dot)
+            float v = (lane < 16u) ? (brow[lane] * (rout[lane] * tau)) : 0.0f;
+            bv = simd_sum(v);
+        }
+        float s = d * A.scale + f16r(bv - sink);
+        float ms = 1.0f, vs;
+        if (s > M) {
+            ms = metal::exp(M - s);
+            oh[0] *= ms; oh[1] *= ms; oh[2] *= ms; oh[3] *= ms;
+            M = s; vs = 1.0f;
+        } else {
+            vs = metal::exp(s - M);
+        }
+        const device uchar * vh = vbase + (size_t)slot_idx * 1088ul;
+        const float vscale = vs * float(((const device half *)(vh + 128u))[blk]);
+        const char4 vq = *(const device char4 *)(vh + t);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) oh[i] = fma(vscale, float(vq[i]), oh[i]);
+        S = S * (float)ms + (float)vs;
+    }
+    // zero-sink term (sinks tensor == 0)
+    {
+        float ms = 1.0f, vs;
+        if (0.0f > M) {
+            ms = metal::exp(M - 0.0f);
+            oh[0] *= ms; oh[1] *= ms; oh[2] *= ms; oh[3] *= ms;
+            M = 0.0f; vs = 1.0f;
+        } else vs = metal::exp(0.0f - M);
+        S = S * (float)ms + (float)vs;
+    }
+    const float inv = (float)(1.0 / S);
+    device float * out = SCR + A.outoff + (size_t)b * A.out_stride + h * 128u;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) out[t + i] = oh[i] * inv;
+}
+
+// ---------------- FlashAttention-2 tiled prefill over Q8_0 KV (Milestone 5A)
+// Byte-for-byte the same algorithm/tiling as k_attn_f16_flash_prefill (read
+// that header comment); the ONLY difference is the K/V tile loads: each
+// thread's 32 columns are exactly one Q8_0 block (seg = block index), so the
+// block dequant runs in place — half(float(q) * d) into tgKV. P stays
+// f16-rounded (tensor cores) -> GATE_SG parity vs the scalar Q8 kernel.
+kernel void k_attn_q8_flash_prefill(device float * SCR [[buffer(0)]],
+                                    constant AttnBatchF16Args & A [[buffer(1)]],
+                                    const device uchar * PACK [[buffer(2)]],
+                                    const device uchar * KV [[buffer(3)]],
+                                    uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                    uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    const uint h = M64_TGPG.x, b0 = M64_TGPG.y * 32u;
+    const uint tid = M64_TITG.y * 32u + M64_TITG.x;      // 0..127
+    const uint sgid = tid >> 5u;
+    const uint qrow = tid >> 2u, seg = tid & 3u;         // loader/softmax mapping
+
+    threadgroup half tgBig[2u * 32u * M64_FQ_LD];        // K/V tiles + Qh tile + O float staging
+    threadgroup half * tgQ = tgBig + 32u * M64_FQ_LD;
+    threadgroup half * tgKV = tgBig;
+    threadgroup float tgS[32u * M64_FS_LD];
+    threadgroup float tgRT[32u * 16u];
+    threadgroup float tgSink[32u];
+    threadgroup float tgAlpha[32u];
+    threadgroup float tgML[2u * 32u];                    // [0..31]=M, [32..63]=S
+    threadgroup float * tgM = tgML;
+    threadgroup float * tgSum = tgML + 32u;
+
+    const uint kvh = h / 3u;
+    const uint b_hi = min(b0 + 31u, A.B - 1u);           // grid.y = ceil(B/32) => b0 < A.B
+    const uint pmin = A.pos0 + b0, pmax = A.pos0 + b_hi;
+    const uint js0 = (A.is_swa && pmin > A.n_swa) ? (pmin - A.n_swa) : 0u;
+
+    // ---- load Qh = half(q * tau) and per-row scalars (rout*tau, sink)
+    {
+        const uint b = b0 + qrow;
+        const bool v = b < A.B;
+        float tau = 1.0f;
+        if (v && !A.is_swa)
+            tau = metal::log(fmax(1.0f, ((float)(A.pos0 + b) + 1.0f) / A.log_scale_floor)) *
+                      A.log_scale_alpha + 1.0f;
+        threadgroup half * dq = tgQ + qrow * M64_FQ_LD + seg * 32u;
+        if (v) {
+            const device float * q = SCR + A.qoff + (size_t)b * A.q_stride + h * 128u;
+            #pragma unroll
+            for (uint i = 0; i < 32u; i++) dq[i] = half(q[seg * 32u + i] * tau);
+            if (seg == 0u) {
+                tgSink[qrow] = SCR[A.sinkoff + (size_t)b * A.sink_stride + h];
+                const device float * rt = SCR + A.rout + (size_t)b * A.rout_stride + h * 16u;
+                #pragma unroll
+                for (uint c = 0; c < 16u; c++) tgRT[qrow * 16u + c] = rt[c] * tau;
+            }
+        } else {
+            #pragma unroll
+            for (uint i = 0; i < 32u; i++) dq[i] = half(0.0f);
+            if (seg == 0u) {
+                tgSink[qrow] = 0.0f;
+                #pragma unroll
+                for (uint c = 0; c < 16u; c++) tgRT[qrow * 16u + c] = 0.0f;
+            }
+        }
+        if (seg == 0u) { tgM[qrow] = -INFINITY; tgSum[qrow] = 0.0f; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_half8x8 aQ[16];
+    #pragma unroll
+    for (uint d = 0u; d < 16u; d++)
+        simdgroup_load(aQ[d], tgQ + (sgid * 8u) * M64_FQ_LD + d * 8u, M64_FQ_LD);
+
+    simdgroup_float8x8 accO[16];
+    #pragma unroll
+    for (uint c = 0u; c < 16u; c++)
+        accO[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const float sink = tgSink[qrow];
+    for (uint j0 = js0; j0 <= pmax; j0 += 32u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- load K tile [32][128], Q8_0-dequantized (j > pmax -> zeros)
+        {
+            const uint jj = j0 + qrow;
+            threadgroup half * dK = tgKV + qrow * M64_FQ_LD + seg * 32u;
+            if (jj <= pmax) {
+                const uint slot = A.is_swa ? (jj % A.ring_cap) : jj;
+                const device uchar * kp = KV + (size_t)A.kvkoff * 2ul +
+                    (size_t)slot * 1088ul + (size_t)kvh * 136ul;
+                const float dscale = float(((const device half *)(kp + 128u))[seg]);
+                const device char4 * cq = (const device char4 *)(kp + seg * 32u);
+                #pragma unroll
+                for (uint u2 = 0u; u2 < 8u; u2++) {
+                    const char4 v = cq[u2];
+                    dK[u2 * 4u + 0u] = half(float(v.x) * dscale);
+                    dK[u2 * 4u + 1u] = half(float(v.y) * dscale);
+                    dK[u2 * 4u + 2u] = half(float(v.z) * dscale);
+                    dK[u2 * 4u + 3u] = half(float(v.w) * dscale);
+                }
+            } else {
+                #pragma unroll
+                for (uint i = 0; i < 32u; i++) dK[i] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- S = Qh @ K^T -> tgS (raw dot; scale applied in softmax pass)
+        {
+            simdgroup_float8x8 accS[4];
+            #pragma unroll
+            for (uint k = 0u; k < 4u; k++)
+                accS[k] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma unroll
+            for (uint d = 0u; d < 16u; d++)
+                #pragma unroll
+                for (uint k = 0u; k < 4u; k++) {
+                    simdgroup_half8x8 bT;
+                    simdgroup_load(bT, tgKV + (k * 8u) * M64_FQ_LD + d * 8u, (ulong)M64_FQ_LD,
+                                           ulong2(0u, 0u), true);
+                    simdgroup_multiply_accumulate(accS[k], aQ[d], bT, accS[k]);
+                }
+            #pragma unroll
+            for (uint k = 0u; k < 4u; k++)
+                simdgroup_store(accS[k], tgS + (sgid * 8u) * M64_FS_LD + k * 8u, M64_FS_LD);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- relbias + mask + online softmax: one 4-thread quad per row
+        {
+            const uint pos_q = A.pos0 + b0 + qrow;
+            const uint jstart_q = (A.is_swa && pos_q > A.n_swa) ? (pos_q - A.n_swa) : 0u;
+            const bool vq = (b0 + qrow) < A.B;
+            // fast path: EVERY valid entry in this tile has dist >= M64_EXT
+            const bool skip_rb = ((int64_t)pmin - (int64_t)(j0 + 31u)) >= (int64_t)M64_EXT;
+            float sv[8];
+            const threadgroup float * srow = tgS + qrow * M64_FS_LD + seg * 8u;
+            float m = -INFINITY;
+            #pragma unroll
+            for (uint i = 0; i < 8u; i++) {
+                const uint j = j0 + seg * 8u + i;
+                float s = -INFINITY;
+                if (vq && j <= pos_q && j >= jstart_q) {
+                    s = srow[i] * A.scale;
+                    const int dist = (int)pos_q - (int)j;
+                    if (skip_rb) {
+                        s += f16r(0.0f - sink);       // bv = 0, -sink MUST stay (see batch kernel)
+                    } else {
+                        float bv = 0.0f;
+                        if (dist < (int)M64_EXT) {    // out-of-extent relbias rows are 0
+                            const device float * brow =
+                                ((const device float *)(PACK + A.relbiaspack)) + (size_t)dist * 16u;
+                            const threadgroup float * rt = tgRT + qrow * 16u;
+                            #pragma unroll
+                            for (uint c = 0; c < 16u; c++) bv = fma(brow[c], rt[c], bv);
+                        }
+                        s += f16r(bv - sink);
+                    }
+                }
+                sv[i] = s;
+                m = fmax(m, s);
+            }
+            m = fmax(m, simd_shuffle_xor(m, 1u));
+            m = fmax(m, simd_shuffle_xor(m, 2u));
+            const float M_old = tgM[qrow];
+            const float M_new = fmax(M_old, m);
+            const float alpha = (M_new == -INFINITY) ? 1.0f : metal::exp(M_old - M_new);
+            float rs = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 8u; i++) {
+                const float p = (sv[i] == -INFINITY) ? 0.0f : metal::exp(sv[i] - M_new);
+                rs += p;
+                ((threadgroup half *)tgS)[qrow * (M64_FS_LD * 2u) + seg * 8u + i] = half(p);
+            }
+            rs += simd_shuffle_xor(rs, 1u);
+            rs += simd_shuffle_xor(rs, 2u);
+            if (seg == 0u) {
+                tgAlpha[qrow] = alpha;
+                tgM[qrow] = M_new;
+                tgSum[qrow] = fma(tgSum[qrow], alpha, rs);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- rescale accO rows to the running max via tgKV float staging
+        // (quad/Morton simdgroup_matrix mapping: never thread_elements()).
+        if (j0 > js0) {
+            threadgroup float * tgF = (threadgroup float *)tgKV;   // 32*64 floats
+            #pragma unroll
+            for (uint hb = 0u; hb < 16u; hb += 8u) {
+                #pragma unroll
+                for (uint c = 0u; c < 8u; c++)
+                    simdgroup_store(accO[hb + c], tgF + (sgid * 8u) * 64u + c * 8u, 64u);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float aq = tgAlpha[qrow];
+                threadgroup float * frow = tgF + qrow * 64u + seg * 16u;
+                #pragma unroll
+                for (uint i = 0u; i < 16u; i++) frow[i] *= aq;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                #pragma unroll
+                for (uint c = 0u; c < 8u; c++)
+                    simdgroup_load(accO[hb + c], tgF + (sgid * 8u) * 64u + c * 8u, 64u);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        // ---- load V tile [32][128], Q8_0-dequantized (j > pmax -> zeros)
+        {
+            const uint jj = j0 + qrow;
+            threadgroup half * dV = tgKV + qrow * M64_FQ_LD + seg * 32u;
+            if (jj <= pmax) {
+                const uint slot = A.is_swa ? (jj % A.ring_cap) : jj;
+                const device uchar * vp = KV + (size_t)A.kvvoff * 2ul +
+                    (size_t)slot * 1088ul + (size_t)kvh * 136ul;
+                const float dscale = float(((const device half *)(vp + 128u))[seg]);
+                const device char4 * cq = (const device char4 *)(vp + seg * 32u);
+                #pragma unroll
+                for (uint u2 = 0u; u2 < 8u; u2++) {
+                    const char4 v = cq[u2];
+                    dV[u2 * 4u + 0u] = half(float(v.x) * dscale);
+                    dV[u2 * 4u + 1u] = half(float(v.y) * dscale);
+                    dV[u2 * 4u + 2u] = half(float(v.z) * dscale);
+                    dV[u2 * 4u + 3u] = half(float(v.w) * dscale);
+                }
+            } else {
+                #pragma unroll
+                for (uint i = 0; i < 32u; i++) dV[i] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- O += P @ V (P read back f16-rounded, exactly what the mma sees)
+        #pragma unroll
+        for (uint kk = 0u; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 pT;
+            simdgroup_load(pT, (const threadgroup half *)tgS + (sgid * 8u) * (M64_FS_LD * 2u) + kk,
+                           M64_FS_LD * 2u);
+            #pragma unroll
+            for (uint c = 0u; c < 16u; c++) {
+                simdgroup_half8x8 vT;
+                simdgroup_load(vT, tgKV + kk * M64_FQ_LD + c * 8u, M64_FQ_LD);
+                simdgroup_multiply_accumulate(accO[c], pT, vT, accO[c]);
+            }
+        }
+    }
+    // ---- final zero-sink term (sinks tensor == 0), same as
+    // k_attn_head_q8_batch, then write O through the tgKV float staging.
+    {
+        threadgroup float * tgF = (threadgroup float *)tgKV;   // 32*64 floats
+        const float M = tgM[qrow];
+        const float ms = (0.0f > M) ? ((M == -INFINITY) ? 0.0f : metal::exp(M)) : 1.0f;
+        const float sum_final = (0.0f > M) ? fma(tgSum[qrow], metal::exp(M), 1.0f)
+                                           : tgSum[qrow] + metal::exp(0.0f - M);
+        const float scale_out = ms * (float)(1.0 / sum_final);
+        const uint b = b0 + qrow;
+        device float * out = SCR + A.outoff + (size_t)b * A.out_stride + h * 128u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (uint hb = 0u; hb < 16u; hb += 8u) {
+            #pragma unroll
+            for (uint c = 0u; c < 8u; c++)
+                simdgroup_store(accO[hb + c], tgF + (sgid * 8u) * 64u + c * 8u, 64u);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (b < A.B) {
+                const threadgroup float * srcrow = tgF + qrow * 64u + seg * 16u;
+                #pragma unroll
+                for (uint i = 0u; i < 16u; i++)
+                    out[hb * 8u + seg * 16u + i] = srcrow[i] * scale_out;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
 // --------------------------------------------- grouped MoE Q8_0 GEMM (prefill)
 // grid = (ceil(nout/4), n_experts), threadgroup = (32, 4): warp = one output
 // row of one expert; walks the expert's token list in chunks of 8, loading

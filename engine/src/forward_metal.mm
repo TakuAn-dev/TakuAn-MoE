@@ -41,6 +41,7 @@ constexpr int kNE = 2304, kNH = 24, kDH = 128, kKVD = 1024, kNREL = 16,
               kNEXP = 128, kTOPK = 8, kNF = 1152, kNPHYS = 24, kNSLOT = 48,
               kCH = 6656, kMAXS = 48, kHR = 3, kBMax = 128, kBBlkMax = 8,
               kAttnMaxSplits = 32;
+constexpr uint32_t kBSpec = 9;  // Milestone 7B: max verify batch (anchor + 8 drafts)
 constexpr uint32_t kPartBytes = 2820096u;  // (1152*2304/32)*34: gate|up|down parts
 constexpr float kConvStatic = 0.447213595499957939281834733746255247f;  // 1/sqrt(5)
 }  // namespace
@@ -53,6 +54,12 @@ struct InklingForwardMetal::Impl {
     // SWA slots use a ring of n_swa+1 positions, full slots keep all ctx.
     id<MTLBuffer> kvBuf = nil;
     size_t kv_bytes = 0;
+    // Q8_0 KV cache (Milestone 5B): 544 uint16 units (1088 B) per token slot
+    // vs kKVD (1024 u16 = 2048 B) for FP16. kv_u16_per_pos is the kvBuf /
+    // PrefixState::swa_kv / .m64kv storage stride in uint16 units; kKVD stays
+    // the SCR activation vector width (kw.n, kw.k_stride, ...).
+    bool kv_q8 = false;
+    uint64_t kv_u16_per_pos = kKVD;
     uint32_t kv_cap[kNSLOT] = {};
     uint64_t kv_k_off[kNSLOT] = {};
     uint64_t kv_v_off[kNSLOT] = {};
@@ -109,6 +116,7 @@ struct InklingForwardMetal::Impl {
         uint32_t b_fin, b_probs, b_sel, b_wgt;
         uint32_t b_gate2, b_ubuf, b_situ, b_down_tmp, b_acc;
         uint32_t b_cnt, b_off, b_list, b_wtab;
+        uint32_t b_lgx, b_amax;  // Milestone 7B: per-row verify logits / argmax
         uint32_t total = 0;
     } o;
     int prefill_chunk = kBMax;
@@ -125,10 +133,13 @@ struct InklingForwardMetal::Impl {
     size_t arena_resident_bytes = 0;
 
     bool init(PackReader & pack, int context_len, std::string & err,
-              double arena_gb_in = 0.0, const std::string & io_mode_in = "pread") {
+              double arena_gb_in = 0.0, const std::string & io_mode_in = "pread",
+              bool kv_q8_in = false) {
         arena_gb = arena_gb_in;
         io_mode = io_mode_in;
         arena_mode = arena_gb > 0.0;
+        kv_q8 = kv_q8_in;
+        kv_u16_per_pos = kv_q8 ? 544ull : (uint64_t)kKVD;
         pk = &pack;
         if (pack.header().arch != "inkling2_loop") { err = "metal: arch != inkling2_loop"; return false; }
         auto hi = [&](const char * k, int64_t f) { return pack.hparam_i64(std::string("inkling2_loop.") + k, f); };
@@ -167,6 +178,10 @@ struct InklingForwardMetal::Impl {
             feed(bits);
             memcpy(&bits, &log_scale_alpha, sizeof(bits));
             feed(bits);
+            // Fold the KV storage dtype in ONLY for Q8_0: existing FP16
+            // .m64kv fingerprints stay byte-identical, while FP16 and Q8_0
+            // files can never collide (Q8 slots are 544 u16 units per pos).
+            if (kv_q8) feed(544ull);
             pack_fp = fh.digest();
         }
         if (getenv("M64_NO_FA16")) fa16 = false;
@@ -443,12 +458,16 @@ struct InklingForwardMetal::Impl {
         o.b_off = fa(kNEXP);
         o.b_list = fa(kBMax * kTOPK);
         o.b_wtab = fa(kNEXP);
+        // Milestone 7B: full-row logits + argmax for speculative verify.
+        o.b_lgx = fa(kBSpec * 201024u);
+        o.b_amax = fa(kBSpec);
         o.total = c;
 
-        // ---- FP16 KV cache layout (separate buffer; scratch stays ctx-independent) ----
+        // ---- KV cache layout (FP16 or Q8_0; separate buffer, scratch ctx-free) ----
         // SWA slots keep a ring of n_swa+1 positions (at pos, distances 0..n_swa
         // are attended -> n_swa+1 distinct j); full-attention slots keep all ctx.
-        // At ctx=131072: 40 SWA rings + 8 full slots ~= 4.16 GiB K+V in FP16.
+        // At ctx=131072: 40 SWA rings + 8 full slots ~= 4.16 GiB K+V in FP16
+        // (46.9% of that with the Q8_0 layout).
         {
             uint64_t kv_elems = 0;
             for (int il = 0; il < kNSLOT; il++) {
@@ -456,8 +475,8 @@ struct InklingForwardMetal::Impl {
                     ? ((int64_t)ctx < n_swa + 1 ? (int64_t)ctx : n_swa + 1)
                     : (int64_t)ctx;
                 kv_cap[il] = (uint32_t)cap;
-                kv_k_off[il] = kv_elems; kv_elems += (uint64_t)cap * kKVD;
-                kv_v_off[il] = kv_elems; kv_elems += (uint64_t)cap * kKVD;
+                kv_k_off[il] = kv_elems; kv_elems += (uint64_t)cap * kv_u16_per_pos;
+                kv_v_off[il] = kv_elems; kv_elems += (uint64_t)cap * kv_u16_per_pos;
             }
             kv_bytes = (size_t)kv_elems * sizeof(uint16_t);
         }
@@ -515,8 +534,8 @@ struct InklingForwardMetal::Impl {
             err = "metal: KV buffer alloc failed (" + std::to_string(kv_bytes) + " B)";
             return false;
         }
-        fprintf(stderr, "kv cache: %.2f MiB (FP16, ctx=%d, swa_ring=%lld)\n",
-                kv_bytes / 1048576.0, ctx, (long long)n_swa + 1);
+        fprintf(stderr, "kv cache: %.2f MiB (%s, ctx=%d, swa_ring=%lld)\n",
+                kv_bytes / 1048576.0, kv_q8 ? "Q8_0" : "FP16", ctx, (long long)n_swa + 1);
         reset();
         return true;
     }
@@ -538,7 +557,7 @@ struct InklingForwardMetal::Impl {
     size_t swa_kv_elems() const {
         size_t n = 0;
         for (int il = 0; il < kNSLOT; il++)
-            if (s_swa[il]) n += (size_t)2 * (size_t)kv_cap[il] * (size_t)kKVD;
+            if (s_swa[il]) n += (size_t)2 * (size_t)kv_cap[il] * (size_t)kv_u16_per_pos;
         return n;
     }
 
@@ -558,7 +577,7 @@ struct InklingForwardMetal::Impl {
         out.swa_kv.reserve(swa_kv_elems());
         for (int il = 0; il < kNSLOT; il++) {
             if (!s_swa[il]) continue;
-            const size_t n = (size_t)kv_cap[il] * kKVD;
+            const size_t n = (size_t)kv_cap[il] * kv_u16_per_pos;
             out.swa_kv.insert(out.swa_kv.end(), kv + kv_k_off[il], kv + kv_k_off[il] + n);
             out.swa_kv.insert(out.swa_kv.end(), kv + kv_v_off[il], kv + kv_v_off[il] + n);
         }
@@ -571,17 +590,31 @@ struct InklingForwardMetal::Impl {
         if (in.tokens.size() != (size_t)in.pos) return false;
         if (in.rs.size() != (size_t)kNSLOT * kCH * kHR) return false;
         if (in.swa_kv.size() != swa_kv_elems()) return false;
+        // Self-contained stash: full-attention KV must cover [0..in.pos).
+        if (!in.full_kv.empty() && in.full_kv.size() != full_kv_elems(in.pos))
+            return false;
         pos = in.pos;
         memcpy((float *)scr.contents + o.rs, in.rs.data(), in.rs.size() * sizeof(float));
         uint16_t * kv = (uint16_t *)kvBuf.contents;
         size_t c = 0;
         for (int il = 0; il < kNSLOT; il++) {
             if (!s_swa[il]) continue;
-            const size_t n = (size_t)kv_cap[il] * kKVD;
+            const size_t n = (size_t)kv_cap[il] * kv_u16_per_pos;
             memcpy(kv + kv_k_off[il], in.swa_kv.data() + c, n * sizeof(uint16_t));
             c += n;
             memcpy(kv + kv_v_off[il], in.swa_kv.data() + c, n * sizeof(uint16_t));
             c += n;
+        }
+        if (!in.full_kv.empty()) {
+            c = 0;
+            for (int il = 0; il < kNSLOT; il++) {
+                if (s_swa[il]) continue;
+                const size_t n = (size_t)in.pos * kv_u16_per_pos;
+                memcpy(kv + kv_k_off[il], in.full_kv.data() + c, n * sizeof(uint16_t));
+                c += n;
+                memcpy(kv + kv_v_off[il], in.full_kv.data() + c, n * sizeof(uint16_t));
+                c += n;
+            }
         }
         return true;
     }
@@ -600,6 +633,34 @@ struct InklingForwardMetal::Impl {
         return n;
     }
 
+    // ---- Self-contained RAM stash (PrefixState::full_kv) -------------------
+    // uint16 elements needed to snapshot [0..n_pos) of every full-attention
+    // slot: 2 (K+V) * n_pos * per-token units * number of full slots.
+    size_t full_kv_elems(int64_t n_pos) const {
+        if (n_pos <= 0) return 0;
+        return (size_t)2 * (size_t)n_pos * (size_t)kv_u16_per_pos * n_full_slots();
+    }
+
+    // Copy the USED [0..st.pos) K/V of every full-attention slot out of the
+    // live kvBuf so the checkpoint survives fwd.reset() + full re-prefills.
+    // Same per-slot K-then-V layout as save_disk_prefix's `full` array, so a
+    // stash and a .m64kv agree bit-for-bit. GPU-idle between prefill/step.
+    void capture_full_kv(PrefixState & st) const {
+        st.full_kv.clear();
+        if (!kvBuf) return;
+        if (st.pos <= 0 || st.pos > pos) return;
+        for (int il = 0; il < kNSLOT; il++)
+            if (!s_swa[il] && kv_cap[il] < (uint32_t)st.pos) return;  // corrupt st
+        st.full_kv.reserve(full_kv_elems(st.pos));
+        const uint16_t * kv = (const uint16_t *)kvBuf.contents;
+        for (int il = 0; il < kNSLOT; il++) {
+            if (s_swa[il]) continue;
+            const size_t n = (size_t)st.pos * kv_u16_per_pos;
+            st.full_kv.insert(st.full_kv.end(), kv + kv_k_off[il], kv + kv_k_off[il] + n);
+            st.full_kv.insert(st.full_kv.end(), kv + kv_v_off[il], kv + kv_v_off[il] + n);
+        }
+    }
+
     // Snapshot rs + SWA rings + the USED 0..pos-1 of every full-attention
     // slot (never the unused tail up to ctx) into one .m64kv file. GPU-idle
     // between prefill/step calls, so raw buffer reads are safe.
@@ -615,7 +676,7 @@ struct InklingForwardMetal::Impl {
         swa.reserve(swa_kv_elems());
         for (int il = 0; il < kNSLOT; il++) {
             if (!s_swa[il]) continue;
-            const size_t n = (size_t)kv_cap[il] * kKVD;
+            const size_t n = (size_t)kv_cap[il] * kv_u16_per_pos;
             swa.insert(swa.end(), kv + kv_k_off[il], kv + kv_k_off[il] + n);
             swa.insert(swa.end(), kv + kv_v_off[il], kv + kv_v_off[il] + n);
         }
@@ -624,7 +685,7 @@ struct InklingForwardMetal::Impl {
             if (s_swa[il]) continue;
             if (kv_cap[il] < (uint32_t)pos)
                 return fail("full slot " + std::to_string(il) + " cap < pos");
-            const size_t n = (size_t)pos * kKVD;
+            const size_t n = (size_t)pos * kv_u16_per_pos;
             full.insert(full.end(), kv + kv_k_off[il], kv + kv_k_off[il] + n);
             full.insert(full.end(), kv + kv_v_off[il], kv + kv_v_off[il] + n);
         }
@@ -657,7 +718,7 @@ struct InklingForwardMetal::Impl {
         if (!read_disk_prefix_file(path, pack_fp, (uint32_t)ctx, swa_ring_cap(),
                                    (uint64_t)kNSLOT * kCH * kHR,
                                    (uint64_t)swa_kv_elems(),
-                                   (uint32_t)(2 * (size_t)kKVD * n_full_slots()),
+                                   (uint32_t)(2 * (size_t)kv_u16_per_pos * n_full_slots()),
                                    tokens, rs, swa, full, err))
             return false;
         const int64_t p = (int64_t)tokens.size();
@@ -668,7 +729,7 @@ struct InklingForwardMetal::Impl {
         size_t c = 0;
         for (int il = 0; il < kNSLOT; il++) {
             if (!s_swa[il]) continue;
-            const size_t n = (size_t)kv_cap[il] * kKVD;
+            const size_t n = (size_t)kv_cap[il] * kv_u16_per_pos;
             memcpy(kv + kv_k_off[il], swa.data() + c, n * sizeof(uint16_t));
             c += n;
             memcpy(kv + kv_v_off[il], swa.data() + c, n * sizeof(uint16_t));
@@ -677,7 +738,7 @@ struct InklingForwardMetal::Impl {
         c = 0;
         for (int il = 0; il < kNSLOT; il++) {
             if (s_swa[il]) continue;
-            const size_t n = (size_t)p * kKVD;
+            const size_t n = (size_t)p * kv_u16_per_pos;
             memcpy(kv + kv_k_off[il], full.data() + c, n * sizeof(uint16_t));
             c += n;
             memcpy(kv + kv_v_off[il], full.data() + c, n * sizeof(uint16_t));
@@ -1061,18 +1122,25 @@ struct InklingForwardMetal::Impl {
                 const uint32_t ring_idx = is_swa ? ((uint32_t)pos % kv_cap[il]) : (uint32_t)pos;
                 KVWriteF16Args kw{
                     o.K, o.emb, kKVD, 0u,
-                    kv_k_off[il] + (uint64_t)ring_idx * kKVD,
-                    kv_v_off[il] + (uint64_t)ring_idx * kKVD,
+                    kv_k_off[il] + (uint64_t)ring_idx * kv_u16_per_pos,
+                    kv_v_off[il] + (uint64_t)ring_idx * kv_u16_per_pos,
                 };
-                id<MTLComputePipelineState> p = rt.pipeline("k_kv_write_f16");
-                if (!p) { err = "pipeline k_kv_write_f16"; }
+                // Milestone 5B: Q8_0 writes 8 KV heads x (32 lanes x char4).
+                const bool wq8 = kv_q8;
+                const char * wn = wq8 ? "k_kv_write_q8" : "k_kv_write_f16";
+                id<MTLComputePipelineState> p = rt.pipeline(wn);
+                if (!p) { err = std::string("pipeline ") + wn; }
                 else {
                     [en setComputePipelineState:p];
                     [en setBuffer:scr offset:0 atIndex:0];
                     [en setBytes:&kw length:sizeof(kw) atIndex:1];
                     [en setBuffer:kvBuf offset:0 atIndex:2];
-                    [en dispatchThreads:MTLSizeMake(kKVD, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    if (wq8)
+                        [en dispatchThreadgroups:MTLSizeMake(8, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    else
+                        [en dispatchThreads:MTLSizeMake(kKVD, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                     cur_disp++;
                 }
             }
@@ -1098,10 +1166,12 @@ struct InklingForwardMetal::Impl {
                     sa.pad0 = 0u;
                     sa.scale = 1.0f / sqrtf((float)kDH);
                     sa.tau = is_swa ? 1.0f : tau_v;
-                    id<MTLComputePipelineState> ps = rt.pipeline("k_attn_head_f16_split");
+                    const char * sn = kv_q8 ? "k_attn_head_q8_split" : "k_attn_head_f16_split";
+                    id<MTLComputePipelineState> ps = rt.pipeline(sn);
                     id<MTLComputePipelineState> pr = rt.pipeline("k_attn_head_f16_reduce");
                     if (!ps || !pr) {
-                        err = !ps ? "pipeline k_attn_head_f16_split" : "pipeline k_attn_head_f16_reduce";
+                        err = !ps ? std::string("pipeline ") + sn
+                                  : std::string("pipeline k_attn_head_f16_reduce");
                     } else {
                         [en setComputePipelineState:ps];
                         [en setBuffer:scr offset:0 atIndex:0];
@@ -1129,8 +1199,9 @@ struct InklingForwardMetal::Impl {
                     aa.ring_cap = kv_cap[il];
                     aa.scale = 1.0f / sqrtf((float)kDH);
                     aa.tau = is_swa ? 1.0f : tau_v;
-                    id<MTLComputePipelineState> p = rt.pipeline("k_attn_head_f16");
-                    if (!p) { err = "pipeline k_attn_head_f16"; }
+                    const char * an = kv_q8 ? "k_attn_head_q8" : "k_attn_head_f16";
+                    id<MTLComputePipelineState> p = rt.pipeline(an);
+                    if (!p) { err = std::string("pipeline ") + an; }
                     else {
                         [en setComputePipelineState:p];
                         [en setBuffer:scr offset:0 atIndex:0];
@@ -1221,7 +1292,8 @@ struct InklingForwardMetal::Impl {
                                            o.fin, o.gate2, o.ubuf, seloff, 0u,
                                            kNF, kNE, (unsigned int)mst};
                     if (arena_mode) curPack = expertBuf;
-                    d_tg("k_gemv_gateup_batch8_q4k_f32in", (kTOPK * 2 * kNF + 7) / 8, 1, 256, &g4, sizeof(g4));
+                    if (gemv_m2) d_tg("k_gemv_gateup_batch8_q4k_f32in_m2", (kTOPK * kNF + 7) / 8, 1, 256, &g4, sizeof(g4));
+                    else d_tg("k_gemv_gateup_batch8_q4k_f32in", (kTOPK * 2 * kNF + 7) / 8, 1, 256, &g4, sizeof(g4));
                     SituF32BatchArgs sf{o.gate2, o.ubuf, o.down_tmp, kNF, kNF, kNF, kNF, kTOPK,
                                         situ_beta, situ_lb, 1.0f / situ_beta, 1.0f / situ_lb};
                     d_th2("k_situ_f32_batch", kNF, kTOPK, 128, &sf, sizeof(sf));
@@ -1229,9 +1301,14 @@ struct InklingForwardMetal::Impl {
                     MoeDownQ5F32Args md{arena_mode ? (unsigned long)L.moe_off[2] : (unsigned long)(L.experts + L.moe_off[2]),
                                         o.down_tmp, o.acc, o.wgt, seloff, 0u, 0u,
                                         kNE, kNF, (unsigned int)mst, 0u};
-                    d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in"
-                                                    : "k_gemv_down_reduce8_q5_0_f32in",
-                         (kNE + 7) / 8, 1, 256, &md, sizeof(md));
+                    if (gemv_m2)
+                        d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in_m4"
+                                                        : "k_gemv_down_reduce8_q5_0_f32in_m4",
+                             (kNE + 31) / 32, 1, 256, &md, sizeof(md));
+                    else
+                        d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in"
+                                                        : "k_gemv_down_reduce8_q5_0_f32in",
+                             (kNE + 7) / 8, 1, 256, &md, sizeof(md));
                     if (arena_mode) curPack = residentBuf;
                     conv(il, 2 * kKVD + kNE, kNE, o.acc, o.tA, L.ffnconv, 0, kNE, kConvStatic);
                     xfer2(o.cur, o.tA, 0, kNE, 0, 0, 0, 0, 0);
@@ -1381,7 +1458,8 @@ struct InklingForwardMetal::Impl {
     // per-MoE-layer commit+resolve in arena_mode). Keeps o.rs and kvBuf layouts
     // identical to gpu_step so RAM/SSD prefix caching and subsequent decode stay
     // 100% compatible.
-    StepResult gpu_prefill_batch(const int32_t * toks, uint32_t B, std::string & err, bool need_logits) {
+    StepResult gpu_prefill_batch(const int32_t * toks, uint32_t B, std::string & err, bool need_logits,
+                                 uint32_t lm_rows = 0) {
         StepResult r{(const float *)scr.contents + o.logits, vocab_eff, 0};
         if (B == 0u) return r;
         if (B > (uint32_t)kBMax || pos + (int64_t)B > ctx) {
@@ -1616,8 +1694,13 @@ struct InklingForwardMetal::Impl {
                     kv_k_off[il], kv_v_off[il], o.b_K, o.b_Vn, kKVD, kKVD, kKVD,
                     B, (uint32_t)pos, is_swa ? 1u : 0u, kv_cap[il], 0u
                 };
-                disp("k_kv_write_f16_batch", false,
-                     MTLSizeMake(kKVD, B, 1), MTLSizeMake(128, 1, 1), &kw, sizeof(kw), kvBuf);
+                if (kv_q8)
+                    // Q8 grid = (8 KV heads, B) threadgroups x 32 lanes (5A parity test).
+                    disp("k_kv_write_q8_batch", true,
+                         MTLSizeMake(8, B, 1), MTLSizeMake(32, 1, 1), &kw, sizeof(kw), kvBuf);
+                else
+                    disp("k_kv_write_f16_batch", false,
+                         MTLSizeMake(kKVD, B, 1), MTLSizeMake(128, 1, 1), &kw, sizeof(kw), kvBuf);
                 AttnBatchF16Args aa{
                     L.relbias, kv_k_off[il], kv_v_off[il],
                     o.b_Q, o.b_Rr, o.b_sinkb, o.b_attnb,
@@ -1630,11 +1713,11 @@ struct InklingForwardMetal::Impl {
                 // and SWA attention; the scalar per-token kernel still wins
                 // for tiny batches.
                 if (B >= 8u)
-                    disp("k_attn_f16_flash_prefill", true,
+                    disp(kv_q8 ? "k_attn_q8_flash_prefill" : "k_attn_f16_flash_prefill", true,
                          MTLSizeMake(kNH, (B + 31u) / 32u, 1), MTLSizeMake(32, 4, 1),
                          &aa, sizeof(aa), curPack, kvBuf);
                 else
-                    disp("k_attn_head_f16_batch", true,
+                    disp(kv_q8 ? "k_attn_head_q8_batch" : "k_attn_head_f16_batch", true,
                          MTLSizeMake(kNH, B, 1), MTLSizeMake(32, 1, 1),
                          &aa, sizeof(aa), curPack, kvBuf);
             }
@@ -1744,7 +1827,8 @@ struct InklingForwardMetal::Impl {
                                                        o.b_fin + b * kNE, o.gate2, o.ubuf, msel, 0u,
                                                        kNF, kNE, (unsigned int)exp_stride};
                                 curPack = expertBuf;
-                                d_tg("k_gemv_gateup_batch8_q4k_f32in", (kTOPK * 2 * kNF + 7) / 8, 1, 256, &g4, sizeof(g4));
+                                if (gemv_m2) d_tg("k_gemv_gateup_batch8_q4k_f32in_m2", (kTOPK * kNF + 7) / 8, 1, 256, &g4, sizeof(g4));
+                                else d_tg("k_gemv_gateup_batch8_q4k_f32in", (kTOPK * 2 * kNF + 7) / 8, 1, 256, &g4, sizeof(g4));
                                 SituF32BatchArgs sf4{o.gate2, o.ubuf, o.down_tmp, kNF, kNF, kNF, kNF, kTOPK,
                                                      situ_beta, situ_lb, 1.0f / situ_beta, 1.0f / situ_lb};
                                 disp("k_situ_f32_batch", false, MTLSizeMake(kNF, kTOPK, 1),
@@ -1752,9 +1836,14 @@ struct InklingForwardMetal::Impl {
                                 MoeDownQ5F32Args md4{(unsigned long)L.moe_off[2], o.down_tmp,
                                                      o.b_acc + b * kNE, o.b_wgt + b * kTOPK, msel, 0u, 0u,
                                                      kNE, kNF, (unsigned int)exp_stride, 0u};
-                                d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in"
-                                                                : "k_gemv_down_reduce8_q5_0_f32in",
-                                     (kNE + 7) / 8, 1, 256, &md4, sizeof(md4));
+                                if (gemv_m2)
+                                    d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in_m4"
+                                                                    : "k_gemv_down_reduce8_q5_0_f32in_m4",
+                                         (kNE + 31) / 32, 1, 256, &md4, sizeof(md4));
+                                else
+                                    d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in"
+                                                                    : "k_gemv_down_reduce8_q5_0_f32in",
+                                         (kNE + 7) / 8, 1, 256, &md4, sizeof(md4));
                                 curPack = residentBuf;
                             } else {
                             QuantArgs qa{o.b_fin + b * kNE, o.xqE, o.dxE, kNE / 32u};
@@ -1877,7 +1966,30 @@ struct InklingForwardMetal::Impl {
         for (int ip = 18; ip < 24; ip++) batch_slot(ip, ip, nullptr);
 
         // --- Final LM head on LAST token in chunk only (when need_logits) ---
-        if (need_logits && err.empty()) {
+        if (lm_rows > 0u && err.empty()) {
+            // Milestone 7B verify: per-row LM head for every batch row, using
+            // the EXACT same kernel/arg sequence as the single-row tail below
+            // (staged through o.mixed / o.xqE one row at a time) so row b's
+            // logits are bitwise-equal to the plain path's logits for token b.
+            for (uint32_t b = 0; b < B; b++) {
+                do_mix(o.b_blocks + b * kBlkStride, st.nblk, o.b_cur + b * kNE,
+                       out_q, 1, o.b_mixed + b * (3 * kNE));
+                const uint32_t lg = o.b_lgx + b * 201024u;
+                RmsQuantArgs RQA{};
+                RQA.k = kNE; RQA.rows = 1; RQA.hasw = 1; RQA.eps = f_eps;
+                RQA.xr[0] = o.b_mixed + b * (3 * kNE); RQA.wr[0] = out_norm; RQA.yr[0] = M64_NOFFU;
+                RQA.q[0] = o.xqE; RQA.d[0] = o.dxE;
+                d_tg("k_rms_quant", 1, 1, 256, &RQA, sizeof(RQA));
+                GemvArgs GA{outw, 0, o.xqE, o.dxE, lg, 0, (uint32_t)vocab_rows, 0, 0, 0};
+                if (gemv_m2) d_tg("k_gemv_q8_k2304_m2", ((uint32_t)vocab_rows + 15) / 16, 1, 256, &GA, sizeof(GA));
+                else         d_tg("k_gemv_q8_k2304",    ((uint32_t)vocab_rows + 7)  / 8,  1, 256, &GA, sizeof(GA));
+                SoftcapArgs sca{lg, (uint32_t)vocab_rows, cap};
+                d_th("k_softcap", (uint32_t)vocab_rows, 256, &sca, sizeof(sca));
+                ArgmaxArgs ara{lg, o.b_amax + b, (uint32_t)vocab_eff};
+                d_tg("k_argmax", 1, 1, 1024, &ara, sizeof(ara));
+            }
+            bprof_flush(BP_LMHEAD);
+        } else if (need_logits && err.empty()) {
             const uint32_t blast = B - 1u;
             do_mix(o.b_blocks + blast * kBlkStride, st.nblk, o.b_cur + blast * kNE, out_q, 1, o.mixed);
             RmsQuantArgs RQA{};
@@ -1928,21 +2040,68 @@ struct InklingForwardMetal::Impl {
         return r;
     }
 
+    // Milestone 7B: one batched GPU pass over up to kBSpec draft/verify rows;
+    // returns the per-row argmax (amax[i] = model argmax after toks[0..i]) and
+    // the last row's logits so the next round's anchor needs no extra pass.
+    bool gpu_verify(const std::vector<int32_t> &toks, std::vector<int32_t> &amax,
+                    std::vector<float> &last_logits, std::string &err) {
+        amax.clear(); last_logits.clear();
+        if (toks.empty()) return true;
+        if (toks.size() > (size_t)kBSpec) { err = "metal: verify batch exceeds kBSpec"; return false; }
+        gpu_prefill_batch(toks.data(), (uint32_t)toks.size(), err, false, 1u);
+        if (!err.empty()) return false;
+        const float * S = (const float *)scr.contents;
+        for (uint32_t b = 0; b < (uint32_t)toks.size(); b++)
+            amax.push_back((int32_t)*(const uint32_t *)(S + o.b_amax + b));
+        const float * lrow = S + o.b_lgx + ((uint32_t)toks.size() - 1u) * 201024u;
+        last_logits.assign(lrow, lrow + vocab_eff);
+        return true;
+    }
+
+    // Milestone 7C: state-only replay (Branch fast path). lm_rows=0 and
+    // need_logits=false skip EVERY LM head row (rms_quant + vocab GEMV +
+    // softcap + argmax); pos/KV/conv rs/SWA still advance exactly like the
+    // verify pass, so the engine lands bitwise where a verify2 would put it.
+    bool gpu_advance_no_logits(const std::vector<int32_t> &toks, std::string &err) {
+        if (toks.empty()) return true;
+        if (toks.size() == 1u) {
+            (void)gpu_step(toks[0], err, /*need_logits=*/false);
+            return err.empty();
+        }
+        if (toks.size() > (size_t)kBSpec) { err = "metal: advance batch exceeds kBSpec"; return false; }
+        (void)gpu_prefill_batch(toks.data(), (uint32_t)toks.size(), err,
+                                /*need_logits=*/false, /*lm_rows=*/0u);
+        return err.empty();
+    }
+
 };
 
 InklingForwardMetal::InklingForwardMetal() = default;
 InklingForwardMetal::~InklingForwardMetal() = default;
 
 bool InklingForwardMetal::init(PackReader & p, int c, std::string & e,
-                               double arena_gb, const std::string & io_mode) {
+                               double arena_gb, const std::string & io_mode,
+                               bool kv_q8) {
     if (!impl_) impl_ = std::make_unique<Impl>();
-    return impl_->init(p, c, e, arena_gb, io_mode);
+    return impl_->init(p, c, e, arena_gb, io_mode, kv_q8);
 }
 StepResult InklingForwardMetal::step(int32_t t) {
     std::string err;
     StepResult r = impl_->gpu_step(t, err);
     if (!err.empty()) fprintf(stderr, "m64metal: %s\n", err.c_str());
     return r;
+}
+bool InklingForwardMetal::verify_batch(const std::vector<int32_t> &toks,
+                                       std::vector<int32_t> &amax,
+                                       std::vector<float> &last_logits,
+                                       std::string &err) {
+    if (!impl_) { err = "metal: engine not initialized"; return false; }
+    return impl_->gpu_verify(toks, amax, last_logits, err);
+}
+bool InklingForwardMetal::advance_no_logits(const std::vector<int32_t> &toks,
+                                            std::string &err) {
+    if (!impl_) { err = "metal: engine not initialized"; return false; }
+    return impl_->gpu_advance_no_logits(toks, err);
 }
 StepResult InklingForwardMetal::prefill(const std::vector<int32_t> & p) {
     StepResult r{};
@@ -1973,6 +2132,12 @@ bool InklingForwardMetal::save_prefix_state(PrefixState & out,
 }
 bool InklingForwardMetal::restore_prefix_state(const PrefixState & in) {
     return impl_ ? impl_->restore_prefix_state(in) : false;
+}
+size_t InklingForwardMetal::full_kv_elems(int64_t n_pos) const {
+    return impl_ ? impl_->full_kv_elems(n_pos) : 0;
+}
+void InklingForwardMetal::capture_full_kv(PrefixState & st) const {
+    if (impl_) impl_->capture_full_kv(st);
 }
 uint64_t InklingForwardMetal::pack_fingerprint() const {
     return impl_ ? impl_->pack_fp : 0;

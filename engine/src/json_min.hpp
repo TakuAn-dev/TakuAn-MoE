@@ -38,6 +38,11 @@ struct JValue {
         if (type == Double) return (int64_t)d;
         throw std::runtime_error("json: not a number");
     }
+    bool as_bool() const {
+        if (type == Bool) return b;
+        if (type == Int) return i != 0;
+        throw std::runtime_error("json: not a bool");
+    }
     const std::string &as_str() const {
         if (type != Str) throw std::runtime_error("json: not a string");
         return s;
