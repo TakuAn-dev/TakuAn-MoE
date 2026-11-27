@@ -554,6 +554,145 @@ static void run_bench(m64::MetalRuntime & rt) {
             setl(en, "k_gemv_down_reduce8_q5_1_f32in_m4", &DR1, sizeof(DR1));
             [en dispatchThreadgroups:MTLSizeMake((NR5 + 31) / 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         });
+
+        // ---- Milestone 9A: decode down chain, real shapes (kNE=2304, kNF=1152,
+        // top-8). Old = single-stage 72-TG m4 reduce + k_conv_slot + k_xfer add
+        // (3 dispatches). New = k_gemv_down_batch8_q5_*_f32in_m2 ((144,8)=1,152
+        // TGs) + k_down_reduce8_conv_add fused (2 dispatches).
+        const uint64_t pCnv = al4k(pR1 + 8ull * NR5 * R51);
+        if (pCnv + (size_t)NR5 * 16 > BPK) { fprintf(stderr, "bench: 9A ffnconv exceeds pack\n"); return; }
+        {
+            float * pcnv = (float *)(pp + pCnv);
+            for (size_t i = 0; i < NR5 * 4; i++) pcnv[i] = uf(g2);
+        }
+        uint32_t sTmpR = segf(8 * NR5), sRsR = segf(3 * NR5), sCurR = segf(NR5);
+        if (c > (1u << 20)) { fprintf(stderr, "bench: scratch exhausted\n"); return; }
+        const float sc9a = 0.4472135955f;
+        for (bool q51 : {false, true}) {
+            const uint64_t pw = q51 ? pR1 : pR0;
+            const uint64_t rb = q51 ? R51 : R50;
+            const char * tag = q51 ? "q5_1" : "q5_0";
+            char nm[48];
+            MoeDownQ5F32Args OLD9{pw, sHR, B.sAcc, B.sWt, B.sSel, 0u, 0u, NR5, 1152u, (uint32_t)(NR5 * rb), 0u};
+            ConvArgs CVA9{sRsR, B.sAcc, sTmpR, pCnv, 0u, NR5, NR5, sc9a, 0u};
+            XferArgs XF9{{sCurR, 0u}, {sTmpR, 0u}, {0u, 0u}, {NR5, 0u}, 0u};
+            snprintf(nm, sizeof(nm), "down_%s_old(m4+conv+add)", tag);
+            bench(nm, IT, [&](id<MTLComputeCommandEncoder> en) {
+                setl(en, q51 ? "k_gemv_down_reduce8_q5_1_f32in_m4" : "k_gemv_down_reduce8_q5_0_f32in_m4",
+                     &OLD9, sizeof(OLD9));
+                [en dispatchThreadgroups:MTLSizeMake((NR5 + 31) / 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                setl(en, "k_conv_slot", &CVA9, sizeof(CVA9));
+                [en dispatchThreads:MTLSizeMake(NR5, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                setl(en, "k_xfer", &XF9, sizeof(XF9));
+                [en dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            });
+            MoeDownQ5F32Args NEW9{pw, sHR, sTmpR, B.sWt, B.sSel, 0u, 0u, NR5, 1152u, (uint32_t)(NR5 * rb), 0u};
+            DownReduceConvArgs DRC9{sTmpR, B.sWt, sRsR, sCurR, pCnv, NR5, sc9a};
+            snprintf(nm, sizeof(nm), "down_%s_new(b8m2+rc)", tag);
+            bench(nm, IT, [&](id<MTLComputeCommandEncoder> en) {
+                setl(en, q51 ? "k_gemv_down_batch8_q5_1_f32in_m2" : "k_gemv_down_batch8_q5_0_f32in_m2",
+                     &NEW9, sizeof(NEW9));
+                [en dispatchThreadgroups:MTLSizeMake((NR5 + 15) / 16, 8, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                setl(en, "k_down_reduce8_conv_add", &DRC9, sizeof(DRC9));
+                [en dispatchThreads:MTLSizeMake(NR5, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            });
+        }
+    }
+
+    // ---- 11. Milestone 11: decode dispatch fusion A/B ----
+    // Old: 5 dispatches (clip Q, clip K, rms V->staging, clip Rr, kv_write)
+    //      and conv_slot + xfer (2 disp) / + extra xfer (3 disp) postconv.
+    // New: k_qkv_prep_kv_write_{q8,f16} (1 disp) and k_postconv_residual (1 disp).
+    {
+        uint32_t bQ = segf(24 * 128), bK = segf(1024), bV = segf(1024), bR = segf(24 * 16);
+        uint32_t bEmb = segf(1024), bRs11 = segf(3 * 2304), bX11 = segf(2304),
+                 bCur11 = segf(2304), bBlk11 = segf(2304), bT11 = segf(2304);
+        if (c > (1u << 20)) { fprintf(stderr, "bench: 11 scratch exhausted\n"); return; }
+        const uint64_t pQC11 = ((pNormW + 2304ull * 4 + 63) / 64) * 64;   // 16B-safe
+        const uint64_t pRC11 = pQC11 + 24u * 128 * 4;
+        const uint64_t pWC11 = pRC11 + 24u * 16 * 4;
+        float * qc11 = (float *)(bp.data() + pQC11);
+        float * rc11 = (float *)(bp.data() + pRC11);
+        float * wc11 = (float *)(bp.data() + pWC11);
+        std::uniform_real_distribution<float> u11(0.5f, 1.5f), uc(-0.3f, 0.3f);
+        for (uint32_t i = 0; i < 24u * 128; i++) qc11[i] = u11(g2);
+        for (uint32_t i = 0; i < 24u * 16; i++) rc11[i] = u11(g2);
+        for (uint32_t i = 0; i < 2304u * 4; i++) wc11[i] = uc(g2);
+        id<MTLBuffer> bKQ = [rt.device() newBufferWithLength:64 * 1024 options:MTLResourceStorageModeShared];   // q8 KV
+        id<MTLBuffer> bKF = [rt.device() newBufferWithLength:2 * 1024 * 1024 options:MTLResourceStorageModeShared]; // f16 KV
+        // dst bases in half-units (q8 byte base = *2; 1024->2048B, 61440->122880B, 8B-aligned)
+        const uint64_t dk11 = 1024, dv11 = 61440;
+        const float qk_th11 = 22.6f, rel_th11 = 8.0f;
+        ClipArgs cQ11{bQ, pQC11, 24, 128, qk_th11};
+        ClipArgs cK11{bK, M64_NOFF, 8, 128, qk_th11};
+        ClipArgs cR11{bR, pRC11, 24, 16, rel_th11};
+        RMSArgs rv11{}; rv11.k = 128; rv11.rows = 8; rv11.hasw = 0; rv11.eps = 1e-6f;
+        for (int hh = 0; hh < 8; hh++) { rv11.xr[hh] = bV + (uint32_t)hh * 128u; rv11.yr[hh] = bEmb + (uint32_t)hh * 128u; }
+        KVWriteF16Args kw11{bK, bEmb, 1024, 0u, dk11, dv11};
+        QkvPrepKvArgs qa11{pQC11, pRC11, dk11, dv11, bQ, bK, bV, bR, qk_th11, rel_th11, 1e-6f, 0u};
+        auto disp5 = [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_clip", &cQ11, sizeof(cQ11));
+            [en dispatchThreadgroups:MTLSizeMake(24, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            setl(en, "k_clip", &cK11, sizeof(cK11));
+            [en dispatchThreadgroups:MTLSizeMake(8, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            setl(en, "k_rms", &rv11, sizeof(rv11));
+            [en dispatchThreadgroups:MTLSizeMake(8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            setl(en, "k_clip", &cR11, sizeof(cR11));
+            [en dispatchThreadgroups:MTLSizeMake(24, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        };
+        for (bool q8 : {true, false}) {
+            const char * tag = q8 ? "q8" : "f16";
+            char nm[48];
+            snprintf(nm, sizeof(nm), "qkvprep_kv_%s_old(5disp)", tag);
+            bench(nm, IT, [&](id<MTLComputeCommandEncoder> en) {
+                disp5(en);
+                setl(en, q8 ? "k_kv_write_q8" : "k_kv_write_f16", &kw11, sizeof(kw11));
+                if (q8) [en dispatchThreadgroups:MTLSizeMake(8, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                else    [en dispatchThreads:MTLSizeMake(1024, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            });
+            QkvPrepKvArgs qaF = qa11;
+            if (!q8) { qaF.dst_k = 0; qaF.dst_v = 1024ull * 1024; }   // half-unit bases in f16 KV
+            snprintf(nm, sizeof(nm), "qkvprep_kv_%s_new(1disp)", tag);
+            bench(nm, IT, [&](id<MTLComputeCommandEncoder> en) {
+                id<MTLComputePipelineState> p = rt.pipeline(q8 ? "k_qkv_prep_kv_write_q8" : "k_qkv_prep_kv_write_f16");
+                if (!p) { fprintf(stderr, "bench: missing fused qkv kernel\n"); return; }
+                [en setComputePipelineState:p];
+                [en setBuffer:sBuf offset:0 atIndex:0];
+                [en setBytes:&qaF length:sizeof(qaF) atIndex:1];
+                [en setBuffer:pBuf offset:0 atIndex:2];
+                [en setBuffer:(q8 ? bKQ : bKF) offset:0 atIndex:3];
+                [en dispatchThreadgroups:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            });
+        }
+        const float sc11 = 0.447213595499957939281834733746255247f;
+        ConvArgs cv11{bRs11, bX11, bT11, pWC11, 0u, 2304, 2304, sc11, 0u};
+        XferArgs xf011{{bCur11, 0u}, {bT11, 0u}, {0u, 0u}, {2304, 0u}, 0u};
+        XferArgs xfP1{{bCur11, 0u}, {0u, 0u}, {bBlk11, 0u}, {2304, 0u}, 1u};
+        XferArgs xfP2{{bT11, 0u}, {0u, 0u}, {bCur11, 0u}, {2304, 0u}, 1u};
+        bench("postconv_res_old(2disp)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_conv_slot", &cv11, sizeof(cv11));
+            [en dispatchThreads:MTLSizeMake(2304, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            setl(en, "k_xfer", &xf011, sizeof(xf011));
+            [en dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        bench("postconv_res_old(3disp,push)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_conv_slot", &cv11, sizeof(cv11));
+            [en dispatchThreads:MTLSizeMake(2304, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            setl(en, "k_xfer", &xfP1, sizeof(xfP1));
+            [en dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            setl(en, "k_xfer", &xfP2, sizeof(xfP2));
+            [en dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        });
+        PostConvResArgs pc11{pWC11, bRs11, bX11, bCur11, bBlk11, 2304, 0u, sc11, 0u};
+        bench("postconv_res_new(1disp)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_postconv_residual", &pc11, sizeof(pc11));
+            [en dispatchThreads:MTLSizeMake(2304, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        });
+        PostConvResArgs pc11p = pc11; pc11p.push = 1u;
+        bench("postconv_res_new(1disp,push)", IT, [&](id<MTLComputeCommandEncoder> en) {
+            setl(en, "k_postconv_residual", &pc11p, sizeof(pc11p));
+            [en dispatchThreads:MTLSizeMake(2304, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        });
     }
 }
 
@@ -2223,6 +2362,9 @@ int main(int argc, char ** argv) {
                     CHECK(bad == 0, "%s %zu bitwise mismatches (first @ %zu)", nm, bad, widx);
                     printf("%-38s bitwise vs m1 %s\n", nm, bad ? "FAIL" : "OK");
                 };
+                // Milestone 13: the factored 2-row dot reorders FMAs vs m1,
+                // so gateup m2 is tolerance-class (mad < 1e-4, cos >= 0.99999,
+                // same gate as down9a tests 51/52) instead of bitwise.
                 auto cmp_gateup = [&](uint32_t nout, uint32_t wtab_on) {
                     for (uint32_t e = 0; e < 8u; e++) sel[e] = wtab_on ? expids[e] : e;
                     MoeGateUpQ4KF32Args A{};
@@ -2236,10 +2378,19 @@ int main(int argc, char ** argv) {
                     memset(scr.data() + suy, 0x7F, 8u * nout * 4);
                     run("k_gemv_gateup_batch8_q4k_f32in_m2", true, 2u * ((nout + 1u) >> 1u), 1, 256, &A, sizeof(A));
                     char nm[64];
+                    auto tol_gateup = [&](const char * nm2, const std::vector<float> & ref, uint32_t off) {
+                        double mad = 0;
+                        for (size_t i = 0; i < ref.size(); i++)
+                            mad = std::max(mad, std::fabs((double)ref[i] - (double)scr[off + i]));
+                        double cos = cosine(ref.data(), scr.data() + off, (uint32_t)ref.size());
+                        CHECK(mad < 1e-4 && cos >= 0.99999, "%s mad=%.3g cos=%.8f", nm2, mad, cos);
+                        printf("%-38s tol vs m1 mad=%.3g cos=%.8f %s\n", nm2, mad, cos,
+                               (mad < 1e-4 && cos >= 0.99999) ? "OK" : "FAIL");
+                    };
                     snprintf(nm, sizeof(nm), "gateup q4k m2 nout=%u %s gate", nout, wtab_on ? "wtab" : "direct");
-                    cmp_bits(nm, rg, sgy, 8u * nout);
+                    tol_gateup(nm, rg, sgy);
                     snprintf(nm, sizeof(nm), "gateup q4k m2 nout=%u %s up", nout, wtab_on ? "wtab" : "direct");
-                    cmp_bits(nm, ru, suy, 8u * nout);
+                    tol_gateup(nm, ru, suy);
                 };
                 auto cmp_down = [&](bool q51, uint32_t nout, uint32_t wtab_on, const uint32_t * slots) {
                     for (uint32_t e = 0; e < 8u; e++) sel[e] = wtab_on ? expids[e] : e;
@@ -2288,6 +2439,328 @@ int main(int argc, char ** argv) {
                     cmp_down(true, 100u, 1, slots);
                 }
                 set_sel(modsel8);
+            }
+
+            // ============ Milestone 9A: 2-stage parallel down vs old chain ============
+            // New: k_gemv_down_batch8_q5_{0,1}_f32in_m2 (grid (ceil(nout/16), 8),
+            //      unweighted [8][nout] slab) + k_down_reduce8_conv_add (fused
+            //      weighted reduce + ffnconv + add).
+            // Reference: k_gemv_down_reduce8_q5_{0,1}_f32in (GPU weighted acc) +
+            // CPU replication of k_conv_slot + add, i.e. the old 3-dispatch chain.
+            // Gate: max_abs < 1e-4 and cosine >= 0.99999.
+            {
+                uint32_t stmp = seg(8u * NO5), srso = seg(3u * NO5), scur = seg(NO5);
+                size_t wco = psegs((size_t)NO5 * 16);
+                const float sc_static = 0.4472135955f;
+                for (uint32_t i = 0; i < NO5 * 4; i++) ((float *)(pk.data() + wco))[i] = R.f(-1, 1);
+                const float NaNf = std::bit_cast<float>(0x7FC00000u);
+                auto cmp9a = [&](bool q51, uint32_t nout) {
+                    fill_q5_blobs(q51);
+                    set_sel(modsel8);                       // wtab_off=0: slot = sel[e] (0..7)
+                    for (uint32_t e = 0; e < 8u; e++) wts[e] = R.f(-1.5f, 1.5f);
+                    for (uint32_t i = 0; i < nout * 3; i++) scr[srso + i] = R.f(-2, 2);
+                    for (uint32_t i = 0; i < nout; i++) scr[scur + i] = R.f(-2, 2);
+                    std::vector<float> rs0(scr.begin() + srso, scr.begin() + srso + nout * 3);
+                    std::vector<float> cur0(scr.begin() + scur, scr.begin() + scur + nout);
+                    for (uint32_t i = 0; i < 8u * nout; i++) scr[stmp + i] = NaNf;   // poison
+                    MoeDownQ5F32Args A{};
+                    A.woff = wdn; A.hoff = sh; A.accoff = stmp; A.wtoff = swt; A.seloff = ssel;
+                    A.wtab_off = 0u; A.nout = nout; A.k = 1152u;
+                    A.stride = (size_t)NO5 * NB5 * (q51 ? 24 : 22);
+                    run(q51 ? "k_gemv_down_batch8_q5_1_f32in_m2" : "k_gemv_down_batch8_q5_0_f32in_m2",
+                        true, (nout + 15u) / 16u, 8u, 256, &A, sizeof(A));
+                    int poison = 0;
+                    for (uint32_t i = 0; i < 8u * nout; i++)
+                        if (std::isnan(scr[stmp + i])) poison++;
+                    char nm[64];
+                    snprintf(nm, sizeof(nm), "down9a %s batch8m2 write", q51 ? "q5_1" : "q5_0");
+                    CHECK(poison == 0, "%s %d unwritten (NaN) rows", nm, poison);
+                    DownReduceConvArgs DRC{stmp, swt, srso, scur, wco, nout, sc_static};
+                    run("k_down_reduce8_conv_add", false, nout, 1, 128, &DRC, sizeof(DRC));
+                    std::vector<float> new_cur(scr.begin() + scur, scr.begin() + scur + nout);
+                    std::vector<float> new_rs(scr.begin() + srso, scr.begin() + srso + nout * 3);
+                    // Old chain: single-stage reduce into sacc (restore rs/cur first;
+                    // run() re-uploads the host mirror, so host edits take effect).
+                    memcpy(scr.data() + srso, rs0.data(), (size_t)nout * 3 * 4);
+                    memcpy(scr.data() + scur, cur0.data(), (size_t)nout * 4);
+                    MoeDownQ5F32Args Aold = A; Aold.accoff = sacc;
+                    run(q51 ? "k_gemv_down_reduce8_q5_1_f32in" : "k_gemv_down_reduce8_q5_0_f32in",
+                        true, (nout + 7u) / 8u, 1, 256, &Aold, sizeof(Aold));
+                    // Stage-1 isolation: xin_new = sum_e w_e * stage1[e][r] vs old acc.
+                    std::vector<float> xin_new(nout, 0.0f);
+                    for (uint32_t c2 = 0; c2 < nout; c2++)
+                        for (uint32_t e = 0; e < 8u; e++)
+                            xin_new[c2] = xin_new[c2] + wts[e] * scr[stmp + (size_t)e * nout + c2];
+                    double mad_x = 0;
+                    for (uint32_t c2 = 0; c2 < nout; c2++)
+                        mad_x = std::max(mad_x, std::fabs((double)xin_new[c2] - (double)scr[sacc + c2]));
+                    double cos_x = cosine(xin_new.data(), scr.data() + sacc, nout);
+                    CHECK(mad_x < 1e-4 && cos_x >= 0.99999,
+                          "down9a %s stage1 xin mad=%.3g cos=%.8f", q51 ? "q5_1" : "q5_0", mad_x, cos_x);
+                    snprintf(nm, sizeof(nm), "down9a %s stage1 xin n=%u", q51 ? "q5_1" : "q5_0", nout);
+                    printf("%-38s mad=%.3g cos=%.8f %s\n", nm, mad_x, cos_x,
+                           (mad_x < 1e-4 && cos_x >= 0.99999) ? "OK" : "FAIL");
+                    // CPU replicate of k_conv_slot + add over the old acc.
+                    const float * wc = (const float *)(pk.data() + wco);
+                    std::vector<float> ref_cur(nout), ref_rs(nout * 3);
+                    for (uint32_t c2 = 0; c2 < nout; c2++) {
+                        float s0 = rs0[c2 * 3], s1 = rs0[c2 * 3 + 1], s2 = rs0[c2 * 3 + 2];
+                        float xi = scr[sacc + c2];
+                        float outv = s0 * wc[c2 * 4] + s1 * wc[c2 * 4 + 1] + s2 * wc[c2 * 4 + 2] + xi * wc[c2 * 4 + 3];
+                        ref_cur[c2] = cur0[c2] + (xi + outv) * sc_static;
+                        ref_rs[c2 * 3] = s1; ref_rs[c2 * 3 + 1] = s2; ref_rs[c2 * 3 + 2] = xi;
+                    }
+                    double mad = 0;
+                    for (uint32_t c2 = 0; c2 < nout; c2++)
+                        mad = std::max(mad, std::fabs((double)new_cur[c2] - (double)ref_cur[c2]));
+                    double cosv = cosine(new_cur.data(), ref_cur.data(), nout);
+                    CHECK(mad < 1e-4 && cosv >= 0.99999,
+                          "down9a %s cur vs old-chain mad=%.3g cos=%.8f", q51 ? "q5_1" : "q5_0", mad, cosv);
+                    snprintf(nm, sizeof(nm), "down9a %s fused vs old n=%u", q51 ? "q5_1" : "q5_0", nout);
+                    printf("%-38s mad=%.3g cos=%.8f %s\n", nm, mad, cosv,
+                           (mad < 1e-4 && cosv >= 0.99999) ? "OK" : "FAIL");
+                    // rs ring update parity (same xin stream feeds the shift).
+                    double mad_rs = 0;
+                    for (uint32_t i = 0; i < nout * 3; i++)
+                        mad_rs = std::max(mad_rs, std::fabs((double)new_rs[i] - (double)ref_rs[i]));
+                    CHECK(mad_rs < 1e-4, "down9a %s rs mad=%.3g", q51 ? "q5_1" : "q5_0", mad_rs);
+                };
+                // Test 51: Q5_0, full Inkling dims (nout=2304) + odd tail 173
+                cmp9a(false, NO5);
+                cmp9a(false, 173u);
+                // Test 52: Q5_1, full dims + odd tail 100
+                cmp9a(true, NO5);
+                cmp9a(true, 100u);
+            }
+        }
+
+        // ---- 53-55. Milestone 11: fused decode dispatches (5->1, 2->1) ----
+        {
+            Rng M;
+            const uint32_t sQm = seg(kNH * kDH), sKm = seg(kKVD), sVm = seg(kKVD), sRm = seg(kNH * kNREL);
+            const uint32_t sEmbM = seg(kKVD);
+            const uint32_t sXm = seg(kNE), sCurM = seg(kNE), sBlkM = seg(kNE), sRsM = seg(3 * kNE);
+            const size_t pQC = psegs(kNH * kDH * 4), pRC = psegs(kNH * kNREL * 4), pWC = psegs((size_t)kNE * 16);
+            float * wc = (float *)(pk.data() + pWC);
+            for (size_t i = 0; i < (size_t)kNE * 4; i++) wc[i] = M.f(-0.3f, 0.3f);
+            const float qk_th = 22.6f, rel_th = 8.0f, eps_m = 1e-6f;
+            const float csc = 0.447213595499957939281834733746255247f;   // kConvStatic
+            const size_t kvl = (size_t)1024 * kKVD;                       // half elems per stream
+
+            auto run5 = [&](bool q8, uint32_t q, uint32_t k, uint32_t v, uint32_t r,
+                            uint32_t emb, uint64_t dk, uint64_t dv, id<MTLBuffer> bKv,
+                            bool with_clip) {
+                id<MTLCommandBuffer> cmd = [rt.queue() commandBuffer];
+                id<MTLComputeCommandEncoder> en = [cmd computeCommandEncoder];
+                auto d = [&](const char * fn, const void * a, size_t sz, bool tg,
+                             uint tx, uint nth, int buf2, id<MTLBuffer> bv) {
+                    id<MTLComputePipelineState> p = rt.pipeline(fn);
+                    CHECK(p != nil, "pipeline %s missing", fn);
+                    if (!p) return;
+                    [en setComputePipelineState:p];
+                    [en setBuffer:bScr offset:0 atIndex:0];
+                    [en setBytes:a length:sz atIndex:1];
+                    [en setBuffer:buf2 == 3 ? bPk : bv offset:0 atIndex:2];
+                    if (buf2 == 3) [en setBuffer:bv offset:0 atIndex:3];
+                    if (tg) [en dispatchThreadgroups:MTLSizeMake(tx, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                    else    [en dispatchThreads:MTLSizeMake(tx, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                };
+                ClipArgs cq{q, with_clip ? pQC : M64_NOFF, kNH, kDH, qk_th};
+                d("k_clip", &cq, sizeof(cq), true, kNH, 128, 3, bPk);
+                ClipArgs ck{k, M64_NOFF, kKVD / kDH, kDH, qk_th};
+                d("k_clip", &ck, sizeof(ck), true, kKVD / kDH, 128, 3, bPk);
+                RMSArgs rv{}; rv.k = kDH; rv.rows = 8; rv.hasw = 0; rv.eps = eps_m;
+                for (int hh = 0; hh < 8; hh++) { rv.xr[hh] = v + (uint32_t)hh * kDH; rv.yr[hh] = emb + (uint32_t)hh * kDH; }
+                d("k_rms", &rv, sizeof(rv), true, 8, 256, 3, bPk);
+                ClipArgs cr{r, with_clip ? pRC : M64_NOFF, kNH, kNREL, rel_th};
+                d("k_clip", &cr, sizeof(cr), true, kNH, 128, 3, bPk);
+                if (q8) {
+                    KVWriteF16Args kw{k, emb, kKVD, 0u, dk, dv};
+                    d("k_kv_write_q8", &kw, sizeof(kw), true, 8, 32, 2, bKv);
+                } else {
+                    KVWriteF16Args kw{k, emb, kKVD, 0u, dk, dv};
+                    d("k_kv_write_f16", &kw, sizeof(kw), false, kKVD, 128, 2, bKv);
+                }
+                [en endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                CHECK(cmd.status == MTLCommandBufferStatusCompleted, "run5 status=%ld", (long)cmd.status);
+            };
+            auto run_fused = [&](bool q8, uint32_t q, uint32_t k, uint32_t v, uint32_t r,
+                                 uint64_t dk, uint64_t dv, id<MTLBuffer> bKv,
+                                 const QkvPrepKvArgs & qa) {
+                id<MTLCommandBuffer> cmd = [rt.queue() commandBuffer];
+                id<MTLComputeCommandEncoder> en = [cmd computeCommandEncoder];
+                const char * fn = q8 ? "k_qkv_prep_kv_write_q8" : "k_qkv_prep_kv_write_f16";
+                id<MTLComputePipelineState> p = rt.pipeline(fn);
+                CHECK(p != nil, "pipeline %s missing", fn);
+                if (!p) return;
+                [en setComputePipelineState:p];
+                [en setBuffer:bScr offset:0 atIndex:0];
+                [en setBytes:&qa length:sizeof(qa) atIndex:1];
+                [en setBuffer:bPk offset:0 atIndex:2];
+                [en setBuffer:bKv offset:0 atIndex:3];
+                [en dispatchThreadgroups:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                [en endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                CHECK(cmd.status == MTLCommandBufferStatusCompleted, "fused qkv status=%ld", (long)cmd.status);
+            };
+            const uint64_t dk_m = 64, dv_m = 4096;  // non-overlapping half-unit bases in bKv
+
+            // ---- 53. k_qkv_prep_kv_write_{q8,f16} vs the 5-dispatch chain ----
+            auto t53 = [&](bool q8) {
+                for (int variant = 0; variant < 2; variant++) {
+                    const bool has_clip = (variant == 0);
+                    for (uint32_t i = 0; i < kNH * kDH; i++) scr[sQm + i] = M.f(-30.f, 30.f);
+                    for (uint32_t i = 0; i < kKVD; i++) { scr[sKm + i] = M.f(-10.f, 10.f); scr[sVm + i] = M.f(-10.f, 10.f); }
+                    for (uint32_t i = 0; i < kNH * kNREL; i++) scr[sRm + i] = M.f(-2.f, 2.f);
+                    for (uint32_t i = 0; i < kNH * kDH; i++) ((float *)(pk.data() + pQC))[i] = M.f(0.5f, 1.5f);
+                    for (uint32_t i = 0; i < kNH * kNREL; i++) ((float *)(pk.data() + pRC))[i] = M.f(0.5f, 1.5f);
+                    auto kvdec = [&](id<MTLBuffer> bKv, uint64_t du16, std::vector<float> & out) {
+                        if (q8) {
+                            const uint8_t * dev = (const uint8_t *)bKv.contents;
+                            for (uint32_t kvh = 0; kvh < 8; kvh++)
+                                for (uint32_t blk = 0; blk < 4; blk++) {
+                                    const uint8_t * hp = dev + (du16 * 2) + kvh * 136u + 128u + blk * 2u;
+                                    uint16_t hb = (uint16_t)(hp[0] | (hp[1] << 8));
+                                    const float s = (float)std::bit_cast<__fp16>(hb);
+                                    for (uint32_t i = 0; i < 32; i++)
+                                        out[kvh * kDH + blk * 32u + i] = s * (float)(int8_t)dev[du16 * 2 + kvh * 136u + blk * 32u + i];
+                                }
+                        } else {
+                            const __fp16 * dev = (const __fp16 *)bKv.contents;
+                            for (uint32_t i = 0; i < kKVD; i++) out[i] = (float)dev[du16 + i];
+                        }
+                    };
+                    std::vector<float> rk(kKVD), rv(kKVD);
+                    id<MTLBuffer> bKv1 = [rt.device() newBufferWithLength:kvl * 2 options:MTLResourceStorageModeShared];
+                    memset(bKv1.contents, 0, kvl * 2);
+                    std::vector<float> sq0(scr.begin() + sQm, scr.begin() + sQm + kNH * kDH);
+                    std::vector<float> sr0(scr.begin() + sRm, scr.begin() + sRm + kNH * kNREL);
+                    memcpy(bScr.contents, scr.data(), SCR_F * 4);
+                    memcpy(bPk.contents, pk.data(), PK_B);
+                    run5(q8, sQm, sKm, sVm, sRm, sEmbM, dk_m, dv_m, bKv1, has_clip);
+                    memcpy(scr.data(), bScr.contents, SCR_F * 4);
+                    kvdec(bKv1, dk_m, rk);
+                    kvdec(bKv1, dv_m, rv);
+                    std::vector<float> sq1(scr.begin() + sQm, scr.begin() + sQm + kNH * kDH);
+                    std::vector<float> sr1(scr.begin() + sRm, scr.begin() + sRm + kNH * kNREL);
+                    // restore pre-state for the fused run
+                    memcpy(scr.data() + sQm, sq0.data(), kNH * kDH * 4);
+                    memcpy(scr.data() + sRm, sr0.data(), kNH * kNREL * 4);
+                    memcpy(bScr.contents, scr.data(), SCR_F * 4);
+                    memcpy(bPk.contents, pk.data(), PK_B);
+                    QkvPrepKvArgs qa{};
+                    qa.qclip_off = has_clip ? pQC : M64_NOFF;
+                    qa.relclip_off = has_clip ? pRC : M64_NOFF;
+                    qa.dst_k = dk_m; qa.dst_v = dv_m;
+                    qa.qoff = sQm; qa.koff = sKm; qa.voff = sVm; qa.roff = sRm;
+                    qa.qk_thresh = qk_th; qa.rel_thresh = rel_th; qa.eps = eps_m;
+                    id<MTLBuffer> bKv2 = [rt.device() newBufferWithLength:kvl * 2 options:MTLResourceStorageModeShared];
+                    memset(bKv2.contents, 0, kvl * 2);
+                    run_fused(q8, sQm, sKm, sVm, sRm, dk_m, dv_m, bKv2, qa);
+                    memcpy(scr.data(), bScr.contents, SCR_F * 4);
+                    std::vector<float> fq(kKVD), fv(kKVD);
+                    kvdec(bKv2, dk_m, fq);
+                    kvdec(bKv2, dv_m, fv);
+                    auto cmpm = [&](const char * nm, const std::vector<float> & a, const std::vector<float> & b, size_t n) {
+                        double mad = 0;
+                        for (size_t i = 0; i < n; i++) mad = std::max(mad, std::fabs((double)a[i] - (double)b[i]));
+                        double cosv = cosine(a.data(), b.data(), n);
+                        CHECK(mad < 1e-5 && cosv >= 0.999999,
+                              "%s %s mad=%.3g cos=%.8f", nm, has_clip ? "clip" : "noff", mad, cosv);
+                        printf("%-24s %-5s mad=%.3g cos=%.8f %s\n", nm, has_clip ? "clip" : "noff",
+                               mad, cosv, (mad < 1e-5 && cosv >= 0.999999) ? "OK" : "FAIL");
+                    };
+                    char nm[48];
+                    snprintf(nm, sizeof(nm), "qkvprep_%s Q", q8 ? "q8" : "f16");
+                    cmpm(nm, sq1, std::vector<float>(scr.begin() + sQm, scr.begin() + sQm + kNH * kDH), kNH * kDH);
+                    snprintf(nm, sizeof(nm), "qkvprep_%s Rr", q8 ? "q8" : "f16");
+                    cmpm(nm, sr1, std::vector<float>(scr.begin() + sRm, scr.begin() + sRm + kNH * kNREL), kNH * kNREL);
+                    snprintf(nm, sizeof(nm), "qkvprep_%s KV_K", q8 ? "q8" : "f16");
+                    cmpm(nm, rk, fq, kKVD);
+                    snprintf(nm, sizeof(nm), "qkvprep_%s KV_V", q8 ? "q8" : "f16");
+                    cmpm(nm, rv, fv, kKVD);
+                }
+            };
+            t53(true);    // Test 53a
+            t53(false);   // Test 53b
+
+            // ---- 54/55. k_postconv_residual vs k_conv_slot + k_xfer ----
+            {
+                const uint32_t sTmpM = seg(kNE);   // unfused o.tB staging
+                std::vector<float> cur0(kNE), x0(kNE), rs0(3 * kNE);
+                for (uint32_t i = 0; i < kNE; i++) { cur0[i] = M.f(-2.f, 2.f); x0[i] = M.f(-2.f, 2.f); }
+                for (uint32_t i = 0; i < 3 * kNE; i++) rs0[i] = M.f(-2.f, 2.f);
+                auto seed = [&]() {
+                    for (uint32_t i = 0; i < kNE; i++) { scr[sCurM + i] = cur0[i]; scr[sXm + i] = x0[i]; }
+                    for (uint32_t i = 0; i < 3 * kNE; i++) scr[sRsM + i] = rs0[i];
+                    for (uint32_t i = 0; i < kNE; i++) scr[sBlkM + i] = 777.0f;
+                };
+                // CPU mirrors of k_conv_slot (hasdyn=0) + k_xfer fold order.
+                std::vector<float> yexp(kNE), rsA(kNE), rsB(kNE), rsC(kNE);
+                auto cpu = [&](uint32_t c) {
+                    const float s0 = rs0[c * 3], s1 = rs0[c * 3 + 1], s2 = rs0[c * 3 + 2];
+                    const float xi = x0[c];
+                    const float * w = wc + c * 4;
+                    const float outv = s0 * w[0] + s1 * w[1] + s2 * w[2] + xi * w[3];
+                    yexp[c] = (xi + outv) * csc;
+                    rsA[c] = s1; rsB[c] = s2; rsC[c] = xi;
+                };
+                // push=0 (unfused: conv_slot->tmp + xfer mode0; fused: fold-add)
+                seed();
+                ConvArgs cvA{sRsM, sXm, sTmpM, pWC, 0u, kNE, kNE, csc, 0u};
+                XferArgs xfA{{sCurM, 0u}, {sTmpM, 0u}, {0u, 0u}, {kNE, 0u}, 0u};
+                run("k_conv_slot", false, kNE, 1, 128, &cvA, sizeof(cvA));
+                run("k_xfer", true, 1, 1, 256, &xfA, sizeof(xfA));
+                std::vector<float> cur_ref(scr.begin() + sCurM, scr.begin() + sCurM + kNE);
+                std::vector<float> rs_ref(scr.begin() + sRsM, scr.begin() + sRsM + 3 * kNE);
+                seed();
+                PostConvResArgs pcA{pWC, sRsM, sXm, sCurM, sBlkM, kNE, 0u, csc, 0u};
+                run("k_postconv_residual", false, kNE, 1, 128, &pcA, sizeof(pcA));
+                double mad_cur = 0, mad_rs = 0;
+                for (uint32_t c = 0; c < kNE; c++) {
+                    cpu(c);
+                    CHECK(scr[sCurM + c] == cur_ref[c], "postconv push0 cur[%u] exact", c);
+                    mad_cur = std::max(mad_cur, std::fabs((double)scr[sCurM + c] - (double)cur_ref[c]));
+                    for (int j = 0; j < 3; j++)
+                        mad_rs = std::max(mad_rs, std::fabs((double)scr[sRsM + c * 3 + j] - (double)rs_ref[c * 3 + j]));
+                }
+                {
+                    double mad_y = 0;
+                    for (uint32_t c = 0; c < kNE; c++)
+                        mad_y = std::max(mad_y, std::fabs((double)(cur_ref[c] - cur0[c]) - (double)yexp[c]));
+                    CHECK(mad_y < 1e-6 && mad_cur == 0.0 && mad_rs == 0.0,
+                          "postconv push0 cur mad=%.3g rs mad=%.3g y-vs-CPU mad=%.3g", mad_cur, mad_rs, mad_y);
+                    printf("%-24s cur-exact rs-exact y-vs-CPU mad=%.3g %s\n", "postconv_res push0", mad_y,
+                           (mad_y < 1e-6 && mad_cur == 0.0 && mad_rs == 0.0) ? "OK" : "FAIL");
+                }
+                // push=1 (unfused: conv_slot->tmp + 2x xfer mode1, exactly
+                // the production order; fused: snapshot cur->blk + cur=y)
+                seed();
+                ConvArgs cvB{sRsM, sXm, sTmpM, pWC, 0u, kNE, kNE, csc, 0u};
+                XferArgs xfB1{{sCurM, 0u}, {0u, 0u}, {sBlkM, 0u}, {kNE, 0u}, 1u};
+                XferArgs xfB2{{sTmpM, 0u}, {0u, 0u}, {sCurM, 0u}, {kNE, 0u}, 1u};
+                run("k_conv_slot", false, kNE, 1, 128, &cvB, sizeof(cvB));
+                run("k_xfer", true, 1, 1, 256, &xfB1, sizeof(xfB1));
+                run("k_xfer", true, 1, 1, 256, &xfB2, sizeof(xfB2));
+                std::vector<float> blk_ref(scr.begin() + sBlkM, scr.begin() + sBlkM + kNE);
+                std::vector<float> cur_ref2(scr.begin() + sCurM, scr.begin() + sCurM + kNE);
+                std::vector<float> rs_ref2(scr.begin() + sRsM, scr.begin() + sRsM + 3 * kNE);
+                seed();
+                PostConvResArgs pcB{pWC, sRsM, sXm, sCurM, sBlkM, kNE, 1u, csc, 0u};
+                run("k_postconv_residual", false, kNE, 1, 128, &pcB, sizeof(pcB));
+                double mad_blk = 0, mad_cur2 = 0, mad_y2 = 0, mad_rs2 = 0;
+                for (uint32_t c = 0; c < kNE; c++) {
+                    cpu(c);
+                    mad_blk = std::max(mad_blk, std::fabs((double)scr[sBlkM + c] - (double)blk_ref[c]));
+                    mad_cur2 = std::max(mad_cur2, std::fabs((double)scr[sCurM + c] - (double)cur_ref2[c]));
+                    mad_y2 = std::max(mad_y2, std::fabs((double)scr[sCurM + c] - (double)yexp[c]));
+                    for (int j = 0; j < 3; j++)
+                        mad_rs2 = std::max(mad_rs2, std::fabs((double)scr[sRsM + c * 3 + j] -
+                                                              (double)(j == 0 ? rsA[c] : (j == 1 ? rsB[c] : rsC[c]))));
+                }
+                CHECK(mad_blk == 0.0 && mad_cur2 == 0.0 && mad_y2 < 1e-6 && mad_rs2 == 0.0,
+                      "postconv push1 blk/cur-exact vs unfused chain (y mad=%.3g rs mad=%.3g)", mad_y2, mad_rs2);
+                printf("%-24s blk+cur-exact y-vs-CPU mad=%.3g rs-exact %s\n", "postconv_res push1", mad_y2,
+                       (mad_blk == 0.0 && mad_cur2 == 0.0 && mad_y2 < 1e-6 && mad_rs2 == 0.0) ? "OK" : "FAIL");
             }
         }
 

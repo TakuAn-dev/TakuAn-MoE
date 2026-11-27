@@ -40,6 +40,8 @@ public:
               bool kv_q8 = false);
     StepResult step(int32_t token);
     StepResult prefill(const std::vector<int32_t> & prompt);
+    // Milestone 8A: rows per batched-prefill chunk (1..64; 0 = default 64).
+    void set_prefill_chunk(int n);
     void reset();
     int64_t current_pos() const;
     int64_t vocab_effective() const;    // real vocab (unpadded)

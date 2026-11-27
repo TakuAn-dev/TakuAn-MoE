@@ -1508,7 +1508,9 @@ int main(int argc, char ** argv) {
         }
         // ---- 10f. k_moe_grouped_f32in_sg_{q4k,q5_0,q5_1} (Milestone 4B) ----
         // FP64-oracle parity per DotS gate (1024-ulp fp32 bound): q4k needs k%256==0.
-        // Expert 0 stays cnt=0 in every scenario; expert 1 gets cnt=37 (> 32-tile).
+        // Expert 0 stays cnt=0 in every scenario; expert 1 gets cnt=37 (> 32-tile),
+        // expert 2 cnt=16 and expert 3 cnt=17 (narrow 32x16 / full 32x32 tile
+        // boundaries, Milestone 15), remaining experts get the formula spread.
         {
             const double EPSF = 1.1920928955078125e-7;
             auto gate_ulp = [&](const char * name, const std::vector<DotS> & ref, uint32_t off, size_t n) {
@@ -1571,7 +1573,9 @@ int main(int argc, char ** argv) {
                     for (uint32_t p = 0; p < npairs; p++) {
                         uint32_t e;
                         if (npairs >= 64 && p < 37) e = 1u;
-                        else e = 1u + ((p * 7u + (p / TOPK) * 3u) % (NEXP - 1u));
+                        else if (npairs >= 64 && p < 53) e = 2u;
+                        else if (npairs >= 64 && p < 70) e = 3u;
+                        else e = 4u + ((p * 7u + (p / TOPK) * 3u) % (NEXP - 4u));
                         ((uint32_t *)scr.data())[sSel + p] = e;
                     }
                     std::vector<uint32_t> exp2slot(NEXP, 0);
@@ -1652,7 +1656,7 @@ int main(int argc, char ** argv) {
         uint32_t splitKvLen = 20001u;
         size_t splitRb = 0;
         {
-            const uint32_t MAX_SP = 32u;
+            const uint32_t MAX_SP = 128u;
             const float scale = 1.0f / sqrtf((float)kDH);
             splitRb = psegs(1024u * kNREL * sizeof(float));
             for (uint32_t d = 0; d < 1024u * kNREL; d++)
@@ -1673,11 +1677,13 @@ int main(int argc, char ** argv) {
 
             struct SplitCase { uint32_t pos, is_swa, n_swa, ring_cap, n_splits; const char * label; };
             const SplitCase cases[] = {
-                {511u,   0u, 0u,    0u,    4u,  "attn_split full p=511"},
-                {2048u,  0u, 0u,    0u,    16u, "attn_split full p=2048"},
-                {20000u, 0u, 0u,    0u,    32u, "attn_split full p=20000"},
-                {2048u,  1u, 1024u, 1025u, 9u,  "attn_split swa  p=2048"},
-                {10u,    0u, 0u,    0u,    16u, "attn_split empty p=10"},
+                {511u,   0u, 0u,    0u,    4u,   "attn_split full p=511"},
+                {2048u,  0u, 0u,    0u,    16u,  "attn_split full p=2048"},
+                {20000u, 0u, 0u,    0u,    32u,  "attn_split full p=20000"},
+                {20000u, 0u, 0u,    0u,    64u,  "attn_split64 full p=20000"},
+                {20000u, 0u, 0u,    0u,    128u, "attn_split128 p=20000"},
+                {2048u,  1u, 1024u, 1025u, 9u,   "attn_split swa  p=2048"},
+                {10u,    0u, 0u,    0u,    16u,  "attn_split empty p=10"},
             };
             const uint64_t kvv_half_off = (uint64_t)splitKvLen * kKVD;
             for (const auto & tc : cases) {
@@ -1697,21 +1703,28 @@ int main(int argc, char ** argv) {
                 AttnF16SplitArgs sp_a{splitRb, 0ull, kvv_half_off, sQ, sRr, sSnk, sGot,
                                       sPartO, sPartMS, tc.pos, tc.is_swa, tc.n_swa, tc.ring_cap,
                                       tc.n_splits, 0u, scale, tau};
-                run("k_attn_head_f16_split", true, kNH, tc.n_splits, 32, 1, &sp_a, sizeof(sp_a), bKvSplit);
-                run("k_attn_head_f16_reduce", true, kNH, 1, 32, 1, &sp_a, sizeof(sp_a));
+                for (int gqa = 0; gqa < 2; gqa++) {
+                    for (uint32_t i = 0; i < kNH * kDH; i++) scr[sGot + i] = 99.0f;
+                    for (uint32_t i = 0; i < kNH * MAX_SP * kDH; i++) scr[sPartO + i] = 77.0f;
+                    for (uint32_t i = 0; i < kNH * MAX_SP * 2u; i++) scr[sPartMS + i] = 77.0f;
+                    run(gqa ? "k_attn_head_f16_split_gqa" : "k_attn_head_f16_split",
+                        true, gqa ? 8u : kNH, tc.n_splits, 32, 1, &sp_a, sizeof(sp_a), bKvSplit);
+                    run("k_attn_head_f16_reduce", true, kNH, 1, 32, 1, &sp_a, sizeof(sp_a));
 
-                double mad = 0, maxabs = 0;
-                const float * got = scr.data() + sGot;
-                for (size_t i = 0; i < ref_out.size(); i++) {
-                    mad = std::max(mad, std::fabs((double)ref_out[i] - got[i]));
-                    maxabs = std::max(maxabs, std::fabs((double)ref_out[i]));
+                    double mad = 0, maxabs = 0;
+                    const float * got = scr.data() + sGot;
+                    for (size_t i = 0; i < ref_out.size(); i++) {
+                        mad = std::max(mad, std::fabs((double)ref_out[i] - got[i]));
+                        maxabs = std::max(maxabs, std::fabs((double)ref_out[i]));
+                    }
+                    const double relscale = mad / std::max(1e-30, maxabs);
+                    const double cosv = cosine(ref_out.data(), got, ref_out.size());
+                    const bool strict_ok = (cosv >= 0.999999 && relscale < 1e-5);
+                    CHECK(strict_ok, "%s (%s) strict parity cos=%.8f relscale=%.3g",
+                          tc.label, gqa ? "gqa" : "24h", cosv, relscale);
+                    printf("%-22s %-3s cos=%.8f relscale=%.3g mad=%.3g %s\n",
+                           tc.label, gqa ? "gqa" : "24h", cosv, relscale, mad, strict_ok ? "OK" : "FAIL");
                 }
-                const double relscale = mad / std::max(1e-30, maxabs);
-                const double cosv = cosine(ref_out.data(), got, ref_out.size());
-                const bool strict_ok = (cosv >= 0.999999 && relscale < 1e-5);
-                CHECK(strict_ok, "%s strict parity cos=%.8f relscale=%.3g", tc.label, cosv, relscale);
-                printf("%-26s cos=%.8f relscale=%.3g mad=%.3g %s\n",
-                       tc.label, cosv, relscale, mad, strict_ok ? "OK" : "FAIL");
             }
         }
 
@@ -1958,7 +1971,7 @@ int main(int argc, char ** argv) {
                     }
                 }
 
-                const uint32_t MAX_SP = 32u;
+                const uint32_t MAX_SP = 128u;
                 const uint32_t sQ2 = seg(kNH * kDH), sR2 = seg(kNH * kNREL), sS2 = seg(kNH);
                 const uint32_t sPO2 = seg(kNH * MAX_SP * kDH), sPM2 = seg(kNH * MAX_SP * 2u);
                 const uint32_t sRef2 = seg(kNH * kDH), sGot2 = seg(kNH * kDH);
@@ -1968,10 +1981,12 @@ int main(int argc, char ** argv) {
 
                 struct QSplitCase { uint32_t pos, is_swa, n_swa, ring_cap, n_splits; const char * label; };
                 const QSplitCase qcases[] = {
-                    {511u,   0u, 0u,    0u,    4u,  "attn_q8split full p=511"},
-                    {2048u,  0u, 0u,    0u,    16u, "attn_q8split full p=2048"},
-                    {20000u, 0u, 0u,    0u,    32u, "attn_q8split full p=20000"},
-                    {2048u,  1u, 1024u, 1025u, 9u,  "attn_q8split swa  p=2048"},
+                    {511u,   0u, 0u,    0u,    4u,   "attn_q8split full p=511"},
+                    {2048u,  0u, 0u,    0u,    16u,  "attn_q8split full p=2048"},
+                    {20000u, 0u, 0u,    0u,    32u,  "attn_q8split full p=20000"},
+                    {20000u, 0u, 0u,    0u,    64u,  "attn_q8split64 p=20000"},
+                    {20000u, 0u, 0u,    0u,    128u, "attn_q8split128 p=20000"},
+                    {2048u,  1u, 1024u, 1025u, 9u,   "attn_q8split swa  p=2048"},
                 };
                 for (const auto & tc : qcases) {
                     const float tau = tc.is_swa ? 1.0f
@@ -1991,25 +2006,291 @@ int main(int argc, char ** argv) {
                     AttnF16SplitArgs sp_a{splitRb, 0ull, q8vHalf, sQ2, sR2, sS2, sGot2,
                                           sPO2, sPM2, tc.pos, tc.is_swa, tc.n_swa, tc.ring_cap,
                                           tc.n_splits, 0u, scale, tau};
-                    run("k_attn_head_q8_split", true, kNH, tc.n_splits, 32, 1, &sp_a, sizeof(sp_a), bKvSplit);
-                    run("k_attn_head_f16_reduce", true, kNH, 1, 32, 1, &sp_a, sizeof(sp_a));
-                    double mad = 0, maxabs = 0;
-                    const float * got = scr.data() + sGot2;
-                    for (size_t i = 0; i < ref_out.size(); i++) {
-                        mad = std::max(mad, std::fabs((double)ref_out[i] - got[i]));
-                        maxabs = std::max(maxabs, std::fabs((double)ref_out[i]));
+                    for (int gqa = 0; gqa < 2; gqa++) {
+                        for (uint32_t i = 0; i < kNH * kDH; i++) scr[sGot2 + i] = 99.0f;
+                        for (uint32_t i = 0; i < kNH * MAX_SP * kDH; i++) scr[sPO2 + i] = 77.0f;
+                        for (uint32_t i = 0; i < kNH * MAX_SP * 2u; i++) scr[sPM2 + i] = 77.0f;
+                        run(gqa ? "k_attn_head_q8_split_gqa" : "k_attn_head_q8_split",
+                            true, gqa ? 8u : kNH, tc.n_splits, 32, 1, &sp_a, sizeof(sp_a), bKvSplit);
+                        run("k_attn_head_f16_reduce", true, kNH, 1, 32, 1, &sp_a, sizeof(sp_a));
+                        double mad = 0, maxabs = 0;
+                        const float * got = scr.data() + sGot2;
+                        for (size_t i = 0; i < ref_out.size(); i++) {
+                            mad = std::max(mad, std::fabs((double)ref_out[i] - got[i]));
+                            maxabs = std::max(maxabs, std::fabs((double)ref_out[i]));
+                        }
+                        const double relscale = mad / std::max(1e-30, maxabs);
+                        const double cosv = cosine(ref_out.data(), got, ref_out.size());
+                        const bool strict_ok = allfin(got, ref_out.size()) && cosv >= 0.99999 && mad < 1e-4;
+                        CHECK(strict_ok, "%s (%s) strict split parity cos=%.8f mad=%.3g",
+                              tc.label, gqa ? "gqa" : "24h", cosv, mad);
+                        printf("%-22s %-3s cos=%.8f relscale=%.3g mad=%.3g %s\n",
+                               tc.label, gqa ? "gqa" : "24h", cosv, relscale, mad, strict_ok ? "OK" : "FAIL");
                     }
-                    const double relscale = mad / std::max(1e-30, maxabs);
-                    const double cosv = cosine(ref_out.data(), got, ref_out.size());
-                    const bool strict_ok = allfin(got, ref_out.size()) && cosv >= 0.99999;
-                    CHECK(strict_ok, "%s strict split parity cos=%.8f relscale=%.3g", tc.label, cosv, relscale);
-                    printf("%-26s cos=%.8f relscale=%.3g mad=%.3g %s\n",
-                           tc.label, cosv, relscale, mad, strict_ok ? "OK" : "FAIL");
                 }
                 bKvSplit = nil;
             }
             bQ8F = nil; bKvFB = nil; bQ8S = nil; bKvSB = nil;
             cur = cur9; pcur = pcur9;
+        }
+
+        // ================= 12. Milestone 9B batched small-op helpers =================
+        // k_xfer_batch / k_mix_rms_batch + k_mix_fused_batch /
+        // k_ctrl_down_batch + k_ctrl_up_batch, all parity-checked against the
+        // OLD sequential for(b=0..B) dispatch loops (the exact per-token
+        // kernel/arg sequence gpu_prefill_batch used before Milestone 9B).
+        {
+            cur = cur9; pcur = pcur9;
+            const uint32_t kNE9 = 2304u;
+            auto run3 = [&](const char * fn, uint tz, uint tx, uint ty, uint nthx,
+                            const void * a, size_t sz) {
+                memcpy(bScr.contents, scr.data(), SCR_F * 4);
+                memcpy(bPk.contents, pk.data(), PK_B);
+                id<MTLComputePipelineState> p = rt.pipeline(fn);
+                CHECK(p != nil, "pipeline %s missing", fn);
+                if (!p) return;
+                auto cmd = [rt.queue() commandBuffer];
+                auto en = [cmd computeCommandEncoder];
+                [en setComputePipelineState:p];
+                [en setBuffer:bScr offset:0 atIndex:0];
+                [en setBytes:a length:sz atIndex:1];
+                [en setBuffer:bPk offset:0 atIndex:2];
+                [en dispatchThreadgroups:MTLSizeMake(tx, ty, tz)
+                   threadsPerThreadgroup:MTLSizeMake(nthx, 1, 1)];
+                [en endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                CHECK(cmd.status == MTLCommandBufferStatusCompleted, "%s status", fn);
+                memcpy(scr.data(), bScr.contents, SCR_F * 4);
+            };
+            auto bitcmp = [&](const char * nm, const float * a, const float * b, size_t n) {
+                size_t bad = 0;
+                for (size_t i = 0; i < n; i++) if (a[i] != b[i]) bad++;
+                printf("%-34s bitwise %zu mismatches %s\n", nm, bad, bad ? "FAIL" : "OK");
+                if (bad) g_fail = true;
+            };
+
+            // ---- 12a. k_xfer_batch (copy + add, incl. npairs=2 + odd n) ----
+            for (uint32_t B : {8u, 32u, 128u}) {
+                cur = cur9; pcur = pcur9;
+                const uint32_t n = 1000u;                       // odd tail path
+                uint32_t sa = seg(B * 2304u + 32), sb = seg(B * 2304u + 32),
+                         sc = seg(B * 2304u + 32), sc2 = seg(B * 2304u + 32);
+                std::vector<float> sa_orig(B * 2304u);
+                for (uint32_t i = 0; i < B * 2304u; i++) {
+                    sa_orig[i] = R.f(-4, 4);
+                    scr[sa + i] = sa_orig[i];
+                    scr[sb + i] = R.f(-4, 4);
+                }
+                for (int mode = 0; mode < 2; mode++) {
+                    char nm[64];
+                    if (mode) {   // copy: dst[b] = src[b]
+                        std::vector<float> ref((size_t)B * n), got((size_t)B * n);
+                        for (uint32_t b = 0; b < B; b++)
+                            for (uint32_t i = 0; i < n; i++) ref[(size_t)b * n + i] = scr[sa + b * 2304u + i];
+                        for (uint32_t i = 0; i < B * 2304u; i++) scr[sc + i] = -777.f;
+                        XferBatchArgs A{};
+                        A.a[0] = sa; A.a_stride[0] = 2304u; A.c[0] = sc; A.c_stride[0] = 2304u;
+                        A.n[0] = n; A.B = B; A.npairs = 1u; A.is_copy = 1u;
+                        run3("k_xfer_batch", 1u, (n + 255u) / 256u, B, 256, &A, sizeof(A));
+                        for (uint32_t b = 0; b < B; b++)
+                            for (uint32_t i = 0; i < n; i++) got[(size_t)b * n + i] = scr[sc + b * 2304u + i];
+                        snprintf(nm, sizeof(nm), "xfer_batch copy B=%u n=%u", B, n);
+                        gate(nm, ref.data(), got.data(), ref.size(), GATE_ATTN);
+                        bitcmp(nm, ref.data(), got.data(), ref.size());
+                    } else {      // add: a[b] += b[b]
+                        std::vector<float> ref((size_t)B * n), got((size_t)B * n);
+                        for (uint32_t b = 0; b < B; b++) {
+                            XferArgs X{{sa + b * 2304u, 0}, {sb + b * 2304u, 0}, {0, 0}, {n, 0}, 0};
+                            run("k_xfer", true, 1, 1, 256, 1, &X, sizeof(X));
+                            for (uint32_t i = 0; i < n; i++) ref[(size_t)b * n + i] = scr[sa + b * 2304u + i];
+                        }
+                        // Restore sa before running batched add (k_xfer mutated sa in-place).
+                        memcpy(scr.data() + sa, sa_orig.data(), (size_t)B * 2304u * 4);
+                        XferBatchArgs A{};
+                        A.a[0] = sa; A.a_stride[0] = 2304u; A.b[0] = sb; A.b_stride[0] = 2304u;
+                        A.n[0] = n; A.B = B; A.npairs = 1u; A.is_copy = 0u;
+                        run3("k_xfer_batch", 1u, (n + 255u) / 256u, B, 256, &A, sizeof(A));
+                        for (uint32_t b = 0; b < B; b++)
+                            for (uint32_t i = 0; i < n; i++) got[(size_t)b * n + i] = scr[sa + b * 2304u + i];
+                        snprintf(nm, sizeof(nm), "xfer_batch add B=%u n=%u", B, n);
+                        gate(nm, ref.data(), got.data(), ref.size(), GATE_ATTN);
+                        bitcmp(nm, ref.data(), got.data(), ref.size());
+                    }
+                }
+                // npairs=2 (dual-pair copy, matches xfer2's 2-pair call shape)
+                {
+                    const uint32_t n0 = 2304u, n1 = 100u;
+                    uint32_t sa2 = seg(B * 128u + 32), sc3 = seg(B * 128u + 32);
+                    for (uint32_t i = 0; i < B * 128u; i++) scr[sa2 + i] = R.f(-4, 4);
+                    std::vector<float> ref0((size_t)B * n0), ref1((size_t)B * n1);
+                    for (uint32_t b = 0; b < B; b++) {          // per-token k_xfer grid.x=2
+                        XferArgs X{{sa + b * 2304u, sa2 + b * 128u}, {0, 0},
+                                   {sc2 + b * 2304u, sc3 + b * 128u}, {n0, n1}, 1};
+                        run("k_xfer", true, 2, 1, 256, 1, &X, sizeof(X));
+                        for (uint32_t i = 0; i < n0; i++) ref0[(size_t)b * n0 + i] = scr[sc2 + b * 2304u + i];
+                        for (uint32_t i = 0; i < n1; i++) ref1[(size_t)b * n1 + i] = scr[sc3 + b * 128u + i];
+                    }
+                    for (uint32_t i = 0; i < B * 2304u; i++) scr[sc2 + i] = -777.f;
+                    for (uint32_t i = 0; i < B * 128u; i++) scr[sc3 + i] = -777.f;
+                    XferBatchArgs A{};
+                    A.a[0] = sa; A.a_stride[0] = 2304u; A.c[0] = sc2; A.c_stride[0] = 2304u; A.n[0] = n0;
+                    A.a[1] = sa2; A.a_stride[1] = 128u; A.c[1] = sc3; A.c_stride[1] = 128u; A.n[1] = n1;
+                    A.B = B; A.npairs = 2u; A.is_copy = 1u;
+                    run3("k_xfer_batch", 2u, (n0 + 255u) / 256u, B, 256, &A, sizeof(A));
+                    std::vector<float> got1((size_t)B * n1);
+                    for (uint32_t b = 0; b < B; b++)
+                        for (uint32_t i = 0; i < n1; i++) got1[(size_t)b * n1 + i] = scr[sc3 + b * 128u + i];
+                    char nm[64];
+                    snprintf(nm, sizeof(nm), "xfer_batch np2 p0 B=%u", B);
+                    bitcmp(nm, ref0.data(), scr.data() + sc2, (size_t)B * n0);
+                    snprintf(nm, sizeof(nm), "xfer_batch np2 p1 B=%u", B);
+                    bitcmp(nm, ref1.data(), got1.data(), (size_t)B * n1);
+                }
+            }
+
+            // ---- 12b. k_mix_rms_batch + k_mix_fused_batch vs per-token chain ----
+            struct MC { uint32_t n, nq, out_stride; };
+            const MC mcs[] = {{8u, 1u, 3u * 2304u}, {4u, 4u, 4u * 2304u}};
+            for (uint32_t B : {8u, 32u, 128u}) {
+                for (const MC & mc : mcs) {
+                    cur = cur9; pcur = pcur9;
+                    const uint32_t n = mc.n, nq = mc.nq, S = n + 1u;
+                    const uint32_t st_stride = n * kNE9, stn_stride = S * kNE9;
+                    uint32_t sStates = seg(B * st_stride + 32), sExtra = seg(B * kNE9 + 32),
+                             sStnB = seg(B * stn_stride + 32), sOutB = seg(B * mc.out_stride + 32),
+                             sOutR = seg(B * mc.out_stride + 32), sStnR = seg(S * kNE9 + 32);
+                    size_t qp = psegs((size_t)nq * kNE9 * 4);
+                    for (uint32_t i = 0; i < B * st_stride; i++) scr[sStates + i] = R.f(-3, 3);
+                    for (uint32_t i = 0; i < B * kNE9; i++) scr[sExtra + i] = R.f(-3, 3);
+                    for (uint32_t i = 0; i < nq * kNE9; i++) pkf[qp / 4 + i] = R.f(-2, 2);
+                    const float scale = 1.0f / sqrtf((float)kNE9);
+                    std::vector<float> ref((size_t)B * nq * kNE9, 0.f);
+                    // OLD path: per token k_rms(S rows) then k_mix_fused
+                    for (uint32_t b = 0; b < B; b++) {
+                        RMSArgs ra{};
+                        for (uint32_t r = 0; r < S; r++) {
+                            ra.xr[r] = (r < n) ? sStates + b * st_stride + (n - 1u - r) * kNE9
+                                               : sExtra + b * kNE9;
+                            ra.yr[r] = sStnR + r * kNE9;
+                            ra.wr[r] = 0;
+                        }
+                        ra.rows = S; ra.k = kNE9; ra.hasw = 0; ra.eps = 1e-6f;
+                        run("k_rms", true, S, 1, 256, 1, &ra, sizeof(ra));
+                        MixFusedArgs fa{qp, sStnR, sOutR + b * mc.out_stride, S, nq, scale, 0u};
+                        run("k_mix_fused", true, nq, 1, 256, 1, &fa, sizeof(fa));
+                        for (uint32_t i = 0; i < nq * kNE9; i++)
+                            ref[(size_t)b * nq * kNE9 + i] = scr[sOutR + b * mc.out_stride + i];
+                    }
+                    // NEW path: 2 batch dispatches for all B tokens
+                    for (uint32_t i = 0; i < B * mc.out_stride; i++) scr[sOutB + i] = -777.f;
+                    MixRmsBatchArgs ra{ sStates, st_stride, sExtra, kNE9,
+                                        sStnB, stn_stride, n, B, kNE9, 0u };
+                    run3("k_mix_rms_batch", 1u, n + 1u, B, 256, &ra, sizeof(ra));
+                    MixFusedBatchArgs fa{};
+                    fa.qpack = qp; fa.stnoff = sStnB; fa.stn_stride = stn_stride;
+                    fa.outoff = sOutB; fa.out_stride = mc.out_stride;
+                    fa.S = S; fa.nq = nq; fa.B = B; fa.scale = scale;
+                    run3("k_mix_fused_batch", 1u, nq, B, 256, &fa, sizeof(fa));
+                    std::vector<float> got((size_t)B * nq * kNE9);
+                    for (uint32_t b = 0; b < B; b++)
+                        for (uint32_t i = 0; i < nq * kNE9; i++)
+                            got[(size_t)b * nq * kNE9 + i] = scr[sOutB + b * mc.out_stride + i];
+                    char nm[64];
+                    snprintf(nm, sizeof(nm), "mix_batch B=%u n=%u nq=%u", B, n, nq);
+                    gate(nm, ref.data(), got.data(), ref.size(), GATE_ATTN);
+                    bitcmp(nm, ref.data(), got.data(), ref.size());
+                }
+            }
+
+            // ---- 12c. k_ctrl_down_batch + k_ctrl_up_batch vs per-token chain ----
+            struct CC { uint32_t nc, in_row; };
+            const CC ccs[] = {{3u, 2304u}, {3u, 0u}, {1u, 0u}};   // attn, attn-swa, ffn
+            for (uint32_t B : {8u, 32u, 128u}) {
+                for (const CC & cc : ccs) {
+                    cur = cur9; pcur = pcur9;
+                    const uint32_t nc = cc.nc, in_row = cc.in_row;
+                    const uint32_t gc_str = 6u * kNE9;
+                    uint32_t sIn = seg(B * 3 * kNE9 + 32), sMsg = seg(B * 4 * kNE9 + 32),
+                             sOutB = seg(B * 3 * kNE9 + 32), sOutR = seg(B * 3 * kNE9 + 32),
+                             sGcB = seg(B * gc_str + 32), sGcR = seg(6 * kNE9 + 32),
+                             sHhB = seg(B * 4 * 64u + 32), sHhR = seg(4 * 64u + 32);
+                    size_t wd[4], wg[4], wf[4];
+                    for (uint32_t j = 0; j < nc; j++) {
+                        wd[j] = psegs((size_t)64u * 2u * kNE9 * 4u);
+                        wg[j] = psegs((size_t)kNE9 * 64u * 4u);
+                        wf[j] = psegs((size_t)kNE9 * 64u * 4u);
+                        for (size_t i = 0; i < 64u * 2u * kNE9; i++) ((float *)(pk.data() + wd[j]))[i] = R.f(-0.05f, 0.05f);
+                        for (size_t i = 0; i < (size_t)kNE9 * 64u; i++) {
+                            ((float *)(pk.data() + wg[j]))[i] = R.f(-0.05f, 0.05f);
+                            ((float *)(pk.data() + wf[j]))[i] = R.f(-0.05f, 0.05f);
+                        }
+                    }
+                    for (uint32_t i = 0; i < B * 3 * kNE9; i++) scr[sIn + i] = R.f(-3, 3);
+                    for (uint32_t i = 0; i < B * 4 * kNE9; i++) scr[sMsg + i] = R.f(-3, 3);
+                    std::vector<float> ref((size_t)B * nc * kNE9, 0.f);
+                    // OLD path: per token k_rms(2*nc rows) + k_ctrl_down + k_ctrl_up
+                    for (uint32_t b = 0; b < B; b++) {
+                        RMSArgs ra{};
+                        for (uint32_t j = 0; j < nc; j++) {
+                            ra.xr[2 * j] = sIn + b * 3 * kNE9 + j * in_row;
+                            ra.yr[2 * j] = sGcR + 2u * j * kNE9;
+                            ra.xr[2 * j + 1] = sMsg + b * 4 * kNE9 + j * kNE9;
+                            ra.yr[2 * j + 1] = sGcR + (2u * j + 1u) * kNE9;
+                            ra.wr[2 * j] = ra.wr[2 * j + 1] = 0;
+                        }
+                        ra.rows = 2 * nc; ra.k = kNE9; ra.hasw = 0; ra.eps = 1e-6f;
+                        run("k_rms", true, 2 * nc, 1, 256, 1, &ra, sizeof(ra));
+                        CtrlSplitArgs A{};
+                        for (uint32_t j = 0; j < nc; j++) {
+                            A.in[j] = sIn + b * 3 * kNE9 + j * in_row;
+                            A.msg[j] = sMsg + b * 4 * kNE9 + j * kNE9;
+                            A.out[j] = sOutR + b * 3 * kNE9 + j * kNE9;
+                            A.wdown[j] = wd[j]; A.wgain[j] = wg[j]; A.wforg[j] = wf[j];
+                        }
+                        A.gcat = sGcR; A.hh = sHhR; A.eps = 1e-6f;
+                        A.grank = 64; A.ne = kNE9; A.nc = nc;
+                        run("k_ctrl_down", true, 64, nc, 256, 1, &A, sizeof(A));
+                        run("k_ctrl_up", true, (kNE9 + 31) / 32, nc, 32, 1, &A, sizeof(A));
+                        for (uint32_t j = 0; j < nc; j++)
+                            for (uint32_t i = 0; i < kNE9; i++)
+                                ref[((size_t)b * nc + j) * kNE9 + i] = scr[sOutR + b * 3 * kNE9 + j * kNE9 + i];
+                    }
+                    // NEW path: rms_batch x2 + down_batch + up_batch (grid.z = B)
+                    for (uint32_t i = 0; i < B * 3 * kNE9; i++) scr[sOutB + i] = -777.f;
+                    RmsBatchArgs R1{0ull, sIn, 3 * kNE9, in_row, sGcB, gc_str, 2u * kNE9,
+                                    M64_NOFFU, M64_NOFFU, 0u, 0u, kNE9, B, nc, 0u, 0u, 0u, 1e-6f};
+                    run("k_rms_batch", true, nc, B, 256, 1, &R1, sizeof(R1));
+                    RmsBatchArgs R2{0ull, sMsg, 4 * kNE9, kNE9, sGcB + kNE9, gc_str, 2u * kNE9,
+                                    M64_NOFFU, M64_NOFFU, 0u, 0u, kNE9, B, nc, 0u, 0u, 0u, 1e-6f};
+                    run("k_rms_batch", true, nc, B, 256, 1, &R2, sizeof(R2));
+                    CtrlBatchSplitArgs A{};
+                    for (uint32_t j = 0; j < nc; j++) {
+                        A.in[j] = sIn + j * in_row;
+                        A.msg[j] = sMsg + j * kNE9;
+                        A.out[j] = sOutB + j * kNE9;
+                        A.wdown[j] = wd[j]; A.wgain[j] = wg[j]; A.wforg[j] = wf[j];
+                    }
+                    A.in_stride = 3 * kNE9; A.msg_stride = 4 * kNE9; A.out_stride = 3 * kNE9;
+                    A.gcat = sGcB; A.gcat_stride = gc_str;
+                    A.hh = sHhB; A.hh_stride = 4u * 64u;
+                    A.grank = 64u; A.ne = kNE9; A.nc = nc; A.B = B; A.eps = 1e-6f;
+                    run3("k_ctrl_down_batch", B, 64, nc, 256, &A, sizeof(A));
+                    run3("k_ctrl_up_batch", B, (kNE9 + 31) / 32, nc, 32, &A, sizeof(A));
+                    std::vector<float> got((size_t)B * nc * kNE9);
+                    for (uint32_t b = 0; b < B; b++)
+                        for (uint32_t j = 0; j < nc; j++)
+                            for (uint32_t i = 0; i < kNE9; i++)
+                                got[((size_t)b * nc + j) * kNE9 + i] = scr[sOutB + b * 3 * kNE9 + j * kNE9 + i];
+                    double mad = 0.0;
+                    for (size_t i = 0; i < ref.size(); i++)
+                        mad = std::max(mad, std::fabs((double)ref[i] - (double)got[i]));
+                    const double cosv = cosine(ref.data(), got.data(), ref.size());
+                    char nm[64];
+                    snprintf(nm, sizeof(nm), "ctrl_batch B=%u nc=%u irow=%u", B, nc, in_row);
+                    gate(nm, ref.data(), got.data(), ref.size(), GATE_ATTN);
+                    CHECK(mad < 1e-5 && cosv >= 0.999999, "%s strict parity mad=%.3g cos=%.8f", nm, mad, cosv);
+                    (void)bitcmp;
+                }
+            }
         }
 
         // ================= optional microbenchmark (--bench) =================
@@ -2384,6 +2665,351 @@ int main(int argc, char ** argv) {
                                    t_b[s2][b2] / t_f[s2][b2], t_f[s2][b2], t_b[s2][b2]);
                 }
                 bKvB = nil;
+            }
+
+            // ---- Milestone 9B: per-token loop vs batched small ops ----
+            {
+                cur = cur9; pcur = pcur9;
+                const uint32_t kB9 = 128, kN9 = 2304;
+                const int IT9 = 50;
+                auto tmr = [&](const char * nm, const std::function<void(id<MTLComputeCommandEncoder>)> & one) {
+                    double best = 1e30;
+                    for (int pass = 0; pass < 3; pass++) {
+                        id<MTLCommandBuffer> c0 = [rt.queue() commandBuffer];
+                        id<MTLComputeCommandEncoder> e0 = [c0 computeCommandEncoder];
+                        one(e0);
+                        [e0 endEncoding]; [c0 commit]; [c0 waitUntilCompleted];
+                        id<MTLCommandBuffer> cmd = [rt.queue() commandBuffer];
+                        id<MTLComputeCommandEncoder> en = [cmd computeCommandEncoder];
+                        auto t0 = std::chrono::steady_clock::now();
+                        for (int i = 0; i < IT9; i++) one(en);
+                        [en endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                        double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count() / IT9;
+                        CHECK(cmd.status == MTLCommandBufferStatusCompleted, "%s status (%s)", nm,
+                              cmd.error ? cmd.error.localizedDescription.UTF8String : "none");
+                        if (ms < best) best = ms;
+                    }
+                    printf("BENCH %-30s %8.4f ms/iter\n", nm, best);
+                    return best;
+                };
+                memcpy(bScr.contents, scr.data(), SCR_F * 4);
+                memcpy(bPk.contents, pk.data(), PK_B);
+                id<MTLComputePipelineState> p[11] = {
+                    rt.pipeline("k_xfer"), rt.pipeline("k_xfer_batch"),
+                    rt.pipeline("k_rms"), rt.pipeline("k_mix_fused"),
+                    rt.pipeline("k_rms_batch"), rt.pipeline("k_mix_fused_batch"),
+                    rt.pipeline("k_ctrl_down"), rt.pipeline("k_ctrl_up"),
+                    rt.pipeline("k_ctrl_down_batch"), rt.pipeline("k_ctrl_up_batch"),
+                    rt.pipeline("k_mix_rms_batch") };
+                for (int i = 0; i < 11; i++) CHECK(p[i] != nil, "bench9B pipeline %d", i);
+                auto use = [&](id<MTLComputePipelineState> ps, id<MTLComputeCommandEncoder> en,
+                               const void * a, size_t sz) {
+                    [en setComputePipelineState:ps];
+                    [en setBuffer:bScr offset:0 atIndex:0];
+                    [en setBytes:a length:sz atIndex:1];
+                    [en setBuffer:bPk offset:0 atIndex:2];
+                };
+                // xfer
+                {
+                    uint32_t sa = seg(kB9 * kN9 + 32), sb = seg(kB9 * kN9 + 32);
+                    XferArgs Xa{{}, {}, {}, {kN9, 0}, 0}, Xc{{}, {}, {}, {kN9, 0}, 1};
+                    XferBatchArgs Xb{};
+                    for (uint32_t b = 0; b < kB9; b++) {
+                        Xa.a[0] = sa + b * kN9; Xa.b[0] = sb + b * kN9; Xa.c[0] = sa + b * kN9;
+                        Xc.a[0] = sa + b * kN9; Xc.b[0] = sb + b * kN9; Xc.c[0] = sa + b * kN9;
+                    }
+                    Xb.a[0] = sa; Xb.a_stride[0] = kN9; Xb.b[0] = sb; Xb.b_stride[0] = kN9;
+                    Xb.c[0] = sa; Xb.c_stride[0] = kN9; Xb.n[0] = kN9;
+                    Xb.B = kB9; Xb.npairs = 1u; Xb.is_copy = 0u;
+                    double a_seq = tmr("xfer_add seq B=128", [&](id<MTLComputeCommandEncoder> en) {
+                        for (uint32_t b = 0; b < kB9; b++) {
+                            Xa.a[0] = sa + b * kN9; Xa.b[0] = sb + b * kN9;
+                            use(p[0], en, &Xa, sizeof(Xa));
+                            [en dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        }});
+                    double a_bat = tmr("xfer_add batch B=128", [&](id<MTLComputeCommandEncoder> en) {
+                        Xb.is_copy = 0u;
+                        use(p[1], en, &Xb, sizeof(Xb));
+                        [en dispatchThreadgroups:MTLSizeMake(kN9 / 256u, kB9, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    });
+                    double c_seq = tmr("xfer_copy seq B=128", [&](id<MTLComputeCommandEncoder> en) {
+                        for (uint32_t b = 0; b < kB9; b++) {
+                            Xc.a[0] = sa + b * kN9; Xc.c[0] = sa + b * kN9;
+                            use(p[0], en, &Xc, sizeof(Xc));
+                            [en dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        }});
+                    double c_bat = tmr("xfer_copy batch B=128", [&](id<MTLComputeCommandEncoder> en) {
+                        Xb.is_copy = 1u;
+                        use(p[1], en, &Xb, sizeof(Xb));
+                        [en dispatchThreadgroups:MTLSizeMake(kN9 / 256u, kB9, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    });
+                    printf("SPEEDUP xfer_batch B=128: add %.1fx, copy %.1fx\n",
+                           a_seq / a_bat, c_seq / c_bat);
+                }
+                // mix (n=8, nq=1)
+                {
+                    cur = cur9; pcur = pcur9;
+                    const uint32_t n = 8, S = n + 1, nq = 1;
+                    uint32_t sSt = seg(kB9 * n * kN9 + 32), sEx = seg(kB9 * kN9 + 32),
+                             sStn = seg(kB9 * (S + 1) * kN9 + 32), sOut = seg(kB9 * 3 * kN9 + 32);
+                    size_t qp9 = psegs((size_t)nq * kN9 * 4);
+                    RMSArgs ra9{}; MixFusedArgs fa9{qp9, 0, 0, S, nq, 1.0f / sqrtf((float)kN9), 0u};
+                    for (uint32_t r = 0; r < S; r++) { ra9.xr[r] = sSt + (n - 1 - r) * kN9;
+                        ra9.yr[r] = sStn + r * kN9; ra9.wr[r] = 0; }
+                    ra9.rows = S; ra9.k = kN9; ra9.hasw = 0; ra9.eps = 1e-6f;
+                    MixRmsBatchArgs mra{sSt, n * kN9, sEx, kN9, sStn, S * kN9, n, kB9, kN9, 0u};
+                    MixFusedBatchArgs mfa{};
+                    mfa.qpack = qp9; mfa.stnoff = sStn; mfa.stn_stride = S * kN9;
+                    mfa.outoff = sOut; mfa.out_stride = 3 * kN9;
+                    mfa.S = S; mfa.nq = nq; mfa.B = kB9; mfa.scale = ra9.eps + 0.0f;
+                    mfa.scale = 1.0f / sqrtf((float)kN9);
+                    double m_seq = tmr("mix seq (rms+fused) B=128", [&](id<MTLComputeCommandEncoder> en) {
+                        for (uint32_t b = 0; b < kB9; b++) {
+                            for (uint32_t r = 0; r < S; r++) {
+                                ra9.xr[r] = sSt + b * n * kN9 + (n - 1 - r) * kN9;
+                                ra9.yr[r] = sStn + b * S * kN9 + r * kN9;
+                            }
+                            ra9.xr[S - 1] = sEx + b * kN9;
+                            use(p[2], en, &ra9, sizeof(ra9));
+                            [en dispatchThreadgroups:MTLSizeMake(S, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                            fa9.stnoff = sStn + b * S * kN9; fa9.outoff = sOut + b * 3 * kN9;
+                            use(p[3], en, &fa9, sizeof(fa9));
+                            [en dispatchThreadgroups:MTLSizeMake(nq, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        }});
+                    double m_bat = tmr("mix batch (2 dispatches) B=128", [&](id<MTLComputeCommandEncoder> en) {
+                        use(p[10], en, &mra, sizeof(mra));
+                        [en dispatchThreadgroups:MTLSizeMake(n + 1u, kB9, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        use(p[5], en, &mfa, sizeof(mfa));
+                        [en dispatchThreadgroups:MTLSizeMake(nq, kB9, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    });
+                    printf("SPEEDUP mix_batch B=128: %.1fx (%.4f vs %.4f ms/iter)\n",
+                           m_seq / m_bat, m_seq, m_bat);
+                }
+                // ctrl (nc=3)
+                {
+                    cur = cur9; pcur = pcur9;
+                    const uint32_t nc = 3;
+                    uint32_t sIn = seg(kB9 * 3 * kN9 + 32), sMsg = seg(kB9 * 4 * kN9 + 32),
+                             sOut = seg(kB9 * 3 * kN9 + 32), sGc = seg(kB9 * 6 * kN9 + 32),
+                             sHh = seg(kB9 * 4 * 64u + 32);
+                    size_t wd9[4], wg9[4], wf9[4];
+                    for (uint32_t j = 0; j < nc; j++) {
+                        wd9[j] = psegs((size_t)64u * 2u * kN9 * 4u);
+                        wg9[j] = psegs((size_t)kN9 * 64u * 4u);
+                        wf9[j] = psegs((size_t)kN9 * 64u * 4u);
+                        for (size_t i = 0; i < 64u * 2u * kN9; i++) ((float *)(pk.data() + wd9[j]))[i] = 0.01f * (float)(i % 7) - 0.03f;
+                        for (size_t i = 0; i < (size_t)kN9 * 64u; i++) {
+                            ((float *)(pk.data() + wg9[j]))[i] = 0.01f * (float)(i % 5) - 0.02f;
+                            ((float *)(pk.data() + wf9[j]))[i] = 0.01f * (float)(i % 3) - 0.01f;
+                        }
+                    }
+                    memcpy(bPk.contents, pk.data(), PK_B);
+                    RMSArgs rr9{};
+                    for (uint32_t j = 0; j < nc; j++) {
+                        rr9.xr[2*j] = sIn + j * kN9; rr9.yr[2*j] = sGc + 2u*j*kN9;
+                        rr9.xr[2*j+1] = sMsg + j * kN9; rr9.yr[2*j+1] = sGc + (2u*j+1u)*kN9;
+                        rr9.wr[2*j] = rr9.wr[2*j+1] = 0;
+                    }
+                    rr9.rows = 2 * nc; rr9.k = kN9; rr9.hasw = 0; rr9.eps = 1e-6f;
+                    CtrlSplitArgs cs9{};
+                    for (uint32_t j = 0; j < nc; j++) {
+                        cs9.in[j] = sIn + j * kN9; cs9.msg[j] = sMsg + j * kN9; cs9.out[j] = sOut + j * kN9;
+                        cs9.wdown[j] = wd9[j]; cs9.wgain[j] = wg9[j]; cs9.wforg[j] = wf9[j];
+                    }
+                    cs9.gcat = sGc; cs9.hh = sHh; cs9.eps = 1e-6f; cs9.grank = 64; cs9.ne = kN9; cs9.nc = nc;
+                    RmsBatchArgs R1{0ull, sIn, 3 * kN9, kN9, sGc, 6 * kN9, 2u * kN9,
+                                    M64_NOFFU, M64_NOFFU, 0u, 0u, kN9, kB9, nc, 0u, 0u, 0u, 1e-6f};
+                    RmsBatchArgs R2{0ull, sMsg, 4 * kN9, kN9, sGc + kN9, 6 * kN9, 2u * kN9,
+                                    M64_NOFFU, M64_NOFFU, 0u, 0u, kN9, kB9, nc, 0u, 0u, 0u, 1e-6f};
+                    CtrlBatchSplitArgs cb9{};
+                    for (uint32_t j = 0; j < nc; j++) {
+                        cb9.in[j] = sIn + j * kN9; cb9.msg[j] = sMsg + j * kN9; cb9.out[j] = sOut + j * kN9;
+                        cb9.wdown[j] = wd9[j]; cb9.wgain[j] = wg9[j]; cb9.wforg[j] = wf9[j];
+                    }
+                    cb9.in_stride = 3 * kN9; cb9.msg_stride = 4 * kN9; cb9.out_stride = 3 * kN9;
+                    cb9.gcat = sGc; cb9.gcat_stride = 6 * kN9;
+                    cb9.hh = sHh; cb9.hh_stride = 4u * 64u;
+                    cb9.grank = 64u; cb9.ne = kN9; cb9.nc = nc; cb9.B = kB9; cb9.eps = 1e-6f;
+                    double k_seq = tmr("ctrl seq (rms+down+up) B=128", [&](id<MTLComputeCommandEncoder> en) {
+                        for (uint32_t b = 0; b < kB9; b++) {
+                            for (uint32_t j = 0; j < nc; j++) {
+                                rr9.xr[2*j] = sIn + b * 3 * kN9 + j * kN9;
+                                rr9.xr[2*j+1] = sMsg + b * 4 * kN9 + j * kN9;
+                                rr9.yr[2*j] = sGc + b * 6 * kN9 + 2u * j * kN9;
+                                rr9.yr[2*j+1] = sGc + b * 6 * kN9 + (2u * j + 1u) * kN9;
+                                cs9.in[j] = rr9.xr[2*j]; cs9.msg[j] = rr9.xr[2*j+1];
+                                cs9.out[j] = sOut + b * 3 * kN9 + j * kN9;
+                            }
+                            cs9.gcat = sGc + b * 6 * kN9; cs9.hh = sHh + b * 4u * 64u;
+                            use(p[2], en, &rr9, sizeof(rr9));
+                            [en dispatchThreadgroups:MTLSizeMake(2 * nc, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                            use(p[6], en, &cs9, sizeof(cs9));
+                            [en dispatchThreadgroups:MTLSizeMake(64, nc, 1)
+                                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                            use(p[7], en, &cs9, sizeof(cs9));
+                            [en dispatchThreadgroups:MTLSizeMake((kN9 + 31u) / 32u, nc, 1)
+                                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                        }});
+                    double k_bat = tmr("ctrl batch (4 dispatches) B=128", [&](id<MTLComputeCommandEncoder> en) {
+                        use(p[4], en, &R1, sizeof(R1));
+                        [en dispatchThreadgroups:MTLSizeMake(nc, kB9, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        use(p[4], en, &R2, sizeof(R2));
+                        [en dispatchThreadgroups:MTLSizeMake(nc, kB9, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        use(p[8], en, &cb9, sizeof(cb9));
+                        [en dispatchThreadgroups:MTLSizeMake(64, nc, kB9)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        use(p[9], en, &cb9, sizeof(cb9));
+                        [en dispatchThreadgroups:MTLSizeMake((kN9 + 31u) / 32u, nc, kB9)
+                            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    });
+                    printf("SPEEDUP ctrl_batch B=128 nc=3: %.1fx (%.4f vs %.4f ms/iter)\n",
+                           k_seq / k_bat, k_seq, k_bat);
+                }
+            }
+
+            // ---- Milestone 9C: GQA 3-head KV sharing + 128 splits (pos=20000 & 65536) ----
+            {
+                cur = cur9; pcur = pcur9;
+                const uint32_t MAX_SP9C = 128u, LEN64 = 65537u;
+                const float scale = 1.0f / sqrtf((float)kDH);
+                const size_t rb64 = psegs(1024u * kNREL * sizeof(float));
+                for (uint32_t d = 0; d < 1024u * kNREL; d++)
+                    ((float *)(pk.data() + rb64))[d] = R.f(-0.4f, 0.4f);
+                const uint32_t sQ = seg(kNH * kDH), sRr = seg(kNH * kNREL), sSnk = seg(kNH);
+                const uint32_t sPartO = seg(kNH * MAX_SP9C * kDH), sPartMS = seg(kNH * MAX_SP9C * 2u);
+                const uint32_t sOut = seg(kNH * kDH);
+                for (uint32_t i = 0; i < kNH * kDH; i++) scr[sQ + i] = R.f(-1.2f, 1.2f);
+                for (uint32_t i = 0; i < kNH * kNREL; i++) scr[sRr + i] = R.f(-0.5f, 0.5f);
+                for (uint32_t i = 0; i < kNH; i++) scr[sSnk + i] = R.f(-1.0f, 1.0f);
+                const size_t kv64_halfs = (size_t)LEN64 * 2u * kKVD;  // ~268 MB (holds FP16 or Q8)
+                id<MTLBuffer> bKv64 = [rt.device() newBufferWithLength:kv64_halfs * sizeof(uint16_t)
+                                                              options:MTLResourceStorageModeShared];
+                CHECK(bKv64 != nil, "bench 9C KV64 alloc");
+                if (bKv64) {
+                    // Populate valid random F16/Q8 bytes (Q8 blocks use safe finite scales).
+                    uint8_t * raw = (uint8_t *)bKv64.contents;
+                    for (uint32_t p = 0; p < LEN64; p++) {
+                        for (int s = 0; s < 2; s++) {
+                            for (uint32_t kvh = 0; kvh < 8u; kvh++) {
+                                const uint64_t at = ((uint64_t)(s ? (uint64_t)LEN64 * 544u : 0ull)
+                                                     + (uint64_t)p * 544u) * 2u + kvh * 136u;
+                                for (uint32_t i = 0; i < 128u; i++) raw[at + i] = (uint8_t)R.u32();
+                                for (uint32_t blk = 0; blk < 4u; blk++) {
+                                    const uint16_t hb = (uint16_t)((R.u32() & 0x3B00u) | (R.u32() & 0xFFu));
+                                    raw[at + 128u + blk * 2u] = (uint8_t)hb;
+                                    raw[at + 129u + blk * 2u] = (uint8_t)(hb >> 8);
+                                }
+                            }
+                        }
+                    }
+                    memcpy(bScr.contents, scr.data(), SCR_F * 4);
+                    memcpy(bPk.contents, pk.data(), PK_B);
+                    id<MTLComputePipelineState> pF = rt.pipeline("k_attn_head_f16_split");
+                    id<MTLComputePipelineState> pFG = rt.pipeline("k_attn_head_f16_split_gqa");
+                    id<MTLComputePipelineState> pQ = rt.pipeline("k_attn_head_q8_split");
+                    id<MTLComputePipelineState> pQG = rt.pipeline("k_attn_head_q8_split_gqa");
+                    id<MTLComputePipelineState> pR = rt.pipeline("k_attn_head_f16_reduce");
+                    CHECK(pF && pFG && pQ && pQG && pR, "bench 9C pipelines missing");
+                    const int IT9C = 20;
+                    auto tmr9c = [&](const char * nm, id<MTLComputePipelineState> ps,
+                                     uint32_t gx, const AttnF16SplitArgs & A) {
+                        double best = 1e30;
+                        for (int pass = 0; pass < 3; pass++) {
+                            id<MTLCommandBuffer> c0 = [rt.queue() commandBuffer];
+                            id<MTLComputeCommandEncoder> e0 = [c0 computeCommandEncoder];
+                            [e0 setComputePipelineState:ps];
+                            [e0 setBuffer:bScr offset:0 atIndex:0];
+                            [e0 setBytes:&A length:sizeof(A) atIndex:1];
+                            [e0 setBuffer:bPk offset:0 atIndex:2];
+                            [e0 setBuffer:bKv64 offset:0 atIndex:3];
+                            [e0 dispatchThreadgroups:MTLSizeMake(gx, A.n_splits, 1)
+                                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                            [e0 setComputePipelineState:pR];
+                            [e0 setBuffer:bScr offset:0 atIndex:0];
+                            [e0 setBytes:&A length:sizeof(A) atIndex:1];
+                            [e0 dispatchThreadgroups:MTLSizeMake(kNH, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                            [e0 endEncoding]; [c0 commit]; [c0 waitUntilCompleted];
+                            id<MTLCommandBuffer> cmd = [rt.queue() commandBuffer];
+                            id<MTLComputeCommandEncoder> en = [cmd computeCommandEncoder];
+                            auto t0 = std::chrono::steady_clock::now();
+                            for (int it = 0; it < IT9C; it++) {
+                                [en setComputePipelineState:ps];
+                                [en setBuffer:bScr offset:0 atIndex:0];
+                                [en setBytes:&A length:sizeof(A) atIndex:1];
+                                [en setBuffer:bPk offset:0 atIndex:2];
+                                [en setBuffer:bKv64 offset:0 atIndex:3];
+                                [en dispatchThreadgroups:MTLSizeMake(gx, A.n_splits, 1)
+                                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                                [en setComputePipelineState:pR];
+                                [en setBuffer:bScr offset:0 atIndex:0];
+                                [en setBytes:&A length:sizeof(A) atIndex:1];
+                                [en dispatchThreadgroups:MTLSizeMake(kNH, 1, 1)
+                                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                            }
+                            [en endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                            double ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count() / IT9C;
+                            CHECK(cmd.status == MTLCommandBufferStatusCompleted, "%s status", nm);
+                            if (ms < best) best = ms;
+                        }
+                        printf("BENCH %-30s %8.4f ms/iter\n", nm, best);
+                        return best;
+                    };
+                    for (int is_q8 : {1, 0}) {
+                        // Run Q8 first (safe Q8 scales already populated), then overwrite with clean FP16.
+                        if (!is_q8) {
+                            uint16_t * hp = (uint16_t *)bKv64.contents;
+                            for (size_t i = 0; i < kv64_halfs; i++) hp[i] = h16bits(R.f(-1.5f, 1.5f));
+                        }
+                        const uint64_t voff = (uint64_t)LEN64 * (is_q8 ? 544ull : (uint64_t)kKVD);
+                        for (uint32_t pos_b : {20000u, 65536u}) {
+                            const float tau = (float)(std::log(((double)pos_b + 1.0) / 8192.0) * 0.25 + 1.0);
+                            AttnF16SplitArgs a_old{rb64, 0ull, voff, sQ, sRr, sSnk, sOut,
+                                                   sPartO, sPartMS, pos_b, 0u, 0u, 0u, 32u, 0u, scale, tau};
+                            AttnF16SplitArgs a_new = a_old;
+                            a_new.n_splits = 128u;
+                            char l1[48], l2[48];
+                            snprintf(l1, sizeof(l1), "attn_%s_24x32 p=%u", is_q8 ? "q8" : "f16", pos_b);
+                            snprintf(l2, sizeof(l2), "attn_%s_gqa8x128 p=%u", is_q8 ? "q8" : "f16", pos_b);
+                            const double t_old = tmr9c(l1, is_q8 ? pQ : pF, kNH, a_old);
+                            // Save old output at pos=65536 for parity cross-check vs new GQA 8x128.
+                            std::vector<float> old_out;
+                            if (pos_b == 65536u) {
+                                const float * dp = (const float *)bScr.contents + sOut;
+                                old_out.assign(dp, dp + kNH * kDH);
+                            }
+                            const double t_new = tmr9c(l2, is_q8 ? pQG : pFG, 8u, a_new);
+                            if (pos_b == 65536u) {
+                                const float * np = (const float *)bScr.contents + sOut;
+                                const double cosv = cosine(old_out.data(), np, old_out.size());
+                                double mad = 0.0;
+                                for (size_t i = 0; i < old_out.size(); i++)
+                                    mad = std::max(mad, std::fabs((double)old_out[i] - (double)np[i]));
+                                CHECK(cosv >= 0.99999 && mad < 1e-4,
+                                      "attn_%s_gqa8x128@65536 parity cos=%.8f mad=%.3g",
+                                      is_q8 ? "q8" : "f16", cosv, mad);
+                                printf("PARITY attn_%s p=65536 8x128 vs 24x32: cos=%.8f mad=%.3g OK\n",
+                                       is_q8 ? "q8" : "f16", cosv, mad);
+                            }
+                            printf("SPEEDUP attn_%s_gqa8x128@%u: %.2fx (%.4f vs %.4f ms/iter)\n",
+                                   is_q8 ? "q8" : "f16", pos_b, t_old / t_new, t_new, t_old);
+                        }
+                    }
+                    bKv64 = nil;
+                }
             }
         }
 

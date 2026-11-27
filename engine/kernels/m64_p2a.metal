@@ -26,6 +26,8 @@ static_assert(sizeof(DownReduceConvArgs) == 32, "DownReduceConvArgs");
 static_assert(sizeof(MixFusedArgs) == 32, "MixFusedArgs");
 static_assert(sizeof(MoeGateUpQ4KF32Args) == 48, "MoeGateUpQ4KF32Args");
 static_assert(sizeof(MoeDownQ5F32Args) == 48, "MoeDownQ5F32Args");
+static_assert(sizeof(QkvPrepKvArgs) == 64, "QkvPrepKvArgs");
+static_assert(sizeof(PostConvResArgs) == 40, "PostConvResArgs");
 
 #define M64_NE    2304u
 #define M64_EXT   1024u
@@ -593,6 +595,8 @@ kernel void k_attn_head_f16_split(device float * SCR [[buffer(0)]],
 }
 
 // Split-K FlashDecoding reduction: grid = (kNH, 1, 1), tg = (32, 1, 1).
+// Each lane holds output channels t = lane*4 .. t+3, so every lane folds all
+// splits sp in [0, n_splits) in ascending order (works for any n_splits <= 128).
 kernel void k_attn_head_f16_reduce(device float * SCR [[buffer(0)]],
                                    constant AttnF16SplitArgs & A [[buffer(1)]],
                                    uint3 M64_TITG [[thread_position_in_threadgroup]],
@@ -619,6 +623,157 @@ kernel void k_attn_head_f16_reduce(device float * SCR [[buffer(0)]],
         M = M_new;
     }
     m64_attn_f16_finish(SCR + A.outoff + h * 128u, t, oh, M, S);
+}
+
+// ------------------------------------------------- Milestone 9C: GQA split-K
+// k_attn_head_f16_split / k_attn_head_q8_split loaded each KV block 3x (once
+// per Q head of the GQA group). These variants dispatch ONE warp per KV head
+// (grid = (8, n_splits, 1), tg = (32, 1, 1)) that keeps the 3 Q heads'
+// q/oh/M/S in registers (qh 12 half + oh 12 float per lane: no barriers, no
+// shared memory) and loads every kh/vh exactly once. Per-head operation order
+// matches m64_attn_f16_range / m64_attn_q8_range line-for-line, so the
+// partials are numerically identical to the 24-head kernels; the partial
+// layout part_o[h * n_splits + sp] / part_ms[h * n_splits + sp] is unchanged,
+// so k_attn_head_f16_reduce reduces both variants identically.
+static inline void m64_attn_f16_acc(float s, float v0, float v1, float v2, float v3,
+                                    thread float * oh, thread float & M, thread float & S) {
+    float ms = 1.0f, vs;
+    if (s > M) {
+        ms = metal::exp(M - s);
+        oh[0] *= ms; oh[1] *= ms; oh[2] *= ms; oh[3] *= ms;
+        M = s; vs = 1.0f;
+    } else {
+        vs = metal::exp(s - M);
+    }
+    oh[0] = fma(vs, v0, oh[0]);
+    oh[1] = fma(vs, v1, oh[1]);
+    oh[2] = fma(vs, v2, oh[2]);
+    oh[3] = fma(vs, v3, oh[3]);
+    S = S * (float)ms + (float)vs;
+}
+
+static inline void m64_attn_q8_acc(float s, float vd, char4 vq,
+                                   thread float * oh, thread float & M, thread float & S) {
+    float ms = 1.0f, vs;
+    if (s > M) {
+        ms = metal::exp(M - s);
+        oh[0] *= ms; oh[1] *= ms; oh[2] *= ms; oh[3] *= ms;
+        M = s; vs = 1.0f;
+    } else {
+        vs = metal::exp(s - M);
+    }
+    const float vscale = vs * vd;
+    oh[0] = fma(vscale, float(vq.x), oh[0]);
+    oh[1] = fma(vscale, float(vq.y), oh[1]);
+    oh[2] = fma(vscale, float(vq.z), oh[2]);
+    oh[3] = fma(vscale, float(vq.w), oh[3]);
+    S = S * (float)ms + (float)vs;
+}
+
+// Relative-bias dot for the 3 GQA heads (same order/rounding as the 1-head
+// kernels: (lane < 16) ? brow[lane] * (rout[lane] * tau) : 0, then simd_sum).
+static inline void m64_attn_gqa_bias(const device uchar * PACK, unsigned long relbiaspack,
+                                     uint dist, const device float * rout0, float tau,
+                                     uint lane, thread float & bv0, thread float & bv1,
+                                     thread float & bv2) {
+    bv0 = 0.0f; bv1 = 0.0f; bv2 = 0.0f;
+    if (dist >= M64_EXT) return;
+    const device float * brow = ((const device float *)(PACK + relbiaspack)) + (size_t)dist * 16u;
+    float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f;
+    if (lane < 16u) {
+        v0 = brow[lane] * (rout0[lane] * tau);
+        v1 = brow[lane] * (rout0[lane + 16u] * tau);
+        v2 = brow[lane] * (rout0[lane + 32u] * tau);
+    }
+    bv0 = simd_sum(v0);
+    bv1 = simd_sum(v1);
+    bv2 = simd_sum(v2);
+}
+
+kernel void k_attn_head_f16_split_gqa(device float * SCR [[buffer(0)]],
+                                      constant AttnF16SplitArgs & A [[buffer(1)]],
+                                      const device uchar * PACK [[buffer(2)]],
+                                      const device half * KV [[buffer(3)]],
+                                      uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                      uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    const uint kvh = M64_TGPG.x;
+    const uint sp = M64_TGPG.y;
+    const uint lane = M64_TITG.x;
+    if (kvh >= 8u || sp >= A.n_splits) return;
+    const uint t = lane * 4u;
+    const uint j_start = (A.is_swa && A.pos > A.n_swa) ? (A.pos - A.n_swa) : 0u;
+    const uint total = A.pos + 1u - j_start;
+    const uint chunk = (total + A.n_splits - 1u) / A.n_splits;
+    const uint j0 = j_start + sp * chunk;
+    const uint j1 = (j0 < A.pos + 1u) ? min(j0 + chunk, A.pos + 1u) : j0;
+    const uint h0 = kvh * 3u;
+    float oh0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float oh1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float oh2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float M0 = -INFINITY, M1 = -INFINITY, M2 = -INFINITY;
+    float S0 = 0.0f, S1 = 0.0f, S2 = 0.0f;
+    if (j0 < j1) {
+        const device float * q = SCR + A.qoff + h0 * 128u;
+        half qa0[4], qa1[4], qa2[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            qa0[i] = half(q[t + i] * A.tau);
+            qa1[i] = half(q[t + i + 128u] * A.tau);
+            qa2[i] = half(q[t + i + 256u] * A.tau);
+        }
+        const device float * rout0 = SCR + A.rout + h0 * 16u;
+        const float snk0 = SCR[A.sinkoff + h0];
+        const float snk1 = SCR[A.sinkoff + h0 + 1u];
+        const float snk2 = SCR[A.sinkoff + h0 + 2u];
+        const device half * kb = KV + A.kvkoff + kvh * 128u + t;
+        const device half * vb = KV + A.kvvoff + kvh * 128u + t;
+        for (uint j = j0; j < j1; j++) {
+            const uint slot_idx = A.is_swa ? (j % A.ring_cap) : j;
+            const device half * kj = kb + (size_t)slot_idx * 1024u;
+            const float k0 = float(kj[0]), k1 = float(kj[1]);
+            const float k2 = float(kj[2]), k3 = float(kj[3]);
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const float kv = (i == 0) ? k0 : ((i == 1) ? k1 : ((i == 2) ? k2 : k3));
+                d0 = fma(float(qa0[i]), kv, d0);
+                d1 = fma(float(qa1[i]), kv, d1);
+                d2 = fma(float(qa2[i]), kv, d2);
+            }
+            d0 = simd_sum(d0); d1 = simd_sum(d1); d2 = simd_sum(d2);
+            float bv0, bv1, bv2;
+            m64_attn_gqa_bias(PACK, A.relbiaspack, A.pos - j, rout0, A.tau, lane, bv0, bv1, bv2);
+            const float s0 = d0 * A.scale + f16r(bv0 - snk0);
+            const float s1 = d1 * A.scale + f16r(bv1 - snk1);
+            const float s2 = d2 * A.scale + f16r(bv2 - snk2);
+            const device half * vj = vb + (size_t)slot_idx * 1024u;
+            const float v0 = float(vj[0]), v1 = float(vj[1]);
+            const float v2 = float(vj[2]), v3 = float(vj[3]);
+            m64_attn_f16_acc(s0, v0, v1, v2, v3, oh0, M0, S0);
+            m64_attn_f16_acc(s1, v0, v1, v2, v3, oh1, M1, S1);
+            m64_attn_f16_acc(s2, v0, v1, v2, v3, oh2, M2, S2);
+        }
+    }
+    const uint p0 = h0 * A.n_splits + sp;
+    const uint p1 = (h0 + 1u) * A.n_splits + sp;
+    const uint p2 = (h0 + 2u) * A.n_splits + sp;
+    device float * po0 = SCR + A.part_o_off + p0 * 128u;
+    device float * po1 = SCR + A.part_o_off + p1 * 128u;
+    device float * po2 = SCR + A.part_o_off + p2 * 128u;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        po0[t + i] = oh0[i];
+        po1[t + i] = oh1[i];
+        po2[t + i] = oh2[i];
+    }
+    if (lane == 0u) {
+        SCR[A.part_ms_off + p0 * 2u] = M0;
+        SCR[A.part_ms_off + p0 * 2u + 1u] = S0;
+        SCR[A.part_ms_off + p1 * 2u] = M1;
+        SCR[A.part_ms_off + p1 * 2u + 1u] = S1;
+        SCR[A.part_ms_off + p2 * 2u] = M2;
+        SCR[A.part_ms_off + p2 * 2u + 1u] = S2;
+    }
 }
 
 // ---------------- Milestone 5A: Q8_0 KV cache (write + attention + split-K) --
@@ -668,6 +823,140 @@ kernel void k_kv_write_q8(const device float * SCR [[buffer(0)]],
         if ((lane & 7u) == 0u)
             ((device half *)(dst[s] + 128u))[blk] = half(amax * (1.0f / 127.0f));
     }
+}
+
+// ---------------- Milestone 11: fused decode QKV prep + KV write (5 -> 1) ---
+// grid = (64, 1, 1), tg = (32, 1, 1): one warp per head, ZERO threadgroup
+// barriers. wg 0..23 Q-head clip (k_clip per=128 semantics, qclip scale,
+// in-place SCR); 24..31 K-head clip -> direct KV write (K clip uses
+// M64_NOFF scale, mirrors k_clip + k_kv_write_*); 32..39 V-head per-head
+// rmsnorm (k_rms hasw=0 semantics: inv = 1/sqrt(s/k + eps)) -> direct KV
+// write, o.emb staging eliminated; 40..63 Rr-head clip (k_clip per=16
+// semantics, relclip scale, in-place SCR).
+template <typename KVt, bool Q8>
+static inline void m64_qkv_prep_kv_write(
+    device float * SCR, constant QkvPrepKvArgs & A,
+    const device uchar * PACK, device KVt * KV, uint wg, uint lane) {
+    if (wg < 24u) {                                   // Q heads 0..23
+        const uint h = wg, t = lane * 4u;
+        device float * base = SCR + A.qoff + h * 128u;
+        const device float * sc = A.qclip_off != M64_NOFF
+            ? ((const device float *)(PACK + A.qclip_off)) + h * 128u : nullptr;
+        float v0 = base[t], v1 = base[t + 1u], v2 = base[t + 2u], v3 = base[t + 3u];
+        if (sc) {
+            const device float4 * s4 = (const device float4 *)(sc + t);
+            const float4 sm = *s4;
+            v0 *= sm.x; v1 *= sm.y; v2 *= sm.z; v3 *= sm.w;
+        }
+        const float s = simd_sum(v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3);
+        float f = A.qk_thresh / (sqrt(s) + 1e-6f);
+        f = fmin(fmax(f, 0.0f), 1.0f);
+        base[t] = v0 * f; base[t + 1u] = v1 * f;
+        base[t + 2u] = v2 * f; base[t + 3u] = v3 * f;
+    } else if (wg < 32u) {                            // KV heads (K) 0..7
+        const uint kvh = wg - 24u, t = lane * 4u;
+        const device float * x = SCR + A.koff + kvh * 128u;
+        float k0 = x[t], k1 = x[t + 1u], k2 = x[t + 2u], k3 = x[t + 3u];
+        const float s = simd_sum(k0 * k0 + k1 * k1 + k2 * k2 + k3 * k3);
+        float f = A.qk_thresh / (sqrt(s) + 1e-6f);
+        f = fmin(fmax(f, 0.0f), 1.0f);
+        k0 *= f; k1 *= f; k2 *= f; k3 *= f;
+        if constexpr (Q8) {
+            device uchar * dst = KV + (size_t)A.dst_k * 2ul + (size_t)kvh * 136ul;
+            float amax = fmax(fmax(fabs(k0), fabs(k1)), fmax(fabs(k2), fabs(k3)));
+            amax = fmax(amax, simd_shuffle_xor(amax, 1u));
+            amax = fmax(amax, simd_shuffle_xor(amax, 2u));
+            amax = fmax(amax, simd_shuffle_xor(amax, 4u));
+            const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            char4 q;
+            q.x = q8_c8(k0, id); q.y = q8_c8(k1, id);
+            q.z = q8_c8(k2, id); q.w = q8_c8(k3, id);
+            *(device char4 *)(dst + t) = q;
+            if ((lane & 7u) == 0u)
+                ((device half *)(dst + 128u))[lane >> 3u] = half(amax * (1.0f / 127.0f));
+        } else {
+            device half * dst = (device half *)KV + (size_t)A.dst_k + (size_t)kvh * 128ul;
+            dst[t] = half(k0); dst[t + 1u] = half(k1);
+            dst[t + 2u] = half(k2); dst[t + 3u] = half(k3);
+        }
+    } else if (wg < 40u) {                            // KV heads (V) 0..7
+        const uint kvh = wg - 32u, t = lane * 4u;
+        const device float * x = SCR + A.voff + kvh * 128u;
+        const float x0 = x[t], x1 = x[t + 1u], x2 = x[t + 2u], x3 = x[t + 3u];
+        const float s = simd_sum(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3);
+        const float inv = 1.0f / sqrt(s / 128.0f + A.eps);
+        const float v0 = x0 * inv, v1 = x1 * inv, v2 = x2 * inv, v3 = x3 * inv;
+        if constexpr (Q8) {
+            device uchar * dst = KV + (size_t)A.dst_v * 2ul + (size_t)kvh * 136ul;
+            float amax = fmax(fmax(fabs(v0), fabs(v1)), fmax(fabs(v2), fabs(v3)));
+            amax = fmax(amax, simd_shuffle_xor(amax, 1u));
+            amax = fmax(amax, simd_shuffle_xor(amax, 2u));
+            amax = fmax(amax, simd_shuffle_xor(amax, 4u));
+            const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            char4 q;
+            q.x = q8_c8(v0, id); q.y = q8_c8(v1, id);
+            q.z = q8_c8(v2, id); q.w = q8_c8(v3, id);
+            *(device char4 *)(dst + t) = q;
+            if ((lane & 7u) == 0u)
+                ((device half *)(dst + 128u))[lane >> 3u] = half(amax * (1.0f / 127.0f));
+        } else {
+            device half * dst = (device half *)KV + (size_t)A.dst_v + (size_t)kvh * 128ul;
+            dst[t] = half(v0); dst[t + 1u] = half(v1);
+            dst[t + 2u] = half(v2); dst[t + 3u] = half(v3);
+        }
+    } else if (wg < 64u) {                            // Rr heads 0..23
+        const uint h = wg - 40u;
+        const device float * src = SCR + A.roff + h * 16u;
+        const device float * sc = A.relclip_off != M64_NOFF
+            ? ((const device float *)(PACK + A.relclip_off)) + h * 16u : nullptr;
+        float v = (lane < 16u) ? src[lane] : 0.0f;
+        if (sc && lane < 16u) v *= sc[lane];
+        const float s = simd_sum(v * v);
+        float f = A.rel_thresh / (sqrt(s) + 1e-6f);
+        f = fmin(fmax(f, 0.0f), 1.0f);
+        if (lane < 16u) SCR[A.roff + h * 16u + lane] = v * f;
+    }
+}
+
+kernel void k_qkv_prep_kv_write_q8(device float * SCR [[buffer(0)]],
+                                   constant QkvPrepKvArgs & A [[buffer(1)]],
+                                   const device uchar * PACK [[buffer(2)]],
+                                   device uchar * KV [[buffer(3)]],
+                                   uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                   uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    m64_qkv_prep_kv_write<uchar, true>(SCR, A, PACK, KV, M64_TGPG.x, M64_TITG.x);
+}
+
+kernel void k_qkv_prep_kv_write_f16(device float * SCR [[buffer(0)]],
+                                    constant QkvPrepKvArgs & A [[buffer(1)]],
+                                    const device uchar * PACK [[buffer(2)]],
+                                    device half * KV [[buffer(3)]],
+                                    uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                    uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    m64_qkv_prep_kv_write<half, false>(SCR, A, PACK, KV, M64_TGPG.x, M64_TITG.x);
+}
+
+// ---------------- Milestone 11: fused postconv + residual (2 -> 1) ----------
+// k_conv_slot (postconv, hasdyn=0) + k_xfer fold. Flat (A.n)x128 dispatch;
+// every channel c is owned by ONE thread, so the read/modify/write of
+// SCR[curoff+c] (push=0 add) and the cur->blkoff snapshot (push=1) are both
+// race-free within this single dispatch.
+kernel void k_postconv_residual(device float * SCR [[buffer(0)]],
+                                constant PostConvResArgs & A [[buffer(1)]],
+                                const device uchar * PACK [[buffer(2)]],
+                                uint3 M64_TIG [[thread_position_in_grid]]) {
+    const uint c = M64_TIG.x;
+    if (c >= A.n) return;
+    device float * st = SCR + A.rsoff + c * 3u;
+    const float s0 = st[0], s1 = st[1], s2 = st[2];
+    const float xin = SCR[A.xoff + c];
+    const device float4 * w4 = ((const device float4 *)(PACK + A.wconv)) + c;
+    const float4 w = *w4;
+    const float outv = s0 * w.x + s1 * w.y + s2 * w.z + xin * w.w;
+    st[0] = s1; st[1] = s2; st[2] = xin;
+    const float y = (xin + outv) * A.scale;
+    if (A.push == 0u) SCR[A.curoff + c] = SCR[A.curoff + c] + y;
+    else { SCR[A.blkoff + c] = SCR[A.curoff + c]; SCR[A.curoff + c] = y; }
 }
 
 // Attention over the Q8_0 KV buffer. Numerics mirror m64_attn_f16_range with
@@ -782,6 +1071,98 @@ kernel void k_attn_head_q8_split(device float * SCR [[buffer(0)]],
     if (lane == 0u) {
         SCR[A.part_ms_off + pidx * 2u] = M;
         SCR[A.part_ms_off + pidx * 2u + 1u] = S;
+    }
+}
+
+// Split-K FlashDecoding over the Q8_0 KV cache with GQA 3-head KV sharing:
+// grid = (8, n_splits, 1), tg = (32, 1, 1). Same partial layout / numerics as
+// k_attn_head_q8_split (kh/vh dequantized once for the 3 Q heads of kvh).
+kernel void k_attn_head_q8_split_gqa(device float * SCR [[buffer(0)]],
+                                     constant AttnF16SplitArgs & A [[buffer(1)]],
+                                     const device uchar * PACK [[buffer(2)]],
+                                     const device uchar * KV [[buffer(3)]],
+                                     uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                     uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    const uint kvh = M64_TGPG.x;
+    const uint sp = M64_TGPG.y;
+    const uint lane = M64_TITG.x;
+    if (kvh >= 8u || sp >= A.n_splits) return;
+    const uint t = lane * 4u;
+    const uint j_start = (A.is_swa && A.pos > A.n_swa) ? (A.pos - A.n_swa) : 0u;
+    const uint total = A.pos + 1u - j_start;
+    const uint chunk = (total + A.n_splits - 1u) / A.n_splits;
+    const uint j0 = j_start + sp * chunk;
+    const uint j1 = (j0 < A.pos + 1u) ? min(j0 + chunk, A.pos + 1u) : j0;
+    const uint h0 = kvh * 3u;
+    float oh0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float oh1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float oh2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float M0 = -INFINITY, M1 = -INFINITY, M2 = -INFINITY;
+    float S0 = 0.0f, S1 = 0.0f, S2 = 0.0f;
+    if (j0 < j1) {
+        const device float * q = SCR + A.qoff + h0 * 128u;
+        half qa0[4], qa1[4], qa2[4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            qa0[i] = half(q[t + i] * A.tau);
+            qa1[i] = half(q[t + i + 128u] * A.tau);
+            qa2[i] = half(q[t + i + 256u] * A.tau);
+        }
+        const device float * rout0 = SCR + A.rout + h0 * 16u;
+        const float snk0 = SCR[A.sinkoff + h0];
+        const float snk1 = SCR[A.sinkoff + h0 + 1u];
+        const float snk2 = SCR[A.sinkoff + h0 + 2u];
+        const uint blk = lane >> 3u;
+        const device uchar * kbase = KV + (size_t)A.kvkoff * 2ul + (size_t)kvh * 136ul;
+        const device uchar * vbase = KV + (size_t)A.kvvoff * 2ul + (size_t)kvh * 136ul;
+        for (uint j = j0; j < j1; j++) {
+            const uint slot_idx = A.is_swa ? (j % A.ring_cap) : j;
+            const device uchar * kh = kbase + (size_t)slot_idx * 1088ul;
+            const float kd = float(((const device half *)(kh + 128u))[blk]);
+            const char4 kq = *(const device char4 *)(kh + t);
+            const float kk0 = float(kq.x) * kd, kk1 = float(kq.y) * kd;
+            const float kk2 = float(kq.z) * kd, kk3 = float(kq.w) * kd;
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const float kv = (i == 0) ? kk0 : ((i == 1) ? kk1 : ((i == 2) ? kk2 : kk3));
+                d0 = fma(float(qa0[i]), kv, d0);
+                d1 = fma(float(qa1[i]), kv, d1);
+                d2 = fma(float(qa2[i]), kv, d2);
+            }
+            d0 = simd_sum(d0); d1 = simd_sum(d1); d2 = simd_sum(d2);
+            float bv0, bv1, bv2;
+            m64_attn_gqa_bias(PACK, A.relbiaspack, A.pos - j, rout0, A.tau, lane, bv0, bv1, bv2);
+            const float s0 = d0 * A.scale + f16r(bv0 - snk0);
+            const float s1 = d1 * A.scale + f16r(bv1 - snk1);
+            const float s2 = d2 * A.scale + f16r(bv2 - snk2);
+            const device uchar * vh = vbase + (size_t)slot_idx * 1088ul;
+            const float vd = float(((const device half *)(vh + 128u))[blk]);
+            const char4 vq = *(const device char4 *)(vh + t);
+            m64_attn_q8_acc(s0, vd, vq, oh0, M0, S0);
+            m64_attn_q8_acc(s1, vd, vq, oh1, M1, S1);
+            m64_attn_q8_acc(s2, vd, vq, oh2, M2, S2);
+        }
+    }
+    const uint p0 = h0 * A.n_splits + sp;
+    const uint p1 = (h0 + 1u) * A.n_splits + sp;
+    const uint p2 = (h0 + 2u) * A.n_splits + sp;
+    device float * po0 = SCR + A.part_o_off + p0 * 128u;
+    device float * po1 = SCR + A.part_o_off + p1 * 128u;
+    device float * po2 = SCR + A.part_o_off + p2 * 128u;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        po0[t + i] = oh0[i];
+        po1[t + i] = oh1[i];
+        po2[t + i] = oh2[i];
+    }
+    if (lane == 0u) {
+        SCR[A.part_ms_off + p0 * 2u] = M0;
+        SCR[A.part_ms_off + p0 * 2u + 1u] = S0;
+        SCR[A.part_ms_off + p1 * 2u] = M1;
+        SCR[A.part_ms_off + p1 * 2u + 1u] = S1;
+        SCR[A.part_ms_off + p2 * 2u] = M2;
+        SCR[A.part_ms_off + p2 * 2u + 1u] = S2;
     }
 }
 
@@ -1870,34 +2251,73 @@ kernel void k_gemv_down_reduce8_q5_1_f32in(device float * SCR [[buffer(0)]],
 // Milestone 7A: FP32-input MoE decode kernels, Q8 _m2/_m4 activation-sharing
 // pattern ported to Q4_K / Q5_0 / Q5_1. Every warp of the warp-per-row
 // kernels re-reads the same fp32 activations from SCR; pairing 2 gate/up rows
-// per warp halves that traffic and 4 down rows per warp quarters it. Per-row
-// FMA order, lane block iteration and simd_sum trees are kept identical to
-// the m1 kernels, so outputs are bitwise-equal (parity tests 47-50).
+// per warp halves that traffic and 4 down rows per warp quarters it. m4
+// kernels keep the exact m1 FMA order (bitwise, tests 49/50); the m2 kernels
+// use Milestone 13 factored 2-row inner loops (tolerance-class, tests 47/48).
 // ---------------------------------------------------------------------------
 
-// One 64-elem Q4_K sub-block dot into `a`, verbatim order from
-// k_gemv_gateup_batch8_q4k_f32in (x passed pre-loaded as float4[16]).
-static inline void m64_q4k_sub_dot(const device uchar * b, uint u,
-                                   const device float4 * xv, float & a) {
-    const uint q = m64_ld32(b + 4u), q2 = m64_ld32(b + 8u), q3 = m64_ld32(b + 12u);
-    float d1, m1, d2, m2;
-    m64_scale_min_k4(2u * (u & 3u), q, q2, q3, d1, m1);
-    m64_scale_min_k4(2u * (u & 3u) + 1u, q, q2, q3, d2, m2);
-    const float vd1 = f16b(m64_ld16(b)) * d1, vm1 = f16b(m64_ld16(b + 2u)) * m1;
-    const float vd2 = f16b(m64_ld16(b)) * d2, vm2 = f16b(m64_ld16(b + 2u)) * m2;
-    const device uint * qs = (const device uint *)(b + 16u + (u & 3u) * 32u);
+// Milestone 13: factored 2-row Q4_K sub-block dot. Row 0 (and row 1 when
+// has_r1) share the x float4 loads and the x row-sums; raw nibble dots are
+// accumulated per half and the (d*scale, dm*min) factors are applied once.
+// Reorders FMAs vs m64_q4k_sub_dot (tolerance-class vs m1, test 47/48).
+// 32-bit header loads are aligned: Q4_K blocks are 144 B and all pack
+// offsets/strides are 4 B aligned (pack is 4 KiB aligned).
+static inline void m64_q4k_sub_dot2(const device uchar * b0, const device uchar * b1,
+                                    bool has_r1, uint u, const device float4 * xv,
+                                    float & a0, float & a1) {
+    const device uint * u0 = (const device uint *)b0;
+    const uint h0 = u0[0];
+    const float d0 = f16b(ushort(h0 & 0xFFFFu)), dm0 = f16b(ushort(h0 >> 16));
+    float q1d, q1m, q2d, q2m;
+    m64_scale_min_k4(2u * (u & 3u), u0[1], u0[2], u0[3], q1d, q1m);
+    m64_scale_min_k4(2u * (u & 3u) + 1u, u0[1], u0[2], u0[3], q2d, q2m);
+    const float vd1_0 = d0 * q1d, vm1_0 = dm0 * q1m;
+    const float vd2_0 = d0 * q2d, vm2_0 = dm0 * q2m;
+    float vd1_1 = 0.0f, vm1_1 = 0.0f, vd2_1 = 0.0f, vm2_1 = 0.0f;
+    if (has_r1) {
+        const device uint * u1 = (const device uint *)b1;
+        const uint h1 = u1[0];
+        const float d1 = f16b(ushort(h1 & 0xFFFFu)), dm1 = f16b(ushort(h1 >> 16));
+        m64_scale_min_k4(2u * (u & 3u), u1[1], u1[2], u1[3], q1d, q1m);
+        m64_scale_min_k4(2u * (u & 3u) + 1u, u1[1], u1[2], u1[3], q2d, q2m);
+        vd1_1 = d1 * q1d; vm1_1 = dm1 * q1m;
+        vd2_1 = d1 * q2d; vm2_1 = dm1 * q2m;
+    }
+    const device uint * qs0 = (const device uint *)(b0 + 16u + (u & 3u) * 32u);
+    const device uint * qs1 = (const device uint *)(b1 + 16u + (u & 3u) * 32u);
+    float sq_lo0 = 0.0f, sq_hi0 = 0.0f, sq_lo1 = 0.0f, sq_hi1 = 0.0f;
+    float sx_lo = 0.0f, sx_hi = 0.0f;
     #pragma unroll
     for (uint t = 0u; t < 8u; t++) {
-        const uint v = qs[t];
         const float4 xlo = xv[t], xhi = xv[8u + t];
-        a = fma(fma(vd1, float(v & 0xFu), -vm1), xlo.x, a);
-        a = fma(fma(vd1, float((v >> 8) & 0xFu), -vm1), xlo.y, a);
-        a = fma(fma(vd1, float((v >> 16) & 0xFu), -vm1), xlo.z, a);
-        a = fma(fma(vd1, float((v >> 24) & 0xFu), -vm1), xlo.w, a);
-        a = fma(fma(vd2, float((v >> 4) & 0xFu), -vm2), xhi.x, a);
-        a = fma(fma(vd2, float((v >> 12) & 0xFu), -vm2), xhi.y, a);
-        a = fma(fma(vd2, float((v >> 20) & 0xFu), -vm2), xhi.z, a);
-        a = fma(fma(vd2, float(v >> 28), -vm2), xhi.w, a);
+        sx_lo += (xlo.x + xlo.y) + (xlo.z + xlo.w);
+        sx_hi += (xhi.x + xhi.y) + (xhi.z + xhi.w);
+        const uint v0 = qs0[t];
+        sq_lo0 = fma(float(v0 & 0xFu), xlo.x, sq_lo0);
+        sq_lo0 = fma(float((v0 >> 8) & 0xFu), xlo.y, sq_lo0);
+        sq_lo0 = fma(float((v0 >> 16) & 0xFu), xlo.z, sq_lo0);
+        sq_lo0 = fma(float((v0 >> 24) & 0xFu), xlo.w, sq_lo0);
+        sq_hi0 = fma(float((v0 >> 4) & 0xFu), xhi.x, sq_hi0);
+        sq_hi0 = fma(float((v0 >> 12) & 0xFu), xhi.y, sq_hi0);
+        sq_hi0 = fma(float((v0 >> 20) & 0xFu), xhi.z, sq_hi0);
+        sq_hi0 = fma(float(v0 >> 28), xhi.w, sq_hi0);
+        if (has_r1) {
+            const uint v1 = qs1[t];
+            sq_lo1 = fma(float(v1 & 0xFu), xlo.x, sq_lo1);
+            sq_lo1 = fma(float((v1 >> 8) & 0xFu), xlo.y, sq_lo1);
+            sq_lo1 = fma(float((v1 >> 16) & 0xFu), xlo.z, sq_lo1);
+            sq_lo1 = fma(float((v1 >> 24) & 0xFu), xlo.w, sq_lo1);
+            sq_hi1 = fma(float((v1 >> 4) & 0xFu), xhi.x, sq_hi1);
+            sq_hi1 = fma(float((v1 >> 12) & 0xFu), xhi.y, sq_hi1);
+            sq_hi1 = fma(float((v1 >> 20) & 0xFu), xhi.z, sq_hi1);
+            sq_hi1 = fma(float(v1 >> 28), xhi.w, sq_hi1);
+        }
+    }
+    a0 = fma(vd1_0, sq_lo0, fma(-vm1_0, sx_lo, a0));
+    a0 = fma(vd2_0, sq_hi0, fma(-vm2_0, sx_hi, a0));
+    if (has_r1) {
+        a1 = fma(vd1_1, sq_lo1, fma(-vm1_1, sx_lo, a1));
+        a1 = fma(vd2_1, sq_hi1, fma(-vm2_1, sx_hi, a1));
     }
 }
 
@@ -1931,8 +2351,7 @@ kernel void k_gemv_gateup_batch8_q4k_f32in_m2(device float * SCR [[buffer(0)]],
         const device uchar * b0 = wb + (size_t)r0 * rstride + (u >> 2) * 144u;
         const device uchar * b1 = wb + (size_t)r1 * rstride + (u >> 2) * 144u;
         const device float4 * xv = (const device float4 *)(x + u * 64u);
-        m64_q4k_sub_dot(b0, u, xv, a0);
-        if (r1 != r0) m64_q4k_sub_dot(b1, u, xv, a1);
+        m64_q4k_sub_dot2(b0, b1, (r1 != r0), u, xv, a0, a1);
     }
     a0 = simd_sum(a0); a1 = simd_sum(a1);
     device float * y = SCR + (up ? A.yoff2 : A.yoff) + e * A.nout;
@@ -2074,4 +2493,130 @@ kernel void k_gemv_down_reduce8_q5_1_f32in_m4(device float * SCR [[buffer(0)]],
     if (lane == 1u && rbase + 1u < A.nout) SCR[A.accoff + rbase + 1u] = acc1;
     if (lane == 2u && rbase + 2u < A.nout) SCR[A.accoff + rbase + 2u] = acc2;
     if (lane == 3u && rbase + 3u < A.nout) SCR[A.accoff + rbase + 3u] = acc3;
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 9A: 2-stage parallel MoE down for the Q4_K (Q5_0/Q5_1 weights)
+// decode path, mirroring k_gemv_down_batch8_m2 + k_down_reduce8_conv_add of
+// the Q8_0 path. Stage 1: 2D grid (ceil(nout/16), 8) -> 1,152 TGs of 256 for
+// kNE=2304 (vs the 72-TG single-stage m4), one expert per grid.y, 2 rows per
+// warp sharing the h float4s. Unweighted per-expert FP32 results land in
+// SCR[A.accoff + e * A.nout + row] (the [8][kNE] down_tmp slab) so the fused
+// weighted-reduce + ffnconv + add kernel can consume them directly.
+// Lane block iteration (i = lane, lane+32, ...) and the per-row simd_sum are
+// identical to m64_gemv_q5_row; Milestone 13 factored the d/m/-16 scaling out
+// of the inner loop, so each ea is tolerance-class (mad < 1e-4,
+// cos >= 0.99999) vs the m1/m4 kernels' expert dot (tests 51/52).
+// ---------------------------------------------------------------------------
+
+// Milestone 13: factored 5-bit raw accumulator for the rows2 2-row loop:
+// sq accumulates q(0..31)·x directly; d / m / -16 are applied per block in
+// the caller. Reorders FMAs vs m64_q5_block_dot (tolerance-class parity,
+// tests 51/52).
+static inline void m64_q5_block_acc(uint v, uint qh, uint t,
+                                    const float4 & vlo, const float4 & vhi, float & sq) {
+    #pragma unroll
+    for (uint u = 0u; u < 4u; u++) {
+        const uint jj = 4u * t + u;
+        const float x0 = float(((v >> (8u * u)) & 0xFu) | (((qh >> jj) << 4) & 0x10u));
+        const float x1 = float(((v >> (8u * u + 4u)) & 0xFu) | ((qh >> (jj + 12u)) & 0x10u));
+        if (u == 0u) { sq = fma(x0, vlo.x, sq); sq = fma(x1, vhi.x, sq); }
+        if (u == 1u) { sq = fma(x0, vlo.y, sq); sq = fma(x1, vhi.y, sq); }
+        if (u == 2u) { sq = fma(x0, vlo.z, sq); sq = fma(x1, vhi.z, sq); }
+        if (u == 3u) { sq = fma(x0, vlo.w, sq); sq = fma(x1, vhi.w, sq); }
+    }
+}
+
+// Two Q5_0/Q5_1 rows vs one h slab (Milestone 13 factored): h float4s and the
+// 32-elem x sum are loaded/computed ONCE per block for both rows; raw 5-bit
+// dots are scaled once per block after the t loop. Headers use 2 B aligned
+// ushort loads (Q5_0 blocks are 22 B — NEVER uint-cast them). Lane block
+// iteration (i = lane, lane+32, ...) is unchanged; per-block d/m application
+// keeps magnitude parity with m64_gemv_q5_row (tolerance-class, tests 51/52).
+template <bool Q51>
+static inline void m64_gemv_q5_rows2(const device uchar * w0, const device uchar * w1,
+                                     const device float * h, uint nb, uint lane,
+                                     float & a0, float & a1) {
+    const uint blk = Q51 ? 24u : 22u;
+    for (uint i = lane; i < nb; i += 32u) {
+        const size_t bo = (size_t)i * blk;
+        const device float4 * hlo = (const device float4 *)(h + (size_t)i * 32u);
+        const device ushort * u0 = (const device ushort *)(w0 + bo);
+        const device ushort * u1 = (const device ushort *)(w1 + bo);
+        const float d0 = f16b(u0[0]), d1 = f16b(u1[0]);
+        const float m0 = Q51 ? f16b(u0[1]) : 0.0f;
+        const float m1 = Q51 ? f16b(u1[1]) : 0.0f;
+        const uint qh0 = Q51 ? (uint(u0[2]) | (uint(u0[3]) << 16))
+                             : (uint(u0[1]) | (uint(u0[2]) << 16));
+        const uint qh1 = Q51 ? (uint(u1[2]) | (uint(u1[3]) << 16))
+                             : (uint(u1[1]) | (uint(u1[2]) << 16));
+        const device ushort * q0 = u0 + (Q51 ? 4u : 3u);
+        const device ushort * q1 = u1 + (Q51 ? 4u : 3u);
+        float sh = 0.0f, sq0 = 0.0f, sq1 = 0.0f;
+        #pragma unroll
+        for (uint t = 0u; t < 4u; t++) {
+            const float4 vlo = hlo[t], vhi = hlo[4u + t];   // shared across rows
+            sh += ((vlo.x + vlo.y) + (vlo.z + vlo.w)) + ((vhi.x + vhi.y) + (vhi.z + vhi.w));
+            m64_q5_block_acc(uint(q0[2u * t]) | (uint(q0[2u * t + 1u]) << 16), qh0, t, vlo, vhi, sq0);
+            m64_q5_block_acc(uint(q1[2u * t]) | (uint(q1[2u * t + 1u]) << 16), qh1, t, vlo, vhi, sq1);
+        }
+        if (!Q51) {
+            a0 = fma(d0, fma(-16.0f, sh, sq0), a0);
+            a1 = fma(d1, fma(-16.0f, sh, sq1), a1);
+        } else {
+            a0 = fma(d0, sq0, fma(m0, sh, a0));
+            a1 = fma(d1, sq1, fma(m1, sh, a1));
+        }
+    }
+}
+
+// Stage 1 (Q5_0): expert e = grid.y, warp w = tid>>5 -> rows r0 = (tgx*8+w)*2,
+// r1 = r0+1 (tail clamps reads, guards writes).
+kernel void k_gemv_down_batch8_q5_0_f32in_m2(device float * SCR [[buffer(0)]],
+                                             constant MoeDownQ5F32Args & A [[buffer(1)]],
+                                             const device uchar * PACK [[buffer(2)]],
+                                             uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                             uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    uint e = M64_TGPG.y;
+    uint tid = M64_TITG.x;
+    uint r0 = (M64_TGPG.x * 8u + (tid >> 5)) * 2u;
+    if (r0 >= A.nout) return;
+    uint lane = tid & 31u;
+    const uint exp_id = ((const device uint *)(SCR + A.seloff))[e];
+    const uint slot = A.wtab_off != 0u ? ((const device uint *)(SCR + A.wtab_off))[exp_id] : exp_id;
+    uint r1 = (r0 + 1u < A.nout) ? (r0 + 1u) : r0;
+    const device uchar * wp = PACK + A.woff + (size_t)slot * A.stride;
+    const device float * h = SCR + A.hoff + (size_t)e * A.k;
+    const uint nb = A.k >> 5;
+    const size_t rowb = (size_t)nb * 22ull;
+    float a0 = 0.0f, a1 = 0.0f;
+    m64_gemv_q5_rows2<false>(wp + (size_t)r0 * rowb, wp + (size_t)r1 * rowb, h, nb, lane, a0, a1);
+    a0 = simd_sum(a0); a1 = simd_sum(a1);
+    if (lane == 0u) SCR[A.accoff + e * A.nout + r0] = a0;
+    if (lane == 1u && r0 + 1u < A.nout) SCR[A.accoff + e * A.nout + r1] = a1;
+}
+
+// Same with Q5_1 blocks (24 B, shared min-offset m; no -16 bias).
+kernel void k_gemv_down_batch8_q5_1_f32in_m2(device float * SCR [[buffer(0)]],
+                                             constant MoeDownQ5F32Args & A [[buffer(1)]],
+                                             const device uchar * PACK [[buffer(2)]],
+                                             uint3 M64_TITG [[thread_position_in_threadgroup]],
+                                             uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    uint e = M64_TGPG.y;
+    uint tid = M64_TITG.x;
+    uint r0 = (M64_TGPG.x * 8u + (tid >> 5)) * 2u;
+    if (r0 >= A.nout) return;
+    uint lane = tid & 31u;
+    const uint exp_id = ((const device uint *)(SCR + A.seloff))[e];
+    const uint slot = A.wtab_off != 0u ? ((const device uint *)(SCR + A.wtab_off))[exp_id] : exp_id;
+    uint r1 = (r0 + 1u < A.nout) ? (r0 + 1u) : r0;
+    const device uchar * wp = PACK + A.woff + (size_t)slot * A.stride;
+    const device float * h = SCR + A.hoff + (size_t)e * A.k;
+    const uint nb = A.k >> 5;
+    const size_t rowb = (size_t)nb * 24ull;
+    float a0 = 0.0f, a1 = 0.0f;
+    m64_gemv_q5_rows2<true>(wp + (size_t)r0 * rowb, wp + (size_t)r1 * rowb, h, nb, lane, a0, a1);
+    a0 = simd_sum(a0); a1 = simd_sum(a1);
+    if (lane == 0u) SCR[A.accoff + e * A.nout + r0] = a0;
+    if (lane == 1u && r0 + 1u < A.nout) SCR[A.accoff + e * A.nout + r1] = a1;
 }

@@ -253,3 +253,216 @@ Oracle determinism (`det_run1` vs `det_run2`, 9 steps): `max_abs_diff = 0.0` (bi
 | `router` | `1.174 ms` | `5.1%` | **`-0.290 ms`** | Parallel SIMD `k_router_topk` |
 | `ctrl` | **`0.960 ms`** | **`4.2%`** | **`-2.786 ms` (3.90x)** | Wide-dispatch `k_ctrl_down` + `k_ctrl_up` |
 | `other` | `0.059 ms` | `0.3%` | `0.00 ms` | `k_emb_gather` + prelude/loop `xfer2` |
+
+## 11. Milestone 9A: Q4_K Decode MoE Down — 2-Stage Parallel + Fused Conv/Add (2026-11-26)
+
+`gpu_step()` Q4_K_S decode path (Inkling-2-Mini): the single-stage
+`k_gemv_down_reduce8_q5_{0,1}_f32in_m4` (72 TGs) + separate `k_conv_slot` +
+`k_xfer` chain now has a 2-stage path mirroring the Q8_0 Milestone 7 design,
+gated on `gemv_r3 && !trace_slot` (`M64_GEMV_R3=0` or trace falls back to the
+old chain for A/B):
+
+- Stage 1 `k_gemv_down_batch8_q5_{0,1}_f32in_m2`: grid `((kNE+15)/16, 8)` =
+  (144, 8) = 1,152 TGs × 256, expert parallel on `grid.y`, 2 rows/warp,
+  unweighted per-expert FP32 → `o.down_tmp` `[8][kNE]` slab.
+- Stage 2 `k_down_reduce8_conv_add` (reused from Q8_0): fused top-8 weighted
+  reduce + `ffnconv` 4-tap static conv + `cur += (xin+outv)·kConvStatic` and
+  rs-slot rotation in one dispatch.
+- SCR conflict fix: `k_situ_f32_batch` now writes h in-place into `o.gate2`
+  (per-thread read→write, disjoint threads), freeing `o.down_tmp` for stage 1.
+
+Parity (`test_p2a_kernels` tests 51/52, gates `mad < 1e-4`, `cos ≥ 0.99999`):
+the m2 stage-1 dots are **BITWISE** (`mad = 0`) vs the m1/m4 reference for
+Q5_0/Q5_1 at nout ∈ {2304, 173, 100} — block-iteration order (`i = lane;
+i += 32`) and per-row FMA order were kept identical. Fused chain end-to-end
+also `mad = 0` vs old reduce+conv+add.
+
+Micro-bench (`--bench`, real shapes kNE=2304 / kNF=1152 / top-8, IT=100,
+median of 3 stable runs; the first run of `down_q5_0_old` shows cold-cache
+0.214 ms and is excluded):
+
+| Chain (decode down, per layer-step) | Q5_0 old | Q5_0 **new** | Q5_1 old | Q5_1 **new** |
+|---|---:|---:|---:|---:|
+| reduce + conv + add (ms) | `0.113` | **`0.109`** | `0.117` | **`0.114`** |
+
+~3.5–4% faster end-to-end plus one fewer dispatch (3→2). The gain is modest
+because at real shapes the 72-TG m4 kernel is already weight-bandwidth bound
+(~14.6 MB expert reads dominate); the 1,152-TG grid mainly removes the tail
+that made m4 lose to m1 on small nout (see §Milestone 7A bench) and folds the
+conv/add traffic into one kernel. Decode E2E not re-measured here (Splash
+resident on :8080; >16 GB live-model runs disallowed this milestone).
+
+## 12. Milestone 9B: Batched Prefill Small-Op Kernels (2026-11-26)
+
+`gpu_prefill_batch()` (`engine/src/forward_metal.mm`) previously ran six
+per-token `for (uint32_t b = 0; b < B; b++)` Metal dispatch loops for `xfer2`,
+`do_mix`, and `do_ctrl` across all 48 logical slots (emitting tens of
+thousands of tiny dispatches per `B=128` prefill chunk). Replaced with batched
+`grid.y`/`grid.z` kernel clones in `engine/kernels/m64_prefill.metal` (`bsmall`
+gate; `M64_NO_BSMALL=1` restores the sequential loops for A/B):
+
+- `k_xfer_batch`: batched copy (`c = a`) and add (`a += b`), `npairs <= 2`,
+  independent per-pair strides (`ip % 6 == 0` block-push preserves sequential
+  2-dispatch ordering `cur -> blocks` before `tB -> cur`).
+- `k_mix_rms_batch` + `k_mix_fused_batch`: 2 dispatches replace `2·B` dispatches
+  for `do_mix` across all `B` tokens (via `o.b_stn` scratch).
+- `k_ctrl_down_batch` + `k_ctrl_up_batch`: 2 `k_rms_batch` + 2 batched split
+  dispatches replace `3·B` dispatches for `do_ctrl` (via `o.b_ctrl_gcat` and
+  disjoint per-token `o.b_ctrl_hh` `[kBMax][4][64]`).
+
+Parity (`test_prefill_kernels` §12, `B ∈ {8, 32, 128}`):
+- `k_xfer_batch` (copy, add, `npairs=2`, `n=1000` odd tail): **bitwise** (`0` mismatches).
+- `k_mix_rms_batch` + `k_mix_fused_batch` (`(n=8,nq=1)` & `(n=4,nq=4)`): **bitwise** (`0` mismatches).
+- `k_ctrl_down_batch` + `k_ctrl_up_batch` (`nc ∈ {1, 3}`, `in_row ∈ {0, 2304}`): `cos = 1.00000000`, `mad <= 9.54e-7`.
+
+Micro-bench (`./build/test_prefill_kernels --bench`, `B=128`, `kNE=2304`, `IT=50`, min of 3 passes):
+
+| Op chain (1 call site, `B=128`) | Seq loop | Batched | Speedup |
+|---|---:|---:|---:|
+| `xfer_add` (`128` → `1` disp) | `0.3687 ms` | **`0.0068 ms`** | **54.0x** |
+| `xfer_copy` (`128` → `1` disp) | `0.3628 ms` | **`0.0063 ms`** | **57.3x** |
+| `mix` (`n=8, nq=1`, `256` → `2` disp) | `3.3467 ms` | **`0.0627 ms`** | **53.4x** |
+| `ctrl` (`nc=3`, `384` → `4` disp) | `1.7762 ms` | **`0.5066 ms`** | **3.5x** |
+
+Prefill E2E not re-measured here (Splash resident on :8080; >16 GB live-model runs disallowed).
+
+---
+
+## 13. Milestone 9C: Long-Context Split-K Attention — GQA 3-Head KV Sharing + 128 Splits (2026-11-27)
+
+Inkling-2-Mini decode uses `24` Q heads over `8` KV heads (`GQA 3:1`, `kDH=256`).
+Previously `attn_split_dispatch` launched `24 × n_splits` threadgroups (`kAttnMaxSplits = 32`), reading every `K`/`V` token 3 separate times per split across GPU workgroups.
+Milestone 9C raises `kAttnMaxSplits` to `128` (`1024` TGs max at `pos >= 16384`) and adds 1-warp register GQA 3-head KV sharing (`k_attn_head_f16_split_gqa` / `k_attn_head_q8_split_gqa`, `grid = (8, n_splits, 1)`, rollback env `M64_NO_ATTN_GQA=1`).
+
+- **Parity (`./build/test_prefill_kernels`)**:
+  - `attn_split` (FP16) & `attn_q8split` (Q8_0) across `24h` (`*_split`) and `gqa` (`*_split_gqa`) at `pos=511, 2048, 20000` (including `n_splits=64, 128`), `swa p=2048`, and `empty p=10`: `cos = 1.00000000`, `mad <= 2.09e-07` (FP16) / `<= 1.53e-05` (Q8_0).
+  - `pos=65536` (`gqa8x128` vs `24x32`): Q8_0 `cos = 1.00000000`, `mad = 4.77e-07`; FP16 `cos = 1.00000000`, `mad = 2.24e-08`.
+- **Full suite (`./scripts/check.sh`)**: `ALL PASS`, `196 passed, 0 failed` (`tools/test_server.py`).
+
+| Kernel (`24x32` → `gqa8x128`) | Baseline (`24x32`) | Milestone 9C (`gqa8x128`) | Speedup |
+|---|---:|---:|---:|
+| `attn_q8 pos=20000` | `0.5719 ms` | **`0.2409 ms`** | **2.37x** |
+| `attn_q8 pos=65536` | `1.6513 ms` | **`0.6739 ms`** | **2.45x** |
+| `attn_f16 pos=20000` | `0.5892 ms` | **`0.2594 ms`** | **2.27x** |
+| `attn_f16 pos=65536` | `1.6919 ms` | **`0.7335 ms`** | **2.31x** |
+
+Decode E2E not re-measured here (Splash resident on :8080; >16 GB live-model runs disallowed).
+
+---
+
+## 14. Milestone 10A: Coalesced Zero-Tail Q4_K/Q5 MoE Decode GEMVs — NEGATIVE RESULT (2026-11-27)
+
+Prototyped coalesced zero-tail decode GEMV variants (`_c8_m2` / `_c8_m4`):
+8 lanes per 64-elem chunk (one full 256-elem Q4_K super-block per warp iteration,
+`k=2304` -> 9 exact iterations, 32/32 lanes, 0 tail) and 8 lanes per 32-elem Q5 block
+(4 blocks / warp iteration, `k=1152`, `nb=36` -> 9 exact iterations), with factored
+1-FMA/elem dots (`d*d1*sum(q*x) - dmin*m1*sum(x)` for Q4_K; `d*sum(q*x) + m*sum(x)`
+for Q5_1 / `d*(sum(q*x) - 16*sum(x))` for Q5_0) and x/h register reuse across R rows.
+
+- **Parity**: passed at tolerance class `cos >= 0.99999`, `mad < 1e-4` (factored dots
+  reorder FMAs vs m1/m2); fp64 oracle worst ulp 0.00 for gate|up; zero-x bitwise zero.
+- **Benchmark (M4 Max, `test_p2a_kernels --bench`, real Inkling dims, reproduced 2/2 runs)**:
+
+| Chain | Winner (existing) | c8_m2 | c8_m4 | Verdict |
+|---|---:|---:|---:|---|
+| `gateup_q4k` (real 8x1152) | **m2: 0.201 ms** | 0.305 ms | 0.351 ms | c8 ~1.5x slower |
+| `down_q5_0` (b8+rc chain) | **b8m2+rc: 0.112 ms** | 0.253 ms | 0.254 ms | c8 ~2.2x slower |
+| `down_q5_1` (b8+rc chain) | **b8m2+rc: 0.117 ms** | 0.245 ms | 0.271 ms | c8 ~2.1x slower |
+
+The factored-dot reductions (`sx_lo/sx_hi`/`sh` lane sums) plus the changed warp
+mapping cost more ALU/ILP than the eliminated tail saves; zero-tail coalescing did
+NOT win on M4 Max for these shapes. **Not wired into `gpu_step()`; prototype kernels
+and their tests were removed** (no dead code). Existing m2/m4 decode GEMVs remain
+the shipped path. Milestone 10B (same multi-lane-per-block hypothesis on Q8_0) was skipped in favor of dispatch fusion (Milestone 11).
+
+---
+
+## 15. Milestone 11: Decode Dispatch Fusion — QKV Clip/V-Norm/KV-Write & PostConv+Residual (2026-11-27)
+
+Inkling-2-Mini decode (`gpu_step()`) previously emitted **5 dispatches** per slot for Q/K/Rr clip, V per-head RMS-norm (with `o.emb` staging), and `k_kv_write_{q8,f16}`, plus **2–3 dispatches** per slot for `k_conv_slot(postconv)` + `k_xfer` residual/block-push.
+Milestone 11 fuses both chains (gated behind `M64_NO_FUSE_M11=1` / `!trace_slot && !nanprobe`), eliminating **248 dispatches/token** (`48 × 4` in QKV prep/write + `48 + 8` in postconv+residual):
+
+- `k_qkv_prep_kv_write_{q8,f16}` (`engine/kernels/m64_p2a.metal`): `grid = (64, 1, 1)`, `tg = (32, 1, 1)`, 1 warp per head, zero `threadgroup_barrier`. Warps `0..23` clip `Q` in-place; `24..31` clip `K` in registers and write directly to `KV_K`; `32..39` RMS-norm `V` in registers and write directly to `KV_V` (eliminating `o.emb` staging); `40..63` clip `Rr` in-place.
+- `k_postconv_residual` (`engine/kernels/m64_p2a.metal`): flat `2304 × 128` dispatch folds 4-tap `postconv` + `rs` shift + residual add (`push=0`) or race-free `cur -> blocks[nblk]; cur = y` snapshot (`push=1` on `ip % 6 == 0`).
+
+- **Parity (`./build/test_p2a_kernels`, Tests 53–55)**:
+  - `qkvprep_{q8,f16}` (`clip` and `M64_NOFF`): `Rr`, `KV_K`, `KV_V` all **`mad = 0, cos = 1.00000000`**, `Q` `mad <= 9.54e-07, cos = 1.00000000`.
+  - `postconv_res` (`push=0` & `push=1`): `cur`/`blk`/`rs` exact vs unfused chain, CPU `y` `mad <= 1.19e-07`.
+- **Full suite (`./scripts/check.sh`)**: `ALL PASS`, `196 passed, 0 failed` (`tools/test_server.py`).
+
+| Chain (per slot, M4 Max `--bench`) | Unfused (`old`) | Fused (`new`, `1 disp`) | Speedup |
+|---|---:|---:|---:|
+| `qkvprep_kv_q8` (`5 → 1` disp) | `0.0130 ms` | **`0.0036 ms`** | **3.61x** |
+| `qkvprep_kv_f16` (`5 → 1` disp) | `0.0136 ms` | **`0.0036 ms`** | **3.78x** |
+| `postconv_res push=0` (`2 → 1` disp) | `0.0075 ms` | **`0.0035 ms`** | **2.14x** |
+| `postconv_res push=1` (`3 → 1` disp) | `0.0095 ms` | **`0.0035 ms`** | **2.71x** |
+
+Decode E2E not re-measured here (Splash resident on :8080; >16 GB live-model runs disallowed).
+
+---
+
+## 16. Milestone 13: Factored 2-Row Q4_K/Q5 Decode Inner Loops + Startup Pipeline Pre-Warming (2026-11-27)
+
+Maintained the winning 1-lane-per-chunk `_m2` warp mapping and grids while optimizing inside the 2-row inner loops and removing lazy request-#1 Metal JIT stalls:
+
+- **`m64_q4k_sub_dot2`** (`engine/kernels/m64_p2a.metal`): fused 2-row Q4_K sub-block dot sharing `float4` activation loads and `sx_lo`/`sx_hi` sums across both rows, cutting inner-loop arithmetic to 1 FMA/element (`sq_lo`/`sq_hi`) and applying `(d*scale, -dmin*min)` once per half-block via aligned 32-bit header loads.
+- **`m64_gemv_q5_rows2<Q51>`** (`engine/kernels/m64_p2a.metal`): shared `h` `float4` loads and `sh` block sum across 2 rows via 2B-aligned `ushort` header loads (safe for 22B Q5_0 blocks), folding `-16`/`d`/`m` out of the 32-elem inner loop.
+- **Startup pipeline pre-warm** (`engine/src/forward_metal.mm`): `InklingForwardMetal::Impl::init()` pre-compiles all 22 hot decode Metal pipelines (`kDecodeWarmFns`) at boot so the first request pays zero lazy compilation overhead.
+
+- **Parity (`./build/test_p2a_kernels`, Tests 47–52)**:
+  - `gateup q4k m2` (direct `nout=1152/173` & `wtab 1152`): `mad <= 9.54e-06`, `cos = 1.00000000` vs `m1`.
+  - `down9a` (`q5_0`/`q5_1`, `nout=2304` & tails `173/100`): `mad <= 2.29e-05`, `cos = 1.00000000` vs old chain.
+- **Full suite (`./scripts/check.sh`)**: `ALL PASS`, `232 passed, 0 failed` (`tools/test_server.py`).
+
+| Kernel / Chain (`--bench` w/ concurrent Splash on :8080) | Reference (`m1` / `old`) | Optimized (`m2` / `b8m2+rc`) | Relative Speedup |
+|---|---:|---:|---:|
+| `gateup_q4k (real 8x1152)` | `0.2570 ms` (`m1`) | **`0.1904 ms`** (`m2`) | **1.35x** vs `m1` *(was 1.12x)* |
+| `down_q5_0 (real 2304 chain)` | `0.1484 ms` (`old`) | **`0.1222 ms`** (`b8m2+rc`) | **1.21x** vs `old` *(was 1.04x)* |
+| `down_q5_1 (real 2304 chain)` | `0.1502 ms` (`old`) | **`0.1274 ms`** (`b8m2+rc`) | **1.18x** vs `old` *(was 1.03x)* |
+
+Decode E2E not re-measured here (Splash resident on :8080; >16 GB live-model runs disallowed).
+
+---
+
+## 17. Milestone 14: Cold-Start TTFT & Startup Warmup Elimination (2026-11-27)
+
+Eliminated the main startup / request-#1 latency stalls observed when serving `inkling-2-mini-q4_k_s.m64pack` (16 GB mmap from external NVMe):
+
+1. **Background `mmap` pack page warming (`engine/src/forward_metal.mm`)**:
+   - In full-pack mode (`!arena_mode && file_size >= 1 MiB`), `Impl::init()` spawns `prefetch_thread_` (unless `M64_NO_PREFETCH=1`; `M64_PREFETCH_SYNC=1` forces blocking warm-up) walking 64 MiB chunks with `madvise(..., MADV_WILLNEED)` + touching one volatile byte per 16 KiB macOS arm64 page while checking `stop_prefetch_` every 4 MiB. `~Impl()` stops and joins before `PackReader` unmaps the pack, while `READY` is emitted immediately.
+2. **Startup Prefill Pipeline Pre-Warm (`engine/src/forward_metal.mm`)**:
+   - `Impl::init()` pre-compiles all 22 hot batched prefill Metal pipelines (`kPrefillWarmFns`: `k_emb_gather_batch`, `k_rms_batch`, `k_conv_batch`, `k_clip_batch`, `k_gate_mul_batch`, `k_gemv_f32_batch`, `k_gemm_q8_f32in_sg`, `k_router_topk_batch`, `k_moe_bucket_build`, `k_moe_down_reduce_batch`, `k_kv_write_{q8,f16}_batch`, `k_attn_{q8,f16}_flash_prefill`, `k_attn_head_{q8,f16}_batch`, `k_moe_grouped_f32in_sg*`, `k_softcap`, `k_argmax`) alongside `kDecodeWarmFns` so Request #1 incurs zero lazy Metal JIT stalls.
+3. **Asynchronous `.m64kv` SSD Prefix Save (`engine/src/forward_metal.hpp`, `forward_metal.mm`, `main.cpp`)**:
+   - Extracted `DiskPrefixSnapshot` + `snapshot_disk_prefix()` (RAM-only copy of `rs`, SWA rings, and used `[0..pos)` full-attention KV while GPU is idle). `WARM` captures the snapshot into RAM and delegates `write_disk_prefix_file()` to a joined-on-exit/reload `disk_save_thread`, returning `WARMED <n> computed` without waiting for external SSD I/O.
+4. **BPE Piece Memoization & Unchanged Static-Prefix Fast Path (`tools/bpe_gguf.py`, `tools/takuan_server.py`)**:
+   - Added a 65,536-entry `_piece_cache` in `BPE._encode_piece` and split `format_static_chat_prefix_text()` so `_maybe_warm_static_prefix()` skips both `bpe.encode()` and `worker.warm()` on pure string match (and reuses `last_warm_ids` on `warm_needs_sync`).
+
+- **Verification (`./scripts/check.sh`)**: all native suites (`test_dequant`, `test_gemma4_cpu`, `test_gemma4_metal`, `test_metal_parity`, `test_p2a_kernels`, `test_prefill_kernels`, `test_sampler`, `test_spec_decode`, `test_arena`) passed; `tools/test_server.py` passed **`232 passed, 0 failed (4.5s)`**. Live E2E TTFT not re-measured here (Splash resident on `:8080`; >16 GB live-model runs disallowed).
+
+---
+
+## 18. Milestone 15: Prefill MoE Grouped Kernel Optimization (`Q4_K`, `Q5_0`, `Q5_1`) (2026-11-27)
+
+Optimized `k_moe_grouped_f32in_sg_{q4k,q5_0,q5_1}` in `engine/kernels/m64_prefill.metal` to eliminate redundant header loads, scalarize less, vectorize activation loads, and specialize the dominant small-bucket (`cnt - off <= 16`) case:
+
+1. **Q4_K super-block header hoisting (`m64_q4k_hdr` + `dequant_q4_k_sub_to_tg`)**: Loads the 16 B super-block header (`d`/`dmin` + 12 scale bytes) ONCE per 256-element super-block (`(blk & 7) == 0`) instead of 32× per sub-block, computes all 8 sub-block scales/mins in registers via `m64_scale_min_k4`, and reads nibble bytes via 4 B loads when `wmat` is 4-byte aligned (byte fallback preserved).
+2. **Vectorized, branch-free `Q5_0` / `Q5_1` dequant**:
+   - `dequant_q5_0_tile32x32_to_tg`: 2B-aligned `ushort` loads (preserving alignment safety for 22 B blocks, never casting to `uint*`), hoisted nibble shift and `qh` bit base.
+   - `dequant_q5_1_tile32x32_to_tg`: 4B-aligned `uint` loads for 24 B blocks (byte fallback when misaligned) with branch-free unpack.
+3. **Vectorized `tgX` loader (`m64_fill_tgX_tile`)**: Uses two `float4` loads instead of 8 scalar loads when `(xoff | x_stride) % 4 == 0`, and skips `bcol >= 16` loads in the narrow path.
+4. **Small-bucket `32×16` fast path (`cnt - off <= 16`)**: Each warp owns `8 × 16` (`2` `simdgroup_float8x8` accumulators vs `4`), halving `tgX` loads, MMA ops, and `tgO` store/writeback for the 99%+ of prefill experts with `<= 16` tokens while keeping `32×32` when `cnt - off > 16`.
+
+- **Parity & Suite**:
+  - Updated `engine/tests/test_prefill_kernels.mm` (§10f) with explicit `cnt=16` (`narrow`) and `cnt=17` (`full`) boundary experts alongside `cnt=37` and `cnt=0`; `test_prefill_kernels` **ALL PASS** (12/12 FP64-oracle scenarios, 0 failures).
+  - Clean rebuild from deleted Metal archives + `./scripts/check.sh`: **ALL PASS**, `tools/test_server.py` **`232 passed, 0 failed (4.3s)`**.
+
+### Prefill Microbenchmark (`./build/test_prefill_kernels --bench`, `NEXP=128 slots=16 topk=8 k=2304 nout=1152`, concurrent Splash on `:8080`)
+
+| Format | `B=32` Before (`ms` / `GB/s`) | `B=32` After (`ms` / `GB/s`) | `B=128` Before (`ms` / `GB/s`) | `B=128` After (`ms` / `GB/s`) | `B=128` Speedup (vs `Q8_0`) |
+|---|---:|---:|---:|---:|---|
+| `Q8_0` *(ref)* | `1.9881` (`181.6`) | `1.8756` (`192.5`) | `1.9709` (`183.2`) | `1.8643` (`193.6`) | `1.00x` |
+| **`Q4_K`** | `2.2883` (`83.5`) | **`1.8079`** (`105.7`) | `2.2857` (`83.6`) | **`1.8201`** (`105.0`) | **1.26x** (**`1.02x` vs `Q8_0`**) |
+| **`Q5_0`** | `2.4436` (`95.6`) | **`1.8484`** (`126.4`) | `2.4573` (`95.1`) | **`1.8633`** (`125.4`) | **1.32x** (**`1.00x` vs `Q8_0`**) |
+| **`Q5_1`** | `2.5658` (`99.3`) | **`1.7659`** (`144.3`) | `2.5679` (`99.2`) | **`1.7869`** (`142.6`) | **1.44x** (**`1.04x` vs `Q8_0`**) |
+
+*(Note: Prefill E2E not re-measured here because Splash is resident on `:8080` and >16 GB live-model runs are disallowed.)*

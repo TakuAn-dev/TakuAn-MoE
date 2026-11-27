@@ -17,12 +17,15 @@
 #include "../kernels/m64_p2a_args.h"
 
 #include <cerrno>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <unordered_map>
+#include <sys/mman.h>
 
 #ifndef M64_KERNEL_DIR
 #define M64_KERNEL_DIR "engine/kernels"
@@ -40,10 +43,13 @@ namespace {
 constexpr int kNE = 2304, kNH = 24, kDH = 128, kKVD = 1024, kNREL = 16,
               kNEXP = 128, kTOPK = 8, kNF = 1152, kNPHYS = 24, kNSLOT = 48,
               kCH = 6656, kMAXS = 48, kHR = 3, kBMax = 128, kBBlkMax = 8,
-              kAttnMaxSplits = 32;
+              kAttnMaxSplits = 128;
 constexpr uint32_t kBSpec = 9;  // Milestone 7B: max verify batch (anchor + 8 drafts)
 constexpr uint32_t kPartBytes = 2820096u;  // (1152*2304/32)*34: gate|up|down parts
 constexpr float kConvStatic = 0.447213595499957939281834733746255247f;  // 1/sqrt(5)
+// Milestone 9C A/B switch: M64_NO_ATTN_GQA=1 restores the legacy 24-head
+// split-K attention (3x duplicate KV loads) for speed comparison.
+const bool g_no_attn_gqa = getenv("M64_NO_ATTN_GQA") != nullptr;
 }  // namespace
 
 struct InklingForwardMetal::Impl {
@@ -117,11 +123,23 @@ struct InklingForwardMetal::Impl {
         uint32_t b_gate2, b_ubuf, b_situ, b_down_tmp, b_acc;
         uint32_t b_cnt, b_off, b_list, b_wtab;
         uint32_t b_lgx, b_amax;  // Milestone 7B: per-row verify logits / argmax
+        uint32_t b_stn, b_ctrl_gcat, b_ctrl_hh;  // Milestone 9B: batched mix/ctrl scratch
         uint32_t total = 0;
     } o;
     int prefill_chunk = kBMax;
 
     static uint32_t fo(uint32_t & c, uint32_t n) { uint32_t r = c; c += n; return r; }
+
+    // ---- Milestone 14: background mmap pack page warming -------------------
+    // ~Impl MUST stop+join the prefetch thread BEFORE the PackReader unmaps
+    // the pack: in main.cpp `pk` is declared before `fwd`, so fwd (and this
+    // Impl) is always destructed first while the mapping is still alive.
+    std::atomic<bool> stop_prefetch_{false};
+    std::thread prefetch_thread_;
+    ~Impl() {
+        stop_prefetch_.store(true, std::memory_order_relaxed);
+        if (prefetch_thread_.joinable()) prefetch_thread_.join();
+    }
 
     // ---- Phase 2B arena state (arena_mode only) ----
     bool arena_mode = false;
@@ -434,6 +452,11 @@ struct InklingForwardMetal::Impl {
         o.b_bank = fa(kBMax * kBBlkMax * kNE);
         o.b_prelude_blk = fa(kBMax * kNE);
         o.b_n3 = fa(kBMax * 3 * kNE);
+        // Milestone 9B: per-token mix stn rows + per-token ctrl gcat/hh so
+        // all B tokens run in one dispatch without SCR collisions.
+        o.b_stn = fa(kBMax * (kBBlkMax + 1) * kNE);
+        o.b_ctrl_gcat = fa(kBMax * 6 * kNE);
+        o.b_ctrl_hh = fa(kBMax * 4 * 64u);
         o.b_Q = fa(kBMax * kNH * kDH);
         o.b_K = fa(kBMax * kKVD);
         o.b_V2 = fa(kBMax * kKVD);
@@ -526,6 +549,38 @@ struct InklingForwardMetal::Impl {
         } else {
             packBuf = rt.wrap_external((void *)pack.data(), (size_t)pack.file_size(), @"m64pack");
             if (!packBuf) { err = "metal: wrap_external pack failed"; return false; }
+            // Milestone 14: stream the whole pack into RAM in the background
+            // (madvise WILLNEED + a 16 KiB-page touch per macOS arm64 page) so
+            // the first real touches don't serialize on minor faults. READY is
+            // emitted immediately; M64_PREFETCH_SYNC=1 waits instead, and
+            // M64_NO_PREFETCH=1 disables the thread entirely.
+            if (!arena_mode && !getenv("M64_NO_PREFETCH") &&
+                pack.file_size() >= 1048576) {
+                const uint8_t * base = pack.data();
+                const size_t len = (size_t)pack.file_size();
+                auto warm_pages = [this, base, len]() {
+                    const size_t kChunk = (size_t)64ull * 1024 * 1024;
+                    const size_t kPage = 16384;  // macOS arm64 page size
+                    for (size_t off = 0; off < len; off += kChunk) {
+                        if (stop_prefetch_.load(std::memory_order_relaxed)) return;
+                        size_t n = len - off;
+                        if (n > kChunk) n = kChunk;
+                        madvise((void *)(base + off), n, MADV_WILLNEED);
+                        for (size_t i = 0; i < n; i += kPage) {
+                            // Stop within <=4 MiB (256 pages) of a shutdown request.
+                            if (i && (i % (4ull * 1024 * 1024)) == 0 &&
+                                stop_prefetch_.load(std::memory_order_relaxed))
+                                return;
+                            (void)*(volatile const uint8_t *)(base + off + i);
+                        }
+                    }
+                };
+                if (getenv("M64_PREFETCH_SYNC")) {
+                    warm_pages();
+                } else {
+                    prefetch_thread_ = std::thread(warm_pages);
+                }
+            }
         }
         scr = rt.alloc_shared((size_t)o.total * 4, @"m64-scratch");
         if (!scr) { err = "metal: scratch alloc failed"; return false; }
@@ -536,6 +591,71 @@ struct InklingForwardMetal::Impl {
         }
         fprintf(stderr, "kv cache: %.2f MiB (%s, ctx=%d, swa_ring=%lld)\n",
                 kv_bytes / 1048576.0, kv_q8 ? "Q8_0" : "FP16", ctx, (long long)n_swa + 1);
+        // Milestone 9B: pre-compile the batched small-op kernels so a missing
+        // or uncompilable kernel fails at init() instead of mid-prefill.
+        if (prefill_chunk > 1) {
+            static const char * const kBatchFns[] = {
+                "k_xfer_batch", "k_mix_rms_batch", "k_mix_fused_batch",
+                "k_ctrl_down_batch", "k_ctrl_up_batch"};
+            for (const char * fn : kBatchFns) {
+                if (!rt.pipeline(fn)) {
+                    err = std::string("metal: batch prefill pipeline missing: ") + fn;
+                    return false;
+                }
+            }
+        }
+        // Milestone 13: pre-warm the hot decode pipelines so request #1 after
+        // startup pays zero lazy pipeline-compilation stalls.
+        static const char * const kDecodeWarmFns[] = {
+            "k_gemv_gateup_batch8_q4k_f32in_m2",
+            "k_gemv_down_batch8_q5_0_f32in_m2",
+            "k_gemv_down_batch8_q5_1_f32in_m2",
+            "k_down_reduce8_conv_add",
+            "k_qkv_prep_kv_write_q8",
+            "k_qkv_prep_kv_write_f16",
+            "k_postconv_residual",
+            "k_attn_head_q8_split_gqa",
+            "k_attn_head_f16_split_gqa",
+            "k_attn_head_f16_reduce",
+            "k_gemv_q8_k2304_m2",
+            "k_gemv_q8_k2304_multi_m2",
+            "k_gemv_q8_k3072_m2",
+            "k_gate_mul_quant",
+            "k_rms_quant",
+            "k_mix_fused",
+            "k_ctrl_down",
+            "k_ctrl_up",
+            "k_router_topk",
+            "k_gemv_f32_tg",
+            "k_situ_f32_batch",
+            "k_situ_quant8"};
+        for (const char * fn : kDecodeWarmFns) {
+            if (!rt.pipeline(fn)) {
+                err = std::string("metal: decode pre-warm pipeline missing: ") + fn;
+                return false;
+            }
+        }
+        // Milestone 14: pre-compile all hot prefill pipelines too, so request
+        // #1 pays zero lazy JIT stalls on the batched path.
+        if (prefill_chunk > 1) {
+            static const char * const kPrefillWarmFns[] = {
+                "k_emb_gather_batch", "k_rms_batch", "k_conv_batch", "k_clip_batch",
+                "k_gate_mul_batch", "k_gemv_f32_batch", "k_gemm_q8_f32in_sg",
+                "k_router_topk_batch", "k_moe_bucket_build", "k_moe_down_reduce_batch",
+                "k_kv_write_q8_batch", "k_kv_write_f16_batch",
+                "k_attn_q8_flash_prefill", "k_attn_f16_flash_prefill",
+                "k_attn_head_q8_batch", "k_attn_head_f16_batch",
+                "k_moe_grouped_f32in_sg", "k_moe_grouped_f32in_sg_q4k",
+                "k_moe_grouped_f32in_sg_q5_0", "k_moe_grouped_f32in_sg_q5_1",
+                "k_softcap", "k_argmax"
+            };
+            for (const char * fn : kPrefillWarmFns) {
+                if (!rt.pipeline(fn)) {
+                    err = std::string("metal: prefill pre-warm pipeline missing: ") + fn;
+                    return false;
+                }
+            }
+        }
         reset();
         return true;
     }
@@ -662,45 +782,62 @@ struct InklingForwardMetal::Impl {
     }
 
     // Snapshot rs + SWA rings + the USED 0..pos-1 of every full-attention
-    // slot (never the unused tail up to ctx) into one .m64kv file. GPU-idle
-    // between prefill/step calls, so raw buffer reads are safe.
-    bool save_disk_prefix(const std::string & path, const std::vector<int32_t> & tokens,
-                          std::string & err) const {
+    // slot (never the unused tail up to ctx) into a RAM DiskPrefixSnapshot.
+    // GPU-idle between prefill/step calls, so raw buffer reads are safe.
+    // Milestone 14: zero disk I/O here — the caller may hand the snapshot to
+    // a background writer thread (write_disk_prefix_file).
+    bool snapshot_disk_prefix(const std::string & path, const std::vector<int32_t> & tokens,
+                              DiskPrefixSnapshot & out, std::string & err) const {
         auto fail = [&](const std::string & m) { err = "prefix disk: " + m; return false; };
         if (!scr || !kvBuf) return fail("engine not initialized");
         if (pos <= 0 || pos >= ctx) return fail("pos " + std::to_string(pos) +
                                                 " outside (0," + std::to_string(ctx) + ")");
         if (tokens.size() != (size_t)pos) return fail("tokens.size() != pos");
         const uint16_t * kv = (const uint16_t *)kvBuf.contents;
-        std::vector<uint16_t> swa;
-        swa.reserve(swa_kv_elems());
+        out.path = path;
+        out.tokens = tokens;
+        const size_t rs_n = (size_t)kNSLOT * kCH * kHR;
+        out.rs.resize(rs_n);
+        memcpy(out.rs.data(), (const float *)scr.contents + o.rs, rs_n * sizeof(float));
+        out.swa.clear();
+        out.swa.reserve(swa_kv_elems());
         for (int il = 0; il < kNSLOT; il++) {
             if (!s_swa[il]) continue;
             const size_t n = (size_t)kv_cap[il] * kv_u16_per_pos;
-            swa.insert(swa.end(), kv + kv_k_off[il], kv + kv_k_off[il] + n);
-            swa.insert(swa.end(), kv + kv_v_off[il], kv + kv_v_off[il] + n);
+            out.swa.insert(out.swa.end(), kv + kv_k_off[il], kv + kv_k_off[il] + n);
+            out.swa.insert(out.swa.end(), kv + kv_v_off[il], kv + kv_v_off[il] + n);
         }
-        std::vector<uint16_t> full;
+        out.full.clear();
         for (int il = 0; il < kNSLOT; il++) {
             if (s_swa[il]) continue;
             if (kv_cap[il] < (uint32_t)pos)
                 return fail("full slot " + std::to_string(il) + " cap < pos");
             const size_t n = (size_t)pos * kv_u16_per_pos;
-            full.insert(full.end(), kv + kv_k_off[il], kv + kv_k_off[il] + n);
-            full.insert(full.end(), kv + kv_v_off[il], kv + kv_v_off[il] + n);
+            out.full.insert(out.full.end(), kv + kv_k_off[il], kv + kv_k_off[il] + n);
+            out.full.insert(out.full.end(), kv + kv_v_off[il], kv + kv_v_off[il] + n);
         }
-        DiskPrefixHeader hdr{};
+        DiskPrefixHeader & hdr = out.hdr;
+        hdr = DiskPrefixHeader{};
         memcpy(hdr.magic, "M64K", 4);
         hdr.version = 1;
         hdr.n_tokens = (uint32_t)pos;
         hdr.n_swa_ring = swa_ring_cap();
         hdr.pack_fp = pack_fp;
         hdr.rs_floats = (uint64_t)kNSLOT * kCH * kHR;
-        hdr.swa_u16 = (uint64_t)swa.size();
-        hdr.full_u16 = (uint64_t)full.size();
-        const float * rs = (const float *)scr.contents + o.rs;
-        if (!write_disk_prefix_file(path, hdr, tokens.data(), rs,
-                                    swa.data(), full.data(), err))
+        hdr.swa_u16 = (uint64_t)out.swa.size();
+        hdr.full_u16 = (uint64_t)out.full.size();
+        err.clear();
+        return true;
+    }
+
+    // One-shot snapshot + .m64kv write (sync path; main.cpp's WARM handler
+    // uses snapshot_disk_prefix + a background writer thread instead).
+    bool save_disk_prefix(const std::string & path, const std::vector<int32_t> & tokens,
+                          std::string & err) const {
+        DiskPrefixSnapshot snap;
+        if (!snapshot_disk_prefix(path, tokens, snap, err)) return false;
+        if (!write_disk_prefix_file(snap.path, snap.hdr, snap.tokens.data(), snap.rs.data(),
+                                    snap.swa.data(), snap.full.data(), err))
             return false;
         err.clear();
         return true;
@@ -771,6 +908,10 @@ struct InklingForwardMetal::Impl {
         const bool gemv_m2 = (getenv("M64_NO_M2") == nullptr);
         const bool gemv_r3 = !(getenv("M64_GEMV_R3") && strcmp(getenv("M64_GEMV_R3"), "0") == 0);
         const bool gemv_r4 = !(getenv("M64_GEMV_R4") && strcmp(getenv("M64_GEMV_R4"), "0") == 0);
+        // Milestone 11: fuse clip(Q)+clip(K)+rms(V)+clip(Rr)+kv_write (5 -> 1)
+        // and postconv+residual (2 -> 1). trace_slot/nanprobe keep the
+        // unfused chain so per-dispatch fault attribution still works.
+        const bool fuse_m11 = (getenv("M64_NO_FUSE_M11") == nullptr) && !trace_slot && !nanprobe;
         const bool profile = (getenv("M64_PROFILE") != nullptr) && !arena_mode && pos == 5;
         enum ProfCat { P_OTHER = 0, P_MIX, P_CTRL, P_QKV, P_ATTN, P_WO, P_ROUTER, P_GATEUP, P_DOWN, P_LMHEAD, P_NCAT };
         double prof_ms[P_NCAT] = {};
@@ -1103,6 +1244,38 @@ struct InklingForwardMetal::Impl {
             }
             // --- clips / head norms ---
             prof_flush(P_QKV);
+            const uint32_t ring_idx = is_swa ? ((uint32_t)pos % kv_cap[il]) : (uint32_t)pos;
+            const uint64_t dstk = kv_k_off[il] + (uint64_t)ring_idx * kv_u16_per_pos;
+            const uint64_t dstv = kv_v_off[il] + (uint64_t)ring_idx * kv_u16_per_pos;
+            if (fuse_m11) {
+                // Milestone 11: ONE dispatch replaces clip(Q)+clip(K)+
+                // rms(V)+clip(Rr)+k_kv_write_{q8,f16}. K clip uses M64_NOFF
+                // scale; V rms writes straight into KV (no o.emb staging).
+                QkvPrepKvArgs qa{};
+                qa.qclip_off = L.qclip; qa.relclip_off = L.relclip;
+                qa.dst_k = dstk; qa.dst_v = dstv;
+                qa.qoff = o.Q; qa.koff = o.K; qa.voff = o.V2; qa.roff = o.Rr;
+                qa.qk_thresh = f_qk_clip; qa.rel_thresh = f_rel_clip; qa.eps = f_eps;
+                qa.pad0 = 0u;
+                const char * fn = kv_q8 ? "k_qkv_prep_kv_write_q8"
+                                        : "k_qkv_prep_kv_write_f16";
+                id<MTLComputePipelineState> p = rt.pipeline(fn);
+                if (!p) { err = std::string("pipeline ") + fn; }
+                else {
+                    [en setComputePipelineState:p];
+                    [en setBuffer:scr offset:0 atIndex:0];
+                    [en setBytes:&qa length:sizeof(qa) atIndex:1];
+                    [en setBuffer:curPack offset:0 atIndex:2];
+                    [en setBuffer:kvBuf offset:0 atIndex:3];
+                    [en dispatchThreadgroups:MTLSizeMake(64, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    cur_disp++;
+                }
+                if (!gemv_r3) {
+                    if (L.wsink_f32) gemvf32(o.sinkb, kNH, kNE, o.qsrc, L.wsink);
+                    else gemv2304(o.sinkb, kNH, o.xqA, o.dxA, L.wsink);
+                }
+            } else {
             clip(o.Q, L.qclip, kNH, kDH, f_qk_clip);
             clip(o.K, M64_NOFF, kKVD / kDH, kDH, f_qk_clip);
             // V per-head rmsnorm (in-place unsafe on GPU): stage via o.emb (consumed long ago)
@@ -1119,11 +1292,9 @@ struct InklingForwardMetal::Impl {
                 else gemv2304(o.sinkb, kNH, o.xqA, o.dxA, L.wsink);
             }
             if (err.empty()) {
-                const uint32_t ring_idx = is_swa ? ((uint32_t)pos % kv_cap[il]) : (uint32_t)pos;
                 KVWriteF16Args kw{
                     o.K, o.emb, kKVD, 0u,
-                    kv_k_off[il] + (uint64_t)ring_idx * kv_u16_per_pos,
-                    kv_v_off[il] + (uint64_t)ring_idx * kv_u16_per_pos,
+                    dstk, dstv,
                 };
                 // Milestone 5B: Q8_0 writes 8 KV heads x (32 lanes x char4).
                 const bool wq8 = kv_q8;
@@ -1144,12 +1315,18 @@ struct InklingForwardMetal::Impl {
                     cur_disp++;
                 }
             }
+            }  // !fuse_m11 (unfused clip/rms/kv-write chain)
             // --- attention ---
             if (err.empty()) {
                 const uint32_t n_tok = is_swa
                     ? (uint32_t)std::min<int64_t>(pos + 1, (int64_t)n_swa + 1)
                     : (uint32_t)(pos + 1);
                 if (n_tok >= 512u) {
+                    // Milestone 9C: GQA 3-head KV-shared split-K dispatches
+                    // grid (8, n_splits, 1); M64_NO_ATTN_GQA=1 falls back to
+                    // the legacy 24-head kernels. 128-token chunks scale the
+                    // split count smoothly to the 128-split cap at 16k tok.
+                    const bool attn_gqa = !g_no_attn_gqa;
                     const uint32_t n_splits = std::min<uint32_t>(
                         (uint32_t)kAttnMaxSplits, (n_tok + 127u) / 128u);
                     AttnF16SplitArgs sa{};
@@ -1166,7 +1343,10 @@ struct InklingForwardMetal::Impl {
                     sa.pad0 = 0u;
                     sa.scale = 1.0f / sqrtf((float)kDH);
                     sa.tau = is_swa ? 1.0f : tau_v;
-                    const char * sn = kv_q8 ? "k_attn_head_q8_split" : "k_attn_head_f16_split";
+                    const char * sn = attn_gqa
+                        ? (kv_q8 ? "k_attn_head_q8_split_gqa"
+                                 : "k_attn_head_f16_split_gqa")
+                        : (kv_q8 ? "k_attn_head_q8_split" : "k_attn_head_f16_split");
                     id<MTLComputePipelineState> ps = rt.pipeline(sn);
                     id<MTLComputePipelineState> pr = rt.pipeline("k_attn_head_f16_reduce");
                     if (!ps || !pr) {
@@ -1178,7 +1358,8 @@ struct InklingForwardMetal::Impl {
                         [en setBytes:&sa length:sizeof(sa) atIndex:1];
                         [en setBuffer:curPack offset:0 atIndex:2];
                         [en setBuffer:kvBuf offset:0 atIndex:3];
-                        [en dispatchThreadgroups:MTLSizeMake(kNH, n_splits, 1)
+                        [en dispatchThreadgroups:
+                             MTLSizeMake(attn_gqa ? kKVD / kDH : kNH, n_splits, 1)
                             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                         [en setComputePipelineState:pr];
                         [en setBuffer:scr offset:0 atIndex:0];
@@ -1227,6 +1408,19 @@ struct InklingForwardMetal::Impl {
                 quant(o.attnb, o.xqD, o.dxD, 96);
             }
             gemv3072(o.tA, kNE, o.xqD, o.dxD, L.wo);
+            if (fuse_m11) {
+                // Milestone 11: k_postconv_residual folds k_conv_slot +
+                // k_xfer into ONE dispatch (per-channel ownership makes the
+                // cur read/modify/write race-free).
+                PostConvResArgs pa{
+                    L.postconv,
+                    o.rs + ((uint32_t)il * (uint32_t)kCH + 2u * kKVD) * kHR,
+                    o.tA, o.cur,
+                    o.blocks + (uint32_t)st.nblk * kNE,
+                    kNE, (uint32_t)((ip % 6 == 0) ? 1 : 0), kConvStatic, 0u};
+                d_th("k_postconv_residual", kNE, 128, &pa, sizeof(pa));
+                if (ip % 6 == 0) st.nblk++;
+            } else {
             conv(il, 2 * kKVD, kNE, o.tA, o.tB, L.postconv, 0, kNE, kConvStatic);
             if (ip % 6 == 0) {
                 // Two sequential dispatches: reading o.cur while threadgroup 1
@@ -1237,6 +1431,7 @@ struct InklingForwardMetal::Impl {
             } else {
                 xfer2(o.cur, o.tB, 0, kNE, 0, 0, 0, 0, 0);
             }
+            }  // !fuse_m11 (unfused postconv+residual chain)
             prof_flush(P_WO);
             // --- FFN ---
             do_mix(o.blocks, st.nblk, o.cur, L.ffnq, 1, o.mixed);
@@ -1294,24 +1489,45 @@ struct InklingForwardMetal::Impl {
                     if (arena_mode) curPack = expertBuf;
                     if (gemv_m2) d_tg("k_gemv_gateup_batch8_q4k_f32in_m2", (kTOPK * kNF + 7) / 8, 1, 256, &g4, sizeof(g4));
                     else d_tg("k_gemv_gateup_batch8_q4k_f32in", (kTOPK * 2 * kNF + 7) / 8, 1, 256, &g4, sizeof(g4));
-                    SituF32BatchArgs sf{o.gate2, o.ubuf, o.down_tmp, kNF, kNF, kNF, kNF, kTOPK,
+                    // Milestone 9A: SITU writes h back into o.gate2 IN-PLACE
+                    // (k_situ_f32_batch reads (goff,p,i)/(uoff,p,i) then writes
+                    // (hoff,p,i) from the same thread, so hoff==goff with equal
+                    // strides is element-safe). This frees o.down_tmp
+                    // ([8][kNE]) for the 2-stage parallel down stage 1.
+                    SituF32BatchArgs sf{o.gate2, o.ubuf, o.gate2, kNF, kNF, kNF, kNF, kTOPK,
                                         situ_beta, situ_lb, 1.0f / situ_beta, 1.0f / situ_lb};
                     d_th2("k_situ_f32_batch", kNF, kTOPK, 128, &sf, sizeof(sf));
                     prof_flush(P_GATEUP);
                     MoeDownQ5F32Args md{arena_mode ? (unsigned long)L.moe_off[2] : (unsigned long)(L.experts + L.moe_off[2]),
-                                        o.down_tmp, o.acc, o.wgt, seloff, 0u, 0u,
+                                        o.gate2, o.acc, o.wgt, seloff, 0u, 0u,
                                         kNE, kNF, (unsigned int)mst, 0u};
-                    if (gemv_m2)
-                        d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in_m4"
-                                                        : "k_gemv_down_reduce8_q5_0_f32in_m4",
-                             (kNE + 31) / 32, 1, 256, &md, sizeof(md));
-                    else
-                        d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in"
-                                                        : "k_gemv_down_reduce8_q5_0_f32in",
-                             (kNE + 7) / 8, 1, 256, &md, sizeof(md));
-                    if (arena_mode) curPack = residentBuf;
-                    conv(il, 2 * kKVD + kNE, kNE, o.acc, o.tA, L.ffnconv, 0, kNE, kConvStatic);
-                    xfer2(o.cur, o.tA, 0, kNE, 0, 0, 0, 0, 0);
+                    if (gemv_r3 && !trace_slot) {
+                        // 2-stage: (144,8)=1,152 TGs of 256 unweighted per-expert
+                        // GEMV into down_tmp, then fused weighted reduce + ffnconv
+                        // + add (mirrors the Q8_0 k_gemv_down_batch8_m2 path).
+                        md.accoff = o.down_tmp;
+                        d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_batch8_q5_1_f32in_m2"
+                                                        : "k_gemv_down_batch8_q5_0_f32in_m2",
+                             (kNE + 15) / 16, kTOPK, 256, &md, sizeof(md));
+                        if (arena_mode) curPack = residentBuf;   // ffnconv lives in residentBuf
+                        DownReduceConvArgs drc{o.down_tmp, o.wgt,
+                                               o.rs + ((uint32_t)il * (uint32_t)kCH + (uint32_t)(2 * kKVD + kNE)) * kHR,
+                                               o.cur, L.ffnconv, kNE, kConvStatic};
+                        d_th("k_down_reduce8_conv_add", kNE, 128, &drc, sizeof(drc));
+                    } else {
+                        // A/B fallback: single-stage 72-TG reduce + separate conv/add.
+                        if (gemv_m2)
+                            d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in_m4"
+                                                            : "k_gemv_down_reduce8_q5_0_f32in_m4",
+                                 (kNE + 31) / 32, 1, 256, &md, sizeof(md));
+                        else
+                            d_tg(L.moe_dt[2] == DType::Q5_1 ? "k_gemv_down_reduce8_q5_1_f32in"
+                                                            : "k_gemv_down_reduce8_q5_0_f32in",
+                                 (kNE + 7) / 8, 1, 256, &md, sizeof(md));
+                        if (arena_mode) curPack = residentBuf;
+                        conv(il, 2 * kKVD + kNE, kNE, o.acc, o.tA, L.ffnconv, 0, kNE, kConvStatic);
+                        xfer2(o.cur, o.tA, 0, kNE, 0, 0, 0, 0, 0);
+                    }
                     prof_flush(P_DOWN);
                 } else {
                 GemvArgs gu{arena_mode ? 0ul : L.experts,
@@ -1615,6 +1831,65 @@ struct InklingForwardMetal::Impl {
             ClipBatchArgs A{soff, coff, cs, groups, per, B, 0u, thresh};
             d_tg("k_clip_batch", groups, B, 128, &A, sizeof(A));
         };
+        // ---- Milestone 9B: batched xfer / mix / ctrl (replace per-token for(b)) ----
+        // The batch kernels mirror k_mix_fused (r3) and the k_ctrl split path (r4),
+        // so keep the sequential loops when those fallbacks are active.
+        const bool bsmall = !getenv("M64_NO_BSMALL") && !getenv("M64_NO_GEMV_R3") &&
+                            !getenv("M64_NO_GEMV_R4");
+        auto d_tg3 = [&](const char * fn, uint tgx, uint tgy, uint tgz, uint nth,
+                         const void * a, size_t sz) {
+            disp(fn, true, MTLSizeMake(tgx, tgy, tgz), MTLSizeMake(nth, 1, 1), a, sz, curPack);
+        };
+        // is_copy=1: SCR[c + b*c_stride] = SCR[a + b*a_stride]; else a += b (k_xfer shape).
+        auto xfer_b = [&](bool is_copy, uint32_t a0, uint32_t a_s, uint32_t b0, uint32_t b_s,
+                          uint32_t c0, uint32_t c_s, uint32_t n) {
+            XferBatchArgs A{};
+            A.a[0] = a0; A.b[0] = b0; A.c[0] = c0; A.n[0] = n;
+            A.a_stride[0] = a_s; A.b_stride[0] = b_s; A.c_stride[0] = c_s;
+            A.B = B; A.npairs = 1u; A.is_copy = is_copy ? 1u : 0u;
+            d_tg3("k_xfer_batch", (n + 255u) / 256u, B, 1u, 256, &A, sizeof(A));
+        };
+        // Batched do_mix: rows r<n read newest-first blocks, row n = extra.
+        auto do_mix_b = [&](uint32_t states, uint32_t st_stride, int n, uint32_t extra,
+                            uint32_t ex_stride, uint64_t qpack, int nq,
+                            uint32_t out, uint32_t out_stride) {
+            const uint32_t stn_stride = (uint32_t)(kBBlkMax + 1) * kNE;
+            MixRmsBatchArgs ra{states, st_stride, extra, ex_stride,
+                               o.b_stn, stn_stride, (uint32_t)n, B, kNE, 0u};
+            d_tg("k_mix_rms_batch", (uint32_t)(n + 1), B, 256, &ra, sizeof(ra));
+            MixFusedBatchArgs ma{};
+            ma.qpack = qpack; ma.stnoff = o.b_stn; ma.stn_stride = stn_stride;
+            ma.outoff = out; ma.out_stride = out_stride;
+            ma.S = (uint32_t)(n + 1); ma.nq = (uint32_t)nq; ma.B = B;
+            ma.scale = 1.0f / sqrtf((float)kNE);
+            d_tg("k_mix_fused_batch", (uint32_t)nq, B, 256, &ma, sizeof(ma));
+        };
+        // Batched do_ctrl: two rms passes write per-token gcat pairs, then
+        // down/up read a per-token hh region (never the shared o.ctrl_hh).
+        auto do_ctrl_b = [&](uint32_t in0, uint32_t in_stride, uint32_t in_row,
+                             uint32_t msg0, uint32_t msg_stride, uint32_t msg_row,
+                             uint32_t out0, uint32_t out_stride, uint32_t out_row,
+                             const uint64_t * wd, const uint64_t * wg, const uint64_t * wf, int nc) {
+            const uint32_t gcstr = (uint32_t)(2u * (uint32_t)nc * kNE);
+            rms_b(0ull, in0, in_stride, in_row, o.b_ctrl_gcat, gcstr, 2u * kNE,
+                  M64_NOFFU, M64_NOFFU, 0u, 0u, kNE, (uint32_t)nc, 0u, 0u, 1e-6f);
+            rms_b(0ull, msg0, msg_stride, msg_row, o.b_ctrl_gcat + kNE, gcstr, 2u * kNE,
+                  M64_NOFFU, M64_NOFFU, 0u, 0u, kNE, (uint32_t)nc, 0u, 0u, 1e-6f);
+            CtrlBatchSplitArgs A{};
+            for (int j = 0; j < nc; j++) {
+                A.in[j] = in0 + (uint32_t)j * in_row;
+                A.msg[j] = msg0 + (uint32_t)j * msg_row;
+                A.out[j] = out0 + (uint32_t)j * out_row;
+                A.wdown[j] = wd[j]; A.wgain[j] = wg[j]; A.wforg[j] = wf[j];
+            }
+            A.in_stride = in_stride; A.msg_stride = msg_stride; A.out_stride = out_stride;
+            A.gcat = o.b_ctrl_gcat; A.gcat_stride = gcstr;
+            A.hh = o.b_ctrl_hh; A.hh_stride = 4u * 64u;
+            A.grank = 64u; A.ne = kNE; A.nc = (uint32_t)nc; A.B = B;
+            A.eps = 1e-6f;
+            d_tg3("k_ctrl_down_batch", 64u, (uint32_t)nc, B, 256, &A, sizeof(A));
+            d_tg3("k_ctrl_up_batch", (kNE + 31u) / 32u, (uint32_t)nc, B, 32, &A, sizeof(A));
+        };
 
         struct { int nblk; } st = {0};
         auto batch_slot = [&](int il, int ip, const LL * lp) {
@@ -1622,24 +1897,37 @@ struct InklingForwardMetal::Impl {
             const bool is_swa = s_swa[il];
             // --- attn inputs ---
             if (L.aquery) {
-                for (uint32_t b = 0; b < B; b++)
-                    do_mix(o.b_blocks + b * kBlkStride, st.nblk, o.b_cur + b * kNE,
-                           L.aquery, L.nq_rows, o.b_mixed + b * (3 * kNE));
+                if (bsmall)
+                    do_mix_b(o.b_blocks, kBlkStride, st.nblk, o.b_cur, kNE,
+                             L.aquery, L.nq_rows, o.b_mixed, 3 * kNE);
+                else
+                    for (uint32_t b = 0; b < B; b++)
+                        do_mix(o.b_blocks + b * kBlkStride, st.nblk, o.b_cur + b * kNE,
+                               L.aquery, L.nq_rows, o.b_mixed + b * (3 * kNE));
                 bprof_flush(BP_MIX);
             } else {
-                for (uint32_t b = 0; b < B; b++)
-                    xfer2(o.b_cur + b * kNE, 0, o.b_mixed + b * (3 * kNE), kNE, 0, 0, 0, 0, 1);
+                if (bsmall)
+                    xfer_b(true, o.b_cur, kNE, 0u, 0u, o.b_mixed, 3 * kNE, kNE);
+                else
+                    for (uint32_t b = 0; b < B; b++)
+                        xfer2(o.b_cur + b * kNE, 0, o.b_mixed + b * (3 * kNE), kNE, 0, 0, 0, 0, 1);
                 bprof_flush(BP_OTHER);
             }
             if (lp) {
-                for (uint32_t b = 0; b < B; b++) {
-                    uint32_t in3[3], msgp[3], outp[3];
-                    for (int j = 0; j < 3; j++) {
-                        in3[j]  = o.b_mixed + b * (3 * kNE) + (is_swa ? 0u : (uint32_t)j * kNE);
-                        msgp[j] = o.b_msgs + b * (4 * kNE) + (uint32_t)j * kNE;
-                        outp[j] = o.b_ctrlout + b * (3 * kNE) + (uint32_t)j * kNE;
+                if (bsmall) {
+                    do_ctrl_b(o.b_mixed, 3 * kNE, is_swa ? 0u : kNE,
+                              o.b_msgs, 4 * kNE, kNE,
+                              o.b_ctrlout, 3 * kNE, kNE, lp->down, lp->gain, lp->forg, 3);
+                } else {
+                    for (uint32_t b = 0; b < B; b++) {
+                        uint32_t in3[3], msgp[3], outp[3];
+                        for (int j = 0; j < 3; j++) {
+                            in3[j]  = o.b_mixed + b * (3 * kNE) + (is_swa ? 0u : (uint32_t)j * kNE);
+                            msgp[j] = o.b_msgs + b * (4 * kNE) + (uint32_t)j * kNE;
+                            outp[j] = o.b_ctrlout + b * (3 * kNE) + (uint32_t)j * kNE;
+                        }
+                        do_ctrl(in3, msgp, outp, lp->down, lp->gain, lp->forg, 3);
                     }
-                    do_ctrl(in3, msgp, outp, lp->down, lp->gain, lp->forg, 3);
                 }
                 bprof_flush(BP_CTRL);
             }
@@ -1734,30 +2022,50 @@ struct InklingForwardMetal::Impl {
                 if (st.nblk >= kBBlkMax) {
                     err = "metal: batch block stack overflow";
                 } else {
-                    for (uint32_t b = 0; b < B; b++) {
-                        xfer2(o.b_cur + b * kNE, 0, o.b_blocks + b * kBlkStride + (uint32_t)st.nblk * kNE,
-                              kNE, 0, 0, 0, 0, 1);
-                        xfer2(o.b_tB + b * kNE, 0, o.b_cur + b * kNE, kNE, 0, 0, 0, 0, 1);
+                    if (bsmall) {
+                        // Order preserved by separate dispatches: cur -> blocks
+                        // must finish before tB -> cur overwrites cur.
+                        xfer_b(true, o.b_cur, kNE, 0u, 0u,
+                               o.b_blocks + (uint32_t)st.nblk * kNE, kBlkStride, kNE);
+                        xfer_b(true, o.b_tB, kNE, 0u, 0u, o.b_cur, kNE, kNE);
+                    } else {
+                        for (uint32_t b = 0; b < B; b++) {
+                            xfer2(o.b_cur + b * kNE, 0, o.b_blocks + b * kBlkStride + (uint32_t)st.nblk * kNE,
+                                  kNE, 0, 0, 0, 0, 1);
+                            xfer2(o.b_tB + b * kNE, 0, o.b_cur + b * kNE, kNE, 0, 0, 0, 0, 1);
+                        }
                     }
                     st.nblk++;
                 }
             } else {
-                for (uint32_t b = 0; b < B; b++)
-                    xfer2(o.b_cur + b * kNE, o.b_tB + b * kNE, 0, kNE, 0, 0, 0, 0, 0);
+                if (bsmall)
+                    xfer_b(false, o.b_cur, kNE, o.b_tB, kNE, o.b_cur, kNE, kNE);
+                else
+                    for (uint32_t b = 0; b < B; b++)
+                        xfer2(o.b_cur + b * kNE, o.b_tB + b * kNE, 0, kNE, 0, 0, 0, 0, 0);
             }
             bprof_flush(BP_WO);
 
             // --- FFN ---
-            for (uint32_t b = 0; b < B; b++)
-                do_mix(o.b_blocks + b * kBlkStride, st.nblk, o.b_cur + b * kNE,
-                       L.ffnq, 1, o.b_mixed + b * (3 * kNE));
+            if (bsmall)
+                do_mix_b(o.b_blocks, kBlkStride, st.nblk, o.b_cur, kNE, L.ffnq, 1, o.b_mixed, 3 * kNE);
+            else
+                for (uint32_t b = 0; b < B; b++)
+                    do_mix(o.b_blocks + b * kBlkStride, st.nblk, o.b_cur + b * kNE,
+                           L.ffnq, 1, o.b_mixed + b * (3 * kNE));
             bprof_flush(BP_MIX);
             if (lp) {
-                for (uint32_t b = 0; b < B; b++) {
-                    uint32_t in1 = o.b_mixed + b * (3 * kNE);
-                    uint32_t msg1 = o.b_msgs + b * (4 * kNE) + 3 * kNE;
-                    uint32_t out1 = o.b_ctrlout + b * (3 * kNE);
-                    do_ctrl(&in1, &msg1, &out1, lp->down + 3, lp->gain + 3, lp->forg + 3, 1);
+                if (bsmall) {
+                    do_ctrl_b(o.b_mixed, 3 * kNE, 0u, o.b_msgs + 3 * kNE, 4 * kNE, 0u,
+                              o.b_ctrlout, 3 * kNE, 0u,
+                              lp->down + 3, lp->gain + 3, lp->forg + 3, 1);
+                } else {
+                    for (uint32_t b = 0; b < B; b++) {
+                        uint32_t in1 = o.b_mixed + b * (3 * kNE);
+                        uint32_t msg1 = o.b_msgs + b * (4 * kNE) + 3 * kNE;
+                        uint32_t out1 = o.b_ctrlout + b * (3 * kNE);
+                        do_ctrl(&in1, &msg1, &out1, lp->down + 3, lp->gain + 3, lp->forg + 3, 1);
+                    }
                 }
                 bprof_flush(BP_CTRL);
             }
@@ -1913,8 +2221,11 @@ struct InklingForwardMetal::Impl {
             }
             conv_b((uint32_t)il, 2 * kKVD + kNE, kNE, o.b_acc, kNE, o.b_tA, kNE,
                    L.ffnconv, 0u, 0u, kNE, kConvStatic);
-            for (uint32_t b = 0; b < B; b++)
-                xfer2(o.b_cur + b * kNE, o.b_tA + b * kNE, 0, kNE, 0, 0, 0, 0, 0);
+            if (bsmall)
+                xfer_b(false, o.b_cur, kNE, o.b_tA, kNE, o.b_cur, kNE, kNE);
+            else
+                for (uint32_t b = 0; b < B; b++)
+                    xfer2(o.b_cur + b * kNE, o.b_tA + b * kNE, 0, kNE, 0, 0, 0, 0, 0);
             bprof_flush(BP_DOWN);
         };
 
@@ -1930,9 +2241,14 @@ struct InklingForwardMetal::Impl {
         // --- Prelude (0..5), Core loop (3 x 6..17), Coda (18..23) ---
         for (int ip = 0; ip < 6; ip++) batch_slot(ip, ip, nullptr);
         if (st.nblk != 1 && err.empty()) err = "metal: unexpected batch prelude block count";
-        for (uint32_t b = 0; b < B; b++)
-            xfer2(o.b_cur + b * kNE, 0, o.b_prelude_out + b * kNE, kNE,
-                  o.b_blocks + b * kBlkStride, 0, o.b_prelude_blk + b * kNE, kNE, 1);
+        if (bsmall) {
+            xfer_b(true, o.b_cur, kNE, 0u, 0u, o.b_prelude_out, kNE, kNE);
+            xfer_b(true, o.b_blocks, kBlkStride, 0u, 0u, o.b_prelude_blk, kNE, kNE);
+        } else {
+            for (uint32_t b = 0; b < B; b++)
+                xfer2(o.b_cur + b * kNE, 0, o.b_prelude_out + b * kNE, kNE,
+                      o.b_blocks + b * kBlkStride, 0, o.b_prelude_blk + b * kNE, kNE, 1);
+        }
         bprof_flush(BP_OTHER);
         int npre = st.nblk;
         for (int pass = 0; pass < 3; pass++) {
@@ -1940,13 +2256,22 @@ struct InklingForwardMetal::Impl {
             if (pass > 0) {
                 nbank = st.nblk - 2;
                 if ((nbank < 0 || nbank > kBBlkMax) && err.empty()) err = "metal: batch bank stack bounds";
-                for (uint32_t b = 0; b < B; b++) {
+                if (bsmall) {
                     if (nbank > 0)
-                        xfer2(o.b_blocks + b * kBlkStride + 2 * kNE, 0,
-                              o.b_bank + b * kBlkStride, (uint32_t)nbank * kNE, 0, 0, 0, 0, 1);
-                    xfer2(o.b_cur + b * kNE, 0, o.b_bank_out + b * kNE, kNE, 0, 0, 0, 0, 1);
-                    xfer2(o.b_prelude_out + b * kNE, 0, o.b_cur + b * kNE, kNE, 0, 0, 0, 0, 1);
-                    xfer2(o.b_prelude_blk + b * kNE, 0, o.b_blocks + b * kBlkStride, kNE, 0, 0, 0, 0, 1);
+                        xfer_b(true, o.b_blocks + 2 * kNE, kBlkStride, 0u, 0u,
+                               o.b_bank, kBlkStride, (uint32_t)nbank * kNE);
+                    xfer_b(true, o.b_cur, kNE, 0u, 0u, o.b_bank_out, kNE, kNE);
+                    xfer_b(true, o.b_prelude_out, kNE, 0u, 0u, o.b_cur, kNE, kNE);
+                    xfer_b(true, o.b_prelude_blk, kNE, 0u, 0u, o.b_blocks, kBlkStride, kNE);
+                } else {
+                    for (uint32_t b = 0; b < B; b++) {
+                        if (nbank > 0)
+                            xfer2(o.b_blocks + b * kBlkStride + 2 * kNE, 0,
+                                  o.b_bank + b * kBlkStride, (uint32_t)nbank * kNE, 0, 0, 0, 0, 1);
+                        xfer2(o.b_cur + b * kNE, 0, o.b_bank_out + b * kNE, kNE, 0, 0, 0, 0, 1);
+                        xfer2(o.b_prelude_out + b * kNE, 0, o.b_cur + b * kNE, kNE, 0, 0, 0, 0, 1);
+                        xfer2(o.b_prelude_blk + b * kNE, 0, o.b_blocks + b * kBlkStride, kNE, 0, 0, 0, 0, 1);
+                    }
                 }
                 st.nblk = npre;
                 bprof_flush(BP_OTHER);
@@ -1955,9 +2280,13 @@ struct InklingForwardMetal::Impl {
                 int il = pass == 0 ? ip : 24 + (pass - 1) * 12 + (ip - 6);
                 if (pass > 0) {
                     const LL & lp = loop[s_loop[il]];
-                    for (uint32_t b = 0; b < B; b++)
-                        do_mix(o.b_bank + b * kBlkStride, nbank, o.b_bank_out + b * kNE,
-                               lp.msgq, 4, o.b_msgs + b * (4 * kNE));
+                    if (bsmall)
+                        do_mix_b(o.b_bank, kBlkStride, nbank, o.b_bank_out, kNE,
+                                 lp.msgq, 4, o.b_msgs, 4 * kNE);
+                    else
+                        for (uint32_t b = 0; b < B; b++)
+                            do_mix(o.b_bank + b * kBlkStride, nbank, o.b_bank_out + b * kNE,
+                                   lp.msgq, 4, o.b_msgs + b * (4 * kNE));
                     bprof_flush(BP_MIX);
                 }
                 batch_slot(il, ip, pass > 0 ? &loop[s_loop[il]] : nullptr);
@@ -2146,6 +2475,12 @@ bool InklingForwardMetal::save_disk_prefix(const std::string & path,
                                            const std::vector<int32_t> & tokens,
                                            std::string & err) const {
     return impl_ ? impl_->save_disk_prefix(path, tokens, err) : false;
+}
+bool InklingForwardMetal::snapshot_disk_prefix(const std::string & path,
+                                               const std::vector<int32_t> & tokens,
+                                               DiskPrefixSnapshot & out,
+                                               std::string & err) const {
+    return impl_ ? impl_->snapshot_disk_prefix(path, tokens, out, err) : false;
 }
 bool InklingForwardMetal::load_disk_prefix(const std::string & path,
                                            PrefixState & out_ram_state,

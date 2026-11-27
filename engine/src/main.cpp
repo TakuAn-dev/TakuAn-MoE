@@ -17,7 +17,10 @@
 //
 // With --worker the process initializes the model once, prints
 // "READY vocab=<n> ctx=<n>" on stdout, then serves a line protocol on stdin:
-//   GEN <max_tokens> <temp> <top_p> <seed> <eos_csv> -- <id0> <id1> ...
+//   GEN <max_tokens> <temp> <top_p> <seed> <eos_csv> [k=v ...] -- <id0> <id1> ...
+//   (optional k=v before "--": presence_penalty, frequency_penalty,
+//    repetition_penalty (>0), penalty_last_n (>=0); legacy lines without
+//    them keep working bit-for-bit unchanged)
 //   WARM [-- ]<id0> <id1> ...        (pin a static prefix; replies WARMED ...)
 //   QUIT
 // Protocol output (stdout): "TOK <id>", "DONE <n> <ms> <finish>"
@@ -52,6 +55,8 @@
 #include <signal.h>
 #include <sstream>
 #include <string>
+#include <functional>
+#include <thread>
 #include <vector>
 
 #include "forward.hpp"
@@ -431,6 +436,18 @@ int main(int argc, char ** argv) {
                          stashed_state.tokens.size(), mib);
         };
         std::string line;
+        // Milestone 14: the .m64kv save runs on this background thread so
+        // WARM replies immediately after the in-RAM snapshot. Every exit
+        // path (QUIT, EOF, early return) joins it via JoinGuard, and any
+        // disk LOAD / re-save joins before touching the same file.
+        std::thread disk_save_thread;
+        auto join_disk_save = [&]() {
+            if (disk_save_thread.joinable()) disk_save_thread.join();
+        };
+        struct JoinGuard {
+            const std::function<void()> & join_fn;
+            ~JoinGuard() { join_fn(); }
+        } join_guard{join_disk_save};
         while (std::getline(std::cin, line)) {
             size_t b = line.find_first_not_of(" \t\r\n");
             if (b == std::string::npos) continue;  // empty / whitespace-only
@@ -491,8 +508,10 @@ int main(int argc, char ** argv) {
                 }
                 // SSD persistent prefix cache: one .m64kv per (pack, tokens).
                 // A hit restores pos + rs + SWA rings + used full KV bit-for-bit
-                // in a single read — no prefill at all.
+                // in a single read — no prefill at all. Join any in-flight
+                // background save first so a reload never races its .tmp write.
                 if (!cache_dir.empty() && fwd.supports_prefix_cache()) {
+                    join_disk_save();
                     const std::string dpath =
                         m64::prefix_cache_path(cache_dir, fwd.metal.pack_fingerprint(), ids);
                     std::error_code dec;
@@ -538,10 +557,30 @@ int main(int argc, char ** argv) {
                     if (!cache_dir.empty() && fwd.supports_prefix_cache()) {
                         const std::string dpath =
                             m64::prefix_cache_path(cache_dir, fwd.metal.pack_fingerprint(), ids);
+                        join_disk_save();
+                        // Snapshot into RAM while the GPU is idle (~15 ms for a
+                        // 381 MB prefix), then stream to the SSD in the
+                        // background so WARMED is emitted without waiting.
+                        m64::DiskPrefixSnapshot snap;
                         std::string d_err;
-                        if (fwd.metal.save_disk_prefix(dpath, ids, d_err)) {
-                            std::fprintf(stderr, "prefix cache: saved %zu tokens to SSD (%s)\n",
-                                         ids.size(), dpath.c_str());
+                        if (fwd.metal.snapshot_disk_prefix(dpath, ids, snap, d_err)) {
+                            disk_save_thread = std::thread(
+                                [snap = std::move(snap)]() {
+                                    std::string werr;
+                                    if (m64::write_disk_prefix_file(snap.path, snap.hdr,
+                                                                    snap.tokens.data(),
+                                                                    snap.rs.data(),
+                                                                    snap.swa.data(),
+                                                                    snap.full.data(), werr)) {
+                                        std::fprintf(stderr,
+                                                     "prefix cache: saved %zu tokens to SSD (%s)\n",
+                                                     snap.tokens.size(), snap.path.c_str());
+                                    } else {
+                                        std::fprintf(stderr,
+                                                     "prefix cache: disk save skipped (%s)\n",
+                                                     werr.c_str());
+                                    }
+                                });
                         } else {
                             std::fprintf(stderr, "prefix cache: disk save skipped (%s)\n",
                                          d_err.c_str());
@@ -556,14 +595,27 @@ int main(int argc, char ** argv) {
                 std::fflush(stdout);
                 continue;
             }
-            // GEN <max_tokens> <temp> <top_p> <seed> <eos_csv> -- <ids>
+            // GEN <max_tokens> <temp> <top_p> <seed> <eos_csv> [k=v ...] -- <ids>
             g_cancel_gen = 0;
             int max_tokens = 0;
             float temp = 0.0f, top_p = 0.0f;
             unsigned long long seed = 0;
-            std::string eos_csv, dash;
-            if (!(iss >> max_tokens >> temp >> top_p >> seed >> eos_csv >> dash) ||
-                dash != "--" || max_tokens < 1 || temp < 0.0f ||
+            std::string eos_csv, tok_str;
+            SamplerPenalties pen;
+            bool gen_bad = false;
+            if (!(iss >> max_tokens >> temp >> top_p >> seed >> eos_csv)) {
+                gen_bad = true;
+            } else {
+                // Optional key=value penalty tokens between <eos_csv> and "--".
+                // Legacy lines hit "--" on the first read (unchanged behavior).
+                while (!gen_bad && (iss >> tok_str)) {
+                    if (tok_str == "--") break;
+                    if (sampler_parse_penalty_opt(tok_str, pen) != 1)
+                        gen_bad = true;
+                }
+                if (tok_str != "--") gen_bad = true;  // also covers missing "--"
+            }
+            if (gen_bad || max_tokens < 1 || temp < 0.0f ||
                 !(top_p > 0.0f && top_p <= 1.0f)) {
                 std::printf("ERR bad_command\n");
                 std::fflush(stdout);
@@ -697,6 +749,7 @@ int main(int argc, char ** argv) {
             m64::SpecStats spec_stats;
             m64::SpecController spec_ctrl;
             const bool spec_on = spec_K > 0 && temp == 0.0f &&
+                                 !pen.active() &&
                                  fwd.supports_prefix_cache();
             if (spec_on) {
                 std::vector<int32_t> hist = prompt;   // invariant: tokens in engine
@@ -796,7 +849,14 @@ int main(int argc, char ** argv) {
             } else {
             for (int k = 0; k < limit; k++) {
                 if (g_cancel_gen) { finish = "cancelled"; break; }
-                int32_t tok = sample_token(r.logits, vocab, temp, top_p, r.argmax, rng);
+                // processed = prompt + emitted tokens: the penalty sampler
+                // windows it to the last pen.last_n ids itself. With all
+                // penalties off this is the exact original sample_token call.
+                int32_t tok = pen.active()
+                    ? sample_token_penalized(r.logits, vocab, temp, top_p,
+                                             r.argmax, rng, processed.data(),
+                                             (int64_t)processed.size(), pen)
+                    : sample_token(r.logits, vocab, temp, top_p, r.argmax, rng);
                 if (eos_set.count(tok)) { finish = "stop"; break; }
                 std::printf("TOK %d\n", tok);
                 std::fflush(stdout);

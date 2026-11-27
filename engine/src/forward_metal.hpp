@@ -10,6 +10,7 @@
 
 #include "forward.hpp"   // StepResult
 #include "pack_reader.hpp"
+#include "prefix_disk.hpp"  // DiskPrefixHeader (DiskPrefixSnapshot, Milestone 14)
 
 namespace m64 {
 
@@ -28,6 +29,18 @@ struct PrefixState {
     // the same per-slot K-then-V order as the .m64kv `full` array. Stays
     // EMPTY for normal in-place LRU checkpoints -> zero extra overhead there.
     std::vector<uint16_t> full_kv;
+};
+
+// Milestone 14: an in-RAM .m64kv snapshot (header + every payload array) that
+// snapshot_disk_prefix() captures synchronously while the GPU is idle, so the
+// slow SSD write can run on a background thread (see main.cpp WARM handler).
+struct DiskPrefixSnapshot {
+    std::string path;
+    DiskPrefixHeader hdr{};
+    std::vector<int32_t> tokens;
+    std::vector<float> rs;
+    std::vector<uint16_t> swa;
+    std::vector<uint16_t> full;
 };
 
 class InklingForwardMetal {
@@ -82,6 +95,12 @@ public:
     // rings + used 0..pos-1 of every full-attention slot, xxh64-guarded).
     bool save_disk_prefix(const std::string & path, const std::vector<int32_t> & tokens,
                           std::string & err) const;
+    // Milestone 14: same snapshot as save_disk_prefix, but captured into RAM
+    // (DiskPrefixSnapshot) with ZERO disk I/O, so the caller can hand the
+    // bytes to a background writer thread. Requires GPU-idle between
+    // prefill/step calls, like save_prefix_state.
+    bool snapshot_disk_prefix(const std::string & path, const std::vector<int32_t> & tokens,
+                              DiskPrefixSnapshot & out, std::string & err) const;
     // Restore the whole warmed state IN-ENGINE (kvBuf + o.rs + pos) and hand
     // back the same state as a RAM PrefixState. False -> file invalid/corrupt.
     bool load_disk_prefix(const std::string & path, PrefixState & out_ram_state,

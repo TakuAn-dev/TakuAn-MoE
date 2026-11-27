@@ -1678,6 +1678,568 @@ def test_sse_tcp_nodelay():
         srv.close()
 
 
+# --------------------------------------------------------------------------
+# 12. Milestone 8B: sampling penalties (presence/frequency/repetition) and
+#     the --default-temp / --default-presence-penalty server flags.
+# --------------------------------------------------------------------------
+GEN_LOG_WORKER = r'''
+import os, sys
+log = os.environ["GEN_LOG"]
+sys.stdout.write("READY vocab=4 ctx=64\n"); sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line or line.strip() == "QUIT":
+        break
+    if line.startswith("GEN"):
+        with open(log, "a") as f:
+            f.write(line.rstrip("\n") + "\n")
+        sys.stdout.write("DONE 0 1.0 stop\n"); sys.stdout.flush()
+    elif line.startswith("WARM"):
+        sys.stdout.write("WARMED 0 computed\n"); sys.stdout.flush()
+    else:
+        sys.stdout.write("ERR bad_command\n"); sys.stdout.flush()
+'''
+
+
+def _pen_server(tmp, fix, gen_log, extra_args):
+    """Start takuan_server with the GEN-logging mock worker; return (proc, port)."""
+    mock_py = os.path.join(tmp, "gen_log_worker.py")
+    with open(mock_py, "w") as f:
+        f.write(GEN_LOG_WORKER)
+    stub_dir = os.path.join(tmp, "stubpkg")
+    os.makedirs(stub_dir, exist_ok=True)
+    with open(os.path.join(stub_dir, "bpe_gguf.py"), "w") as f:
+        f.write(STUB_BPE_SRC)
+    free = socket.socket()
+    free.bind(("127.0.0.1", 0))
+    port = free.getsockname()[1]
+    free.close()
+    env = dict(os.environ, PYTHONPATH=HERE, GEN_LOG=gen_log)
+    boot = ("import sys; sys.path.insert(0, %r); import bpe_gguf; "
+            "import takuan_server; takuan_server.main()" % stub_dir)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", boot,
+         "--worker-cmd", sys.executable + " " + mock_py,
+         "--gguf", os.path.join(fix, "tiny.gguf"),
+         "--port", str(port), "--ctx", "64"] + list(extra_args),
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env, text=True)
+    ready = proc.stderr.readline()
+    check("penalty server starts (%s)" % (extra_args[0] if extra_args else "plain"),
+          "serving" in ready, ready.strip())
+    return proc, port
+
+
+def _read_gen_lines(path):
+    try:
+        with open(path) as f:
+            return [l.rstrip("\n") for l in f if l.startswith("GEN")]
+    except OSError:
+        return []
+
+
+def test_penalties(fix):
+    print("[12] Sampling penalties + --default-temp/--default-presence-penalty")
+    import takuan_server
+
+    # ---- CLI surface ------------------------------------------------------
+    help_res = subprocess.run(
+        [sys.executable, os.path.join(HERE, "takuan_server.py"), "--help"],
+        capture_output=True, text=True)
+    check("takuan_server exposes --default-temp",
+          help_res.returncode == 0 and "--default-temp" in help_res.stdout,
+          help_res.returncode)
+    check("takuan_server exposes --default-presence-penalty",
+          help_res.returncode == 0
+          and "--default-presence-penalty" in help_res.stdout,
+          help_res.returncode)
+
+    # ---- EngineWorker GEN line format (direct, no HTTP) --------------------
+    tmp0 = tempfile.mkdtemp(prefix="takuan_pen_")
+    gen_log0 = os.path.join(tmp0, "gen.log")
+    mock_py = os.path.join(tmp0, "gen_log_worker.py")
+    with open(mock_py, "w") as f:
+        f.write(GEN_LOG_WORKER)
+    saved_env = os.environ.get("GEN_LOG")
+    os.environ["GEN_LOG"] = gen_log0
+    ew = takuan_server.EngineWorker(None, None, "metal", 64, 0.0, "pread",
+                                    worker_cmd=sys.executable + " " + mock_py)
+    list(ew.generate([1, 2, 3], 4, 0.0, 0.95, 0, []))
+    legacy = _read_gen_lines(gen_log0)
+    p = legacy[-1].split() if legacy else []
+    check("no-penalty GEN line keeps legacy layout",
+          p[:2] == ["GEN", "4"] and p[6] == "--"
+          and not any("=" in x for x in p), legacy)
+    list(ew.generate([1, 2, 3], 4, 0.0, 0.95, 0, [],
+                     presence_penalty=0.5, frequency_penalty=-0.25,
+                     repetition_penalty=1.05, penalty_last_n=128))
+    kv = _read_gen_lines(gen_log0)[-1]
+    kp = kv.split()
+    di = kp.index("--") if "--" in kp else -1
+    check("penalty k=v sit between eos and --",
+          "presence_penalty=0.5" in kp and "frequency_penalty=-0.25" in kp
+          and "repetition_penalty=1.05" in kp and "penalty_last_n=128" in kp
+          and di > 0 and any("=" in x for x in kp[:di])
+          and kp[di + 1] == "1", kv)
+    ew.close()
+    if saved_env is None:
+        del os.environ["GEN_LOG"]
+    else:
+        os.environ["GEN_LOG"] = saved_env
+
+    # ---- HTTP: body penalties forwarded, defaults applied ------------------
+    tmp = tempfile.mkdtemp(prefix="takuan_pen_http_")
+    gen_log = os.path.join(tmp, "gen.log")
+    proc, port = _pen_server(tmp, fix, gen_log, [])
+    base = "http://127.0.0.1:%d" % port
+    msg = {"model": "stub", "messages": [{"role": "user", "content": "hi"}],
+           "max_tokens": 4}
+    try:
+        st, raw, _ = http("POST", base + "/v1/chat/completions", dict(msg))
+        check("plain chat 200 (penalty server)", st == 200, raw[:120])
+        st, raw, _ = http("POST", base + "/v1/chat/completions",
+                          dict(msg, temperature=0.8, presence_penalty=1.5,
+                               frequency_penalty=0.5, repetition_penalty=1.1))
+        check("penalty chat 200", st == 200, raw[:120])
+        st, raw, _ = http("POST", base + "/v1/chat/completions",
+                          dict(msg, presence_penalty=5.0))
+        check("out-of-range presence clamped (200)", st == 200, raw[:120])
+        st, raw, _ = http("POST", base + "/v1/chat/completions",
+                          dict(msg, presence_penalty=0.0, repetition_penalty=0.0,
+                               frequency_penalty=-1.0))
+        check("explicit 0.0 penalties pass through (200)", st == 200, raw[:120])
+        lines = _read_gen_lines(gen_log)
+        ok = len(lines) >= 4
+        check("4 GEN lines logged", ok, len(lines))
+        if ok:
+            p0 = lines[0].split()
+            check("body without penalties keeps legacy GEN layout",
+                  p0[6] == "--" and not any("=" in x for x in p0), lines[0])
+            p1 = lines[1].split()
+            check("body penalties forwarded verbatim",
+                  p1[2] == "0.8" and "presence_penalty=1.5" in p1
+                  and "frequency_penalty=0.5" in p1
+                  and "repetition_penalty=1.1" in p1
+                  and p1.index("--") == 6 + 3, lines[1])
+            check("presence_penalty clamped to 2.0",
+                  "presence_penalty=2.0" in lines[2].split(), lines[2])
+            p3 = lines[3].split()
+            check("repetition_penalty=0.0 treated as disabled",
+                  "repetition_penalty=0.0" not in lines[3]
+                  and "presence_penalty=0.0" not in lines[3]
+                  and "frequency_penalty=-1.0" in p3, lines[3])
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    # ---- defaults from server flags ----------------------------------------
+    tmp2 = tempfile.mkdtemp(prefix="takuan_pen_def_")
+    gen_log2 = os.path.join(tmp2, "gen.log")
+    proc2, port2 = _pen_server(tmp2, fix, gen_log2,
+                               ["--default-temp", "0.7",
+                                "--default-presence-penalty", "0.3"])
+    base2 = "http://127.0.0.1:%d" % port2
+    try:
+        st, raw, _ = http("POST", base2 + "/v1/chat/completions", dict(msg))
+        check("default-flag server chat 200", st == 200, raw[:120])
+        st, raw, _ = http("POST", base2 + "/v1/chat/completions",
+                          dict(msg, temperature=0.0, presence_penalty=0.0))
+        check("explicit 0.0 beats server defaults (200)", st == 200, raw[:120])
+        lines = _read_gen_lines(gen_log2)
+        ok2 = len(lines) >= 2
+        check("2 GEN lines logged (defaults server)", ok2, len(lines))
+        if ok2:
+            q0 = lines[0].split()
+            check("--default-temp applied to GEN line",
+                  q0[2] == "0.7" and "presence_penalty=0.3" in q0, lines[0])
+            q1 = lines[1].split()
+            check("explicit temperature/presence 0.0 override the flags",
+                  q1[2] == "0.0" and not any("=" in x for x in q1), lines[1])
+    finally:
+        proc2.terminate()
+        try:
+            proc2.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc2.kill()
+
+
+# --------------------------------------------------------------------------
+# 13-16. Milestone 12: multi-turn agentic workflow integration tests
+#        (tool-calling + prefix reuse, interrupt/RAM-stash recovery, and
+#        SSE streaming + sampler-penalty forwarding, all through the HTTP API)
+# --------------------------------------------------------------------------
+AGENTIC_MOCK_WORKER = r'''
+import os, sys
+sys.path.insert(0, os.environ["TOOL_STUB_DIR"])
+from bpe_gguf import BPE
+b = BPE()
+TOOLCALL = (
+    '<|content_thinking|>need ls<|end_message|>'
+    '<|message_model|><|content_text|>Running tool.<|end_message|>'
+    '<|message_model|>run<|content_invoke_tool_json|>'
+    '{"name":"run","args":{"cmd":"ls"}}<|end_message|>'
+    '<|content_model_end_sampling|>')
+FINAL = '<|content_text|>Done. 3 entries<|content_model_end_sampling|>'
+tool_seq = b.encode(TOOLCALL)
+final_seq = b.encode(FINAL)
+gen_log = os.environ["AGENT_GEN_LOG"]
+warm_log = os.environ["AGENT_WARM_LOG"]
+# Worker-side KV prefix cache: keep recently WARMed prefixes (LRU-ish set);
+# re-warming an already-cached prefix answers "cached" like real m64run.
+warmed = []
+def warm_note(n, kind):
+    with open(warm_log, "a") as f:
+        f.write("%d %s\n" % (n, kind))
+sys.stdout.write("READY vocab=%d ctx=2048\n" % len(b.tokens)); sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line or line.strip() == "QUIT":
+        break
+    parts = line.split()
+    if parts[0] == "WARM":
+        ids = [p for p in parts[1:] if p != "--"]
+        kind = "cached" if ids in warmed else "computed"
+        warmed.append(ids)
+        del warmed[:-4]
+        warm_note(len(ids), kind)
+        sys.stdout.write("WARMED %d %s\n" % (len(ids), kind)); sys.stdout.flush()
+        continue
+    if parts[0] != "GEN":
+        sys.stdout.write("ERR bad_command\n"); sys.stdout.flush(); continue
+    with open(gen_log, "a") as f:
+        f.write(line.rstrip("\n") + "\n")
+    di = parts.index("--")
+    ids = parts[di + 1:]
+    eos_set = set(int(x) for x in parts[5].split(",") if x not in ("-1", "none"))
+    n = int(parts[1])
+    # A tool RESULT turn (Inkling tool marker present) -> final answer;
+    # otherwise the agent declares a tool call.
+    seq = final_seq if "<|message_tool|>" in b.decode([int(i) for i in ids]) \
+        else tool_seq
+    em = 0
+    for tid in seq:
+        if tid in eos_set:
+            sys.stdout.write("DONE %d 5.0 stop\n" % em); sys.stdout.flush()
+            break
+        if em >= n:
+            sys.stdout.write("DONE %d 5.0 length\n" % em); sys.stdout.flush()
+            break
+        sys.stdout.write("TOK %d\n" % tid); sys.stdout.flush()
+        em += 1
+    else:
+        sys.stdout.write("DONE %d 5.0 length\n" % em); sys.stdout.flush()
+'''
+
+
+class _M12Server:
+    """takuan_server + AGENTIC_MOCK_WORKER with GEN/WARM call logs."""
+
+    def __init__(self, fix, tag):
+        self.tmp = tempfile.mkdtemp(prefix="takuan_m12_%s_" % tag)
+        mock_py = os.path.join(self.tmp, "agentic_worker.py")
+        with open(mock_py, "w") as f:
+            f.write(AGENTIC_MOCK_WORKER)
+        stub_dir = os.path.join(self.tmp, "stubpkg")
+        os.makedirs(stub_dir, exist_ok=True)
+        with open(os.path.join(stub_dir, "bpe_gguf.py"), "w") as f:
+            f.write(TOOL_STUB_BPE_SRC)
+        self.gen_log = os.path.join(self.tmp, "gen.log")
+        self.warm_log = os.path.join(self.tmp, "warm.log")
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        self.port = free.getsockname()[1]
+        free.close()
+        env = dict(os.environ, PYTHONPATH=HERE, TOOL_STUB_DIR=stub_dir,
+                   AGENT_GEN_LOG=self.gen_log, AGENT_WARM_LOG=self.warm_log)
+        boot = ("import sys; sys.path.insert(0, %r); import bpe_gguf; "
+                "import takuan_server; takuan_server.main()" % stub_dir)
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", boot,
+             "--worker-cmd", sys.executable + " " + mock_py,
+             "--gguf", os.path.join(fix, "tiny.gguf"),
+             "--port", str(self.port), "--ctx", "2048"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
+            text=True)
+        ready = self.proc.stderr.readline()
+        check("[%s] agentic server starts" % tag, "serving" in ready,
+              ready.strip())
+        self.base = "http://127.0.0.1:%d" % self.port
+
+    def gen_ids(self):
+        """prompt-token id lists, one per GEN call, in order."""
+        try:
+            with open(self.gen_log) as f:
+                return [l.split()[l.split().index("--") + 1:]
+                        for l in f if l.startswith("GEN")]
+        except OSError:
+            return []
+
+    def gen_lines(self):
+        try:
+            with open(self.gen_log) as f:
+                return [l.rstrip("\n") for l in f if l.startswith("GEN")]
+        except OSError:
+            return []
+
+    def warm_calls(self):
+        try:
+            with open(self.warm_log) as f:
+                return [tuple(l.split()) for l in f if l.strip()]
+        except OSError:
+            return []
+
+    def close(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "run",
+        "description": "Execute command",
+        "parameters": {"type": "object",
+                       "properties": {"cmd": {"type": "string"}}},
+    },
+}]
+
+
+# ---- 13. multi-turn tool calling + static-prefix (WARM) cache reuse -------
+def test_m12_multiturn_tool_prefix(fix):
+    print("[13] M12: multi-turn tool-calling + prefix-cache reuse")
+    srv = _M12Server(fix, "mt")
+    try:
+        turn1 = [{"role": "system", "content": "B" * 600},
+                 {"role": "user", "content": "List dir"}]
+        st, raw, _ = http("POST", srv.base + "/v1/chat/completions", {
+            "messages": turn1, "tools": TOOLS, "max_tokens": 512})
+        j = json.loads(raw)
+        check("turn1 200", st == 200, raw[:120])
+        ch = j["choices"][0]
+        check("turn1 finish_reason tool_calls", ch["finish_reason"] == "tool_calls", ch)
+        tc = ch["message"]["tool_calls"][0]
+        check("turn1 tool_call name+args",
+              tc["function"]["name"] == "run"
+              and json.loads(tc["function"]["arguments"]) == {"cmd": "ls"}, tc)
+        pt1 = j["usage"]["prompt_tokens"]
+
+        # Turn 2: append the assistant tool_calls message + the tool result
+        # under the SAME system+tools static prefix.
+        turn2 = turn1 + [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": tc["id"], "type": "function",
+                             "function": {"name": "run",
+                                          "arguments": '{"cmd": "ls"}'}}]},
+            {"role": "tool", "tool_call_id": tc["id"], "content": "README.md"},
+        ]
+        st, raw, _ = http("POST", srv.base + "/v1/chat/completions", {
+            "messages": turn2, "tools": TOOLS, "max_tokens": 512})
+        j2 = json.loads(raw)
+        check("turn2 200 valid completion", st == 200
+              and j2.get("object") == "chat.completion"
+              and j2["choices"][0]["message"]["role"] == "assistant", raw[:120])
+        check("turn2 consumed tool result -> final answer",
+              j2["choices"][0]["message"]["content"] == "Done. 3 entries"
+              and j2["choices"][0]["finish_reason"] == "stop",
+              j2["choices"][0])
+        pt2 = j2["usage"]["prompt_tokens"]
+        check("turn2 prompt_tokens grew past turn1 (full history resent)",
+              pt2 > pt1, (pt1, pt2))
+
+        ids = srv.gen_ids()
+        ok = len(ids) >= 2
+        check("2 GEN calls logged", ok, len(ids))
+        if ok:
+            i1, i2 = [list(map(int, x)) for x in ids[:2]]
+            check("usage.prompt_tokens == GEN ids (both turns)",
+                  len(i1) == pt1 and len(i2) == pt2, (len(i1), pt1, len(i2), pt2))
+            check("turn2 prompt reuses turn1 token prefix exactly",
+                  i2[:len(i1)] == i1, (len(i1), len(i2)))
+        w = srv.warm_calls()
+        check("static tool+system prefix warmed ONCE across both turns",
+              len(w) == 1 and int(w[0][0]) >= 64 and w[0][1] == "computed", w)
+    finally:
+        srv.close()
+
+
+# ---- 14. interrupting side prompt + RAM prefix-stash recovery -------------
+def test_m12_interrupt_stash(fix):
+    print("[14] M12: side-prompt interrupt + RAM prefix-stash recovery")
+    srv = _M12Server(fix, "stash")
+    try:
+        # Main agent session: long (>=1024 tok) static prefix gets pinned
+        # into the worker (server RAM stash: last_warm_prefix/ids).
+        main1 = [{"role": "system", "content": "B" * 1100},
+                 {"role": "user", "content": "hi"}]
+        st, raw, _ = http("POST", srv.base + "/v1/chat/completions",
+                          {"messages": main1, "tools": TOOLS, "max_tokens": 64})
+        w = srv.warm_calls()
+        check("main turn1 pins long warm prefix (computed)",
+              st == 200 and len(w) == 1 and int(w[0][0]) >= 1024
+              and w[0][1] == "computed", (st, w))
+
+        # Unrelated interrupting side prompt (memory-review, own system
+        # prompt, NO tools -> plain parse path where <|end_message|> is an
+        # EOS: stops at the first end_message with the thinking text): its
+        # >=512-tok prefix overwrites the pinned stash.
+        side = [{"role": "system", "content": "M" * 600},
+                {"role": "user", "content": "summarize memory"}]
+        st, raw, _ = http("POST", srv.base + "/v1/chat/completions",
+                          {"messages": side, "max_tokens": 64})
+        j = json.loads(raw)
+        w = srv.warm_calls()
+        check("side prompt served cleanly + takes over the stash",
+              st == 200 and j["choices"][0]["finish_reason"] == "stop"
+              and j["choices"][0]["message"]["content"] == "need ls"
+              and len(w) == 2, (st, len(w)))
+
+        # Micro (<64 tok) background prompt: skipped by WARM but its GEN
+        # resets the worker warm_state.
+        micro = [{"role": "system", "content": "S"},
+                 {"role": "user", "content": "title?"}]
+        st, raw, _ = http("POST", srv.base + "/v1/chat/completions",
+                          {"messages": micro, "max_tokens": 64})
+        w = srv.warm_calls()
+        check("micro prompt skips WARM", st == 200 and len(w) == 2, (st, len(w)))
+
+        # Resume the main session: stash mismatch re-pins the main prefix and
+        # the WORKER's KV prefix cache still holds it -> "cached" hit.
+        main2 = main1 + [{"role": "assistant", "content": "Hi there"},
+                         {"role": "user", "content": "continue"}]
+        st, raw, _ = http("POST", srv.base + "/v1/chat/completions",
+                          {"messages": main2, "tools": TOOLS, "max_tokens": 64})
+        j = json.loads(raw)
+        w = srv.warm_calls()
+        check("main resume re-pins stash with worker cache HIT",
+              st == 200 and len(w) == 3 and int(w[2][0]) >= 1024
+              and w[2][1] == "cached", (st, w))
+        check("resumed output clean (own stream only)",
+              j["choices"][0]["message"]["content"] == "Running tool.",
+              j["choices"][0]["message"])
+
+        # Consecutive main turn: stash intact -> no redundant WARM.
+        main3 = main2 + [{"role": "assistant", "content": "Hi there"},
+                         {"role": "user", "content": "more"}]
+        st, raw, _ = http("POST", srv.base + "/v1/chat/completions",
+                          {"messages": main3, "tools": TOOLS, "max_tokens": 64})
+        w = srv.warm_calls()
+        check("consecutive main turn avoids redundant WARM",
+              st == 200 and len(w) == 3, (st, len(w)))
+    finally:
+        srv.close()
+
+
+# ---- 15. agentic SSE streaming + sampler penalty forwarding (final turn) --
+def test_m12_sse_penalties(fix):
+    print("[15] M12: agentic SSE stream + presence/frequency/repetition forwarding")
+    srv = _M12Server(fix, "sse")
+    try:
+        hist = [{"role": "system", "content": "B" * 300},
+                {"role": "user", "content": "List dir"},
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "run",
+                                 "arguments": '{"cmd": "ls"}'}}]},
+                {"role": "tool", "tool_call_id": "call_1",
+                 "content": "README.md"}]
+        body = {"messages": hist, "tools": TOOLS, "max_tokens": 512,
+                "stream": True, "stream_options": {"include_usage": True},
+                "presence_penalty": 0.7, "frequency_penalty": 0.4,
+                "repetition_penalty": 1.15}
+        st, raw, ct = http("POST", srv.base + "/v1/chat/completions", body)
+        check("stream 200 text/event-stream",
+              st == 200 and "text/event-stream" in ct, (st, ct))
+        evs = sse_events(raw)
+        check("SSE frames + [DONE] termination",
+              len(evs) >= 3 and evs[-1] == "[DONE]", (len(evs), evs[-2:]))
+        chunks = [json.loads(e) for e in evs if e != "[DONE]"]
+        check("all frames are chat.completion.chunk",
+              all(c.get("object") == "chat.completion.chunk" for c in chunks),
+              chunks[0])
+        text = "".join(c["choices"][0]["delta"].get("content", "")
+                       for c in chunks if c.get("choices"))
+        check("streamed tool-result turn answers with final text",
+              text == "Done. 3 entries", repr(text))
+        finals = [c for c in chunks if c.get("choices")]
+        check("final content chunk finish stop",
+              finals[-1]["choices"][0]["finish_reason"] == "stop",
+              finals[-1]["choices"][0])
+        usage_ev = [c for c in chunks if not c["choices"] and "usage" in c]
+        check("include_usage chunk present", len(usage_ev) == 1, usage_ev)
+
+        lines = srv.gen_lines()
+        check("1 GEN logged", len(lines) >= 1, len(lines))
+        if usage_ev and lines:
+            pen = lines[-1].split()
+            di = pen.index("--")
+            check("penalties reach worker payload on the STREAM path",
+                  "presence_penalty=0.7" in pen and "frequency_penalty=0.4" in pen
+                  and "repetition_penalty=1.15" in pen
+                  and all("=" in x for x in pen[6:di]) and pen[di + 1],
+                  lines[-1][:160])
+            check("usage.prompt_tokens == GEN prompt ids",
+                  usage_ev[0]["usage"]["prompt_tokens"] == len(pen) - di - 1,
+                  (usage_ev[0]["usage"], len(pen) - di - 1))
+    finally:
+        srv.close()
+
+
+# ---- 16. streaming TOOL-CALL turn: penalties on the tool path too --------
+def test_m12_sse_toolcall_penalties(fix):
+    print("[16] M12: streaming tool_call turn + clean penalty forwarding")
+    srv = _M12Server(fix, "tcpen")
+    try:
+        base_msgs = [{"role": "system", "content": "B" * 120},
+                     {"role": "user", "content": "List dir"}]
+        st, raw, _ = http("POST", srv.base + "/v1/chat/completions", {
+            "messages": base_msgs, "tools": TOOLS, "max_tokens": 512,
+            "stream": True, "presence_penalty": 0.25,
+            "repetition_penalty": 1.3})
+        check("tool stream 200", st == 200, raw[:120])
+        evs = sse_events(raw)
+        chunks = [json.loads(e) for e in evs if e != "[DONE]"]
+        tcs = [t for c in chunks if c.get("choices")
+               for t in c["choices"][0]["delta"].get("tool_calls", [])]
+        finals = [c for c in chunks if c.get("choices")]
+        check("delta tool_calls + finish tool_calls",
+              evs[-1] == "[DONE]" and len(tcs) == 1
+              and tcs[0]["function"]["name"] == "run"
+              and finals[-1]["choices"][0]["finish_reason"] == "tool_calls",
+              (len(tcs), finals[-1]["choices"][0] if finals else None))
+        rds = "".join(c["choices"][0]["delta"]["reasoning_content"]
+                      for c in chunks if c.get("choices")
+                      and c["choices"][0]["delta"].get("reasoning_content"))
+        check("thinking streams live as reasoning_content", rds == "need ls",
+              repr(rds))
+        lines = srv.gen_lines()
+        ok = len(lines) >= 1
+        check("tool GEN logged", ok, len(lines))
+        if ok:
+            pen = lines[-1].split()
+            di = pen.index("--")
+            check("stream tool path carries presence+repetition",
+                  "presence_penalty=0.25" in pen and "repetition_penalty=1.3" in pen,
+                  lines[-1][:160])
+            check("zero frequency_penalty omitted (clean payload)",
+                  "frequency" not in lines[-1], lines[-1][:160])
+
+        # No penalties in the body -> legacy GEN layout (all disabled).
+        http("POST", srv.base + "/v1/chat/completions", {
+            "messages": base_msgs, "tools": TOOLS, "max_tokens": 512})
+        lines = srv.gen_lines()
+        ok2 = len(lines) >= 2
+        check("no-penalty follow-up keeps legacy GEN layout",
+              ok2 and "=" not in "".join(lines[-1].split()),
+              lines[-1][:160] if ok2 else len(lines))
+    finally:
+        srv.close()
+
+
 def main():
     fix = _fixture_dir()
     t0 = time.time()
@@ -1692,6 +2254,11 @@ def main():
     test_gemma4_worker(fix)
     test_gemma4_tokenizer(fix)
     test_sse_tcp_nodelay()
+    test_penalties(fix)
+    test_m12_multiturn_tool_prefix(fix)
+    test_m12_interrupt_stash(fix)
+    test_m12_sse_penalties(fix)
+    test_m12_sse_toolcall_penalties(fix)
     print("----")
     print("%d passed, %d failed (%.1fs)" % (PASSED, len(FAILED), time.time() - t0))
     if FAILED:

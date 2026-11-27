@@ -28,9 +28,96 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <numeric>
 #include <random>
+#include <string>
+#include <unordered_map>
 #include <vector>
+
+// Sampling penalties (Milestone 8B). All disabled by default; when disabled
+// the sampler MUST stay bitwise-identical to the original fast path.
+struct SamplerPenalties {
+    float presence = 0.0f;   // OpenAI: -presence on tokens with count > 0
+    float frequency = 0.0f;  // OpenAI: -frequency * count on tokens with count > 0
+    float repetition = 1.0f; // != 1: logit/rep if > 0 else logit*rep (once per token)
+    int last_n = 256;        // penalty window: last `last_n` history tokens
+
+    bool active() const {
+        return presence != 0.0f || frequency != 0.0f || repetition != 1.0f;
+    }
+};
+
+// Penalize logits[0..nv) in place from a generation history window (only the
+// last `pen.last_n` entries count). Out-of-vocabulary history ids are ignored.
+// Per unique token: repetition first (sign-aware, once), then the additive
+// presence/frequency penalties computed in double.
+inline void apply_sampling_penalties(float * logits, int64_t nv,
+                                     const int32_t * history, int64_t n_hist,
+                                     const SamplerPenalties & pen) {
+    if (!pen.active() || nv <= 0 || n_hist <= 0) return;
+    if (pen.last_n <= 0) return;
+    if (n_hist > pen.last_n) {
+        history += (n_hist - pen.last_n);
+        n_hist = pen.last_n;
+    }
+    std::unordered_map<int32_t, int> counts;
+    for (int64_t i = 0; i < n_hist; i++) {
+        const int32_t t = history[i];
+        if (t >= 0 && t < (int32_t)nv) counts[t]++;
+    }
+    for (const auto & kv : counts) {
+        double v = logits[kv.first];
+        if (pen.repetition != 1.0f)
+            v = v > 0.0 ? v / pen.repetition : v * pen.repetition;
+        v -= pen.presence;                 // presence: once when count > 0
+        v -= (double)pen.frequency * kv.second;
+        logits[kv.first] = (float)v;
+    }
+}
+
+// Parse one optional "key=value" penalty token from a GEN worker line (the
+// tokens between <eos_csv> and "--"). Recognized keys: presence_penalty,
+// frequency_penalty, repetition_penalty (must be > 0), penalty_last_n (>= 0).
+// Returns: 1 = recognized and stored; 0 = not a penalty option (missing '=',
+// unknown key); -1 = recognized key with malformed/invalid value.
+inline int sampler_parse_penalty_opt(const std::string & tok,
+                                     SamplerPenalties & pen) {
+    const size_t eq = tok.find('=');
+    if (eq == std::string::npos) return 0;
+    const std::string key = tok.substr(0, eq);
+    const std::string val = tok.substr(eq + 1);
+    auto parse_float = [](const std::string & s, float & out) {
+        try {
+            size_t pos = 0;
+            const float f = std::stof(s, &pos);
+            if (pos != s.size() || !std::isfinite(f)) return false;
+            out = f;
+            return true;
+        } catch (...) { return false; }
+    };
+    if (key == "presence_penalty")
+        return parse_float(val, pen.presence) ? 1 : -1;
+    if (key == "frequency_penalty")
+        return parse_float(val, pen.frequency) ? 1 : -1;
+    if (key == "repetition_penalty") {
+        float f = 1.0f;
+        if (!parse_float(val, f) || f <= 0.0f) return -1;
+        pen.repetition = f;
+        return 1;
+    }
+    if (key == "penalty_last_n") {
+        try {
+            size_t pos = 0;
+            const int n = std::stoi(val, &pos);
+            if (pos != val.size() || n < 0) return -1;
+            pen.last_n = n;
+            return 1;
+        } catch (...) { return -1; }
+    }
+    return 0;
+}
 
 // Temperature-scaled softmax + top-p nucleus sampling over logits[0..nv).
 // temp <= 0 returns argmax. rng is the caller's engine RNG (one uniform draw
@@ -95,6 +182,28 @@ inline int32_t sample_token(const float * logits, int64_t nv, float temp,
         if (acc >= target) return (int32_t)i;
     }
     return (int32_t)keep.back();
+}
+
+// Penalty-aware sampler. With all penalties disabled this dispatches to the
+// exact original sample_token() (bitwise identical). With penalties active the
+// row is copied, penalized, its argmax recomputed (so temp <= 0 picks the
+// post-penalty argmax), and the ORIGINAL core sampler runs on the penalized
+// row — the 1e-6 candidate pre-filter and RNG consumption stay intact.
+inline int32_t sample_token_penalized(const float * logits, int64_t nv,
+                                      float temp, float top_p, int32_t argmax,
+                                      std::mt19937_64 & rng,
+                                      const int32_t * history, int64_t n_hist,
+                                      const SamplerPenalties & pen) {
+    if (!pen.active() || nv <= 0) return sample_token(logits, nv, temp, top_p, argmax, rng);
+    std::vector<float> adj((size_t)nv);
+    std::copy(logits, logits + nv, adj.begin());
+    apply_sampling_penalties(adj.data(), nv, history, n_hist, pen);
+    int32_t am = 0;
+    if (nv > 0) {
+        for (int64_t i = 1; i < nv; i++)
+            if (adj[(size_t)i] > adj[(size_t)am]) am = (int32_t)i;
+    }
+    return sample_token(adj.data(), nv, temp, top_p, am, rng);
 }
 
 // True when sample_token() would take the full-vocabulary fallback for this

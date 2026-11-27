@@ -177,19 +177,81 @@ int main(int argc, char ** argv) {
 
     std::printf("== 4. prefill parity (Metal prefill+step vs Metal stepwise) ==\n");
     {
-        std::vector<int32_t> tokens(10);
-        for (int i = 0; i < 10; i++) tokens[i] = (int32_t)((i * 37 + 5) % vocab);
+        std::vector<int32_t> tokens(17);
+        for (size_t i = 0; i < tokens.size(); i++) tokens[i] = (int32_t)((i * 37 + 5) % vocab);
+        // Parity sweep: batched prefill (default + several chunk sizes) vs
+        // stepwise, with prompt lengths crossing chunk boundaries AND the
+        // sliding-window boundary, on FP16 and Q8_0 KV. Also verifies that
+        // steps continuing after a batched prefill stay identical to stepwise
+        // (KV ring, SWA slots and pos_ consistency).
+        auto sweep = [&](Gemma4ForwardMetal & g, const char * tag) {
+            for (int k : {2, 5, 9, 17}) {
+                g.reset();
+                std::vector<std::vector<float>> sl;
+                std::vector<int> sa;
+                for (int i = 0; i < k; i++) {
+                    StepResult st = g.step(tokens[i]);
+                    sl.emplace_back(st.logits, st.logits + st.n_logits);
+                    sa.push_back(st.argmax);
+                }
+                for (int c : {0, 1, 2, 4, 5}) {
+                    g.reset();
+                    if (c != 0) g.set_prefill_chunk(c);
+                    StepResult pk = g.prefill(std::vector<int32_t>(tokens.begin(), tokens.begin() + k));
+                    if (c != 0) g.set_prefill_chunk(0);
+                    double dot = 0.0, na = 0.0, nb = 0.0;
+                    float mxk = 0.f;
+                    for (size_t v = 0; v < sl[k - 1].size(); v++) {
+                        const float d = std::fabs(sl[k - 1][v] - pk.logits[v]);
+                        if (d > mxk) mxk = d;
+                        dot += sl[k - 1][v] * pk.logits[v];
+                        na += (double)sl[k - 1][v] * sl[k - 1][v];
+                        nb += (double)pk.logits[v] * pk.logits[v];
+                    }
+                    const double cos = (na > 0.0 && nb > 0.0) ? dot / std::sqrt(na * nb) : 1.0;
+                    std::printf("  [%s k=%d chunk=%d] max_abs=%.3e cos=%.7f argmax %d vs %d\n",
+                                tag, k, c, (double)mxk, cos, sa[k - 1], pk.argmax);
+                    CHECK(cos >= 0.9999, "prefill parity cosine >= 0.9999");
+                    CHECK(sa[k - 1] == pk.argmax, "prefill parity argmax exact");
+                }
+                // continuation: prefill(k) then 3 more steps vs fully stepwise
+                for (int st = 0; st < 3; st++) {
+                    const int32_t nt = (int32_t)(((k + st) * 37 + 5) % vocab);
+                    g.reset();
+                    g.prefill(std::vector<int32_t>(tokens.begin(), tokens.begin() + k));
+                    StepResult sb{nullptr, 0, -1};
+                    for (int u = 0; u < st; u++) sb = g.step((int32_t)(((k + u) * 37 + 5) % vocab));
+                    sb = g.step(nt);
+                    std::vector<float> lb(sb.logits, sb.logits + sb.n_logits);
+                    const int ab = sb.argmax;
+                    g.reset();
+                    StepResult sw{nullptr, 0, -1};
+                    for (int i = 0; i < k; i++) sw = g.step(tokens[i]);
+                    for (int u = 0; u <= st; u++) sw = g.step(u == st ? nt : (int32_t)(((k + u) * 37 + 5) % vocab));
+                    float mxd = 0.f;
+                    for (size_t v = 0; v < lb.size(); v++) {
+                        const float d = std::fabs(sw.logits[v] - lb[v]);
+                        if (d > mxd) mxd = d;
+                    }
+                    CHECK(mxd < 1e-4f, "step-after-prefill matches stepwise");
+                    CHECK(ab == sw.argmax, "step-after-prefill argmax exact");
+                }
+            }
+        };
+        sweep(gpu_f16, "f16");
+        sweep(gpu_q8, "q8");
+        // full-length prompt: prefill(16)+step vs fully stepwise over 17 tokens
         gpu_f16.reset();
         StepResult a{nullptr, 0, -1};
-        for (int i = 0; i < 10; i++) a = gpu_f16.step(tokens[i]);
-        std::vector<float> la(a.logits, a.logits + a.n_logits);  // internal buffer is reused
+        for (int i = 0; i < 17; i++) a = gpu_f16.step(tokens[i]);
+        std::vector<float> la(a.logits, a.logits + a.n_logits);
         const int a_argmax = a.argmax;
         gpu_f16.reset();
-        gpu_f16.prefill(std::vector<int32_t>(tokens.begin(), tokens.begin() + 9));
-        StepResult b = gpu_f16.step(tokens[9]);
+        gpu_f16.prefill(std::vector<int32_t>(tokens.begin(), tokens.begin() + 16));
+        StepResult b = gpu_f16.step(tokens[16]);
         CHECK(b.argmax >= 0, "both paths produce logits");
         float mx = 0.f;
-        for (int64_t v = 0; v < b.n_logits; v++) {
+        for (size_t v = 0; v < la.size(); v++) {
             const float d = std::fabs(la[v] - b.logits[v]);
             if (d > mx) mx = d;
         }

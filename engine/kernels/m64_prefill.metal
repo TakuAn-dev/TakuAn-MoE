@@ -1597,42 +1597,61 @@ kernel void k_moe_grouped_f32in_sg(device float * SCR [[buffer(0)]],
 // ============================================================================
 // Same tile pipeline as k_moe_grouped_f32in_sg; ONLY the weight loader swaps.
 // Bit layouts byte-for-byte per engine/src/dequant.hpp refs (see m64_p2a.metal
-// Milestone 4B header for the derivation). All weight loads are byte-wise
-// (m64_ld16 / m64_ld32) so Q5_0's 22 B blocks need no alignment at all.
+// Milestone 4B header for the derivation). Milestone 15: loads are 4 B/2 B
+// vectorised when the block alignment permits (Q5_0 22 B blocks stay ushort);
+// byte-wise fallbacks keep misaligned wmat correct.
 
-// Q4_K: one 32-col tile = one sub-block (blk & 7) of block (blk >> 3).
+// Q4_K: one 32-col tile = one sub-block (blk & 7) of super-block (blk >> 3).
 // row bytes = nb/8 * 144 == nb * 18 (nb = k/32, k % 256 == 0).
-static inline void dequant_q4_k_tile32x32_to_tg(const device uchar * wmat,
-                                                uint m0, uint nout, uint blk,
-                                                uint nb, uint tid,
-                                                threadgroup half * tg, uint ld) {
-    const uint row = tid >> 2u, seg = tid & 3u;
-    const uint b = blk >> 3u, is = blk & 7u;
-    const size_t rowb = (size_t)nb * 18ull;
-    threadgroup half * dst = tg + row * ld + seg * 8u;
-    if (m0 + row < nout) {
-        const device uchar * bp = wmat + (size_t)(m0 + row) * rowb + (size_t)b * 144ull;
-        const uint q = m64_ld32(bp + 4u), q2 = m64_ld32(bp + 8u), q3 = m64_ld32(bp + 12u);
-        float sd, sm;
-        m64_scale_min_k4(is, q, q2, q3, sd, sm);
-        const float vd = f16b(m64_ld16(bp)) * sd;
-        const float vm = f16b(m64_ld16(bp + 2u)) * sm;
-        const device uchar * qb = bp + 16u + (is >> 1u) * 32u + seg * 8u;
-        #pragma unroll
-        for (uint i = 0; i < 8u; i++) {
-            const uint byte = qb[i];
-            const uint n = (is & 1u) ? (byte >> 4) : (byte & 0xFu);
-            dst[i] = half(vd * float(n) - vm);
-        }
+// Milestone 15: the 16 B super-block header (d, dmin f16 + 12 scale bytes) is
+// loaded ONCE per (row, super-block) into registers (m64_q4k_hdr); each of the
+// 8 sub-block scales is then derived in-register from q0/q1/q2 with ZERO extra
+// global reads. Nibble bytes use 4 B loads when wmat is 4-byte aligned (pack
+// layout guarantees it; byte-load fallback otherwise — rowb = nb*18 and 144 are
+// multiples of 16 B, so every super-block header keeps wmat's alignment).
+static inline void m64_q4k_hdr(const device uchar * bp, bool wr4,
+                               ushort & d, ushort & dm,
+                               uint & s0, uint & s1, uint & s2) {
+    const uint h = wr4 ? (*(const device uint *)bp) : m64_ld32(bp);
+    d  = (ushort)(h & 0xFFFFu);
+    dm = (ushort)(h >> 16);
+    s0 = wr4 ? (*(const device uint *)(bp + 4u))  : m64_ld32(bp + 4u);
+    s1 = wr4 ? (*(const device uint *)(bp + 8u))  : m64_ld32(bp + 8u);
+    s2 = wr4 ? (*(const device uint *)(bp + 12u)) : m64_ld32(bp + 12u);
+}
+
+static inline void dequant_q4_k_sub_to_tg(const device uchar * bp, uint is,
+                                          uint seg, bool wr4,
+                                          ushort hd, ushort hm,
+                                          uint s0, uint s1, uint s2,
+                                          threadgroup half * dst) {
+    float sd, sm;
+    m64_scale_min_k4(is, s0, s1, s2, sd, sm);
+    const float vd = f16b(hd) * sd, vm = f16b(hm) * sm;
+    const device uchar * qb = bp + 16u + (is >> 1u) * 32u + seg * 8u;
+    const uint sh = (is & 1u) ? 4u : 0u;
+    uint u0, u1;
+    if (wr4) {
+        u0 = *(const device uint *)qb;
+        u1 = *(const device uint *)(qb + 4u);
     } else {
-        #pragma unroll
-        for (uint i = 0; i < 8u; i++) dst[i] = half(0.0f);
+        u0 = m64_ld32(qb);
+        u1 = m64_ld32(qb + 4u);
+    }
+    #pragma unroll
+    for (uint i = 0; i < 8u; i++) {
+        const uint w = (i < 4u) ? u0 : u1;
+        dst[i] = half(vd * float((w >> (((i & 3u) << 3u) + sh)) & 0xFu) - vm);
     }
 }
 
 // Q5_0: one 32-col tile = one 22 B block. row bytes = nb * 22.
 // elem j (0..15): (qs[j] & 0xF) | bit j of qh at 0x10, minus 16, times d;
-// elem 16+j: (qs[j] >> 4) | bit (j + 12) of qh at 0x10 (dequant.hpp:117-124).
+// elem 16+j: (qs[j] >> 4) | bit (j + 16) of qh (dequant.hpp:117-124).
+// Milestone 15: 22 B blocks are only 2-byte aligned, so reads are ushort-wide
+// (NEVER cast Q5_0 to uint*); the per-seg nibble shift (lo seg<2 -> 0, hi -> 4)
+// and qh bit base (j0 / j0+16) are hoisted so the 8-elem unpack is branch-free:
+// (i<2?c0:i<4?c1:i<6?c2:c3) covers qs bytes j0..j0+7 as four 2 B loads.
 static inline void dequant_q5_0_tile32x32_to_tg(const device uchar * wmat,
                                                 uint m0, uint nout, uint blk,
                                                 uint nb, uint tid,
@@ -1640,7 +1659,25 @@ static inline void dequant_q5_0_tile32x32_to_tg(const device uchar * wmat,
     const uint row = tid >> 2u, seg = tid & 3u;
     const size_t rowb = (size_t)nb * 22ull;
     threadgroup half * dst = tg + row * ld + seg * 8u;
-    if (m0 + row < nout) {
+    if (m0 + row < nout && ((size_t)wmat & 1ull) == 0ull) {
+        const device ushort * bp = (const device ushort *)
+            (wmat + (size_t)(m0 + row) * rowb + (size_t)blk * 22ull);
+        const float d = f16b(bp[0]);
+        const uint qh = (uint)bp[1] | ((uint)bp[2] << 16);
+        const uint j0 = (seg & 1u) << 3u;
+        const uint nib_sh = (seg >> 1u) << 2u;
+        const uint qh_base = j0 + ((seg >> 1u) << 4u);
+        const uint jh = j0 >> 1;
+        const uint c0 = bp[3u + jh], c1 = bp[4u + jh],
+                     c2 = bp[5u + jh], c3 = bp[6u + jh];
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) {
+            const uint w = (i < 2u) ? c0 : ((i < 4u) ? c1 : ((i < 6u) ? c2 : c3));
+            const uint byte = (i & 1u) ? (w >> 8) : (w & 0xFFu);
+            const uint bit = ((qh >> (qh_base + i)) & 1u) << 4u;
+            dst[i] = half(d * (float(((byte >> nib_sh) & 0xFu) | bit) - 16.0f));
+        }
+    } else if (m0 + row < nout) {   // byte-wise fallback: misaligned wmat
         const device uchar * bp = wmat + (size_t)(m0 + row) * rowb + (size_t)blk * 22ull;
         const float d = f16b(m64_ld16(bp));
         const uint qh = m64_ld32(bp + 2u);
@@ -1662,6 +1699,8 @@ static inline void dequant_q5_0_tile32x32_to_tg(const device uchar * wmat,
 }
 
 // Q5_1: 24 B block {d f16 @0, m f16 @2, qh @4, qs[16] @8}, y = d*x + m.
+// 24 B blocks keep 4-byte alignment: header + qh as two uint loads, qs as two
+// uint loads, branch-free unpack identical to Q5_0 (byte fallback if misaligned).
 static inline void dequant_q5_1_tile32x32_to_tg(const device uchar * wmat,
                                                 uint m0, uint nout, uint blk,
                                                 uint nb, uint tid,
@@ -1669,7 +1708,25 @@ static inline void dequant_q5_1_tile32x32_to_tg(const device uchar * wmat,
     const uint row = tid >> 2u, seg = tid & 3u;
     const size_t rowb = (size_t)nb * 24ull;
     threadgroup half * dst = tg + row * ld + seg * 8u;
-    if (m0 + row < nout) {
+    if (m0 + row < nout && ((size_t)wmat & 3ull) == 0ull) {
+        const device uint * bp = (const device uint *)
+            (wmat + (size_t)(m0 + row) * rowb + (size_t)blk * 24ull);
+        const uint h = bp[0];
+        const float d = f16b((ushort)(h & 0xFFFFu));
+        const float mm = f16b((ushort)(h >> 16));
+        const uint qh = bp[1];
+        const uint j0 = (seg & 1u) << 3u;
+        const uint nib_sh = (seg >> 1u) << 2u;
+        const uint qh_base = j0 + ((seg >> 1u) << 4u);
+        const uint u0 = bp[2u + (j0 >> 2u)], u1 = bp[3u + (j0 >> 2u)];
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) {
+            const uint w = (i < 4u) ? u0 : u1;
+            const uint byte = w >> ((i & 3u) << 3u);
+            const uint bit = ((qh >> (qh_base + i)) & 1u) << 4u;
+            dst[i] = half(d * float(((byte >> nib_sh) & 0xFu) | bit) + mm);
+        }
+    } else if (m0 + row < nout) {   // byte-wise fallback: misaligned wmat
         const device uchar * bp = wmat + (size_t)(m0 + row) * rowb + (size_t)blk * 24ull;
         const float d = f16b(m64_ld16(bp));
         const float mm = f16b(m64_ld16(bp + 2u));
@@ -1688,6 +1745,40 @@ static inline void dequant_q5_1_tile32x32_to_tg(const device uchar * wmat,
     } else {
         #pragma unroll
         for (uint i = 0; i < 8u; i++) dst[i] = half(0.0f);
+    }
+}
+
+// Milestone 15: shared tgX loader for the quantized grouped kernels.
+// narrow (rem <= 16) tiles need only 16 columns -> threads with bcol >= 16
+// skip their 8 float loads entirely. When (xoff | x_stride) % 4 == 0 every
+// thread's 8 floats are 16 B aligned -> two float4 loads instead of eight.
+static inline void m64_fill_tgX_tile(device float * SCR,
+                                     constant MoeGroupedF32SgArgs & A,
+                                     const threadgroup uint * tgIn,
+                                     const threadgroup uint * tgOutP,
+                                     uint blk, uint tid, bool narrow, bool x16,
+                                     threadgroup half * tgX) {
+    const uint bcol = tid >> 2u, kseg = tid & 3u;
+    if (narrow && bcol >= 16u) return;
+    const uint p_out = tgOutP[bcol];
+    threadgroup half * dx = tgX + kseg * 8u * M64_SG_LD + bcol;
+    if (p_out != 0xFFFFFFFFu) {
+        const device float * xb = SCR + A.xoff +
+            (size_t)tgIn[bcol] * A.x_stride + (size_t)blk * 32u + kseg * 8u;
+        if (x16) {
+            const device float4 * xb4 = (const device float4 *)xb;
+            const float4 v0 = xb4[0], v1 = xb4[1];
+            dx[0] = half(v0.x);                    dx[M64_SG_LD] = half(v0.y);
+            dx[2u * M64_SG_LD] = half(v0.z);       dx[3u * M64_SG_LD] = half(v0.w);
+            dx[4u * M64_SG_LD] = half(v1.x);       dx[5u * M64_SG_LD] = half(v1.y);
+            dx[6u * M64_SG_LD] = half(v1.z);       dx[7u * M64_SG_LD] = half(v1.w);
+        } else {
+            #pragma unroll
+            for (uint i = 0; i < 8u; i++) dx[i * M64_SG_LD] = half(xb[i]);
+        }
+    } else {
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) dx[i * M64_SG_LD] = half(0.0f);
     }
 }
 
@@ -1712,9 +1803,8 @@ static inline void m64_moe_grouped_sg_q_impl(
     const device uint * list = (const device uint *)(SCR + A.list_off);
 
     const uint tid = TITG.y * 32u + TITG.x;                // 0..127
-    const uint sg_row = ((tid >> 5u) >> 1u) * 16u;
-    const uint sg_col = ((tid >> 5u) & 1u) * 16u;
-    const uint bcol = tid >> 2u, kseg = tid & 3u;
+    const uint warp = tid >> 5u;                           // 0..3
+    const uint wrow = tid >> 2u, wseg = tid & 3u;          // weight tile coords
 
     const uint slot = A.wtab_off != 0u
         ? ((const device uint *)SCR)[A.wtab_off + exp_id]
@@ -1722,8 +1812,23 @@ static inline void m64_moe_grouped_sg_q_impl(
     const device uchar * wmat = PACK + (size_t)A.wbase + (size_t)slot * A.exp_stride +
                                 (size_t)A.part_off;
     const uint nb = A.k / 32u;
+    // Milestone 15 uniform fast-path flags (weight alignment + float4 tgX).
+    const bool wr4 = ((size_t)wmat & 3ull) == 0ull;
+    const bool x16 = ((A.xoff & 3u) == 0u) && ((A.x_stride & 3u) == 0u);
+    const bool wvalid = (m0 + wrow) < A.nout;
+    const device uchar * q4k_rp = wmat + (size_t)(m0 + wrow) * ((size_t)nb * 18ull);
+    ushort hd = (ushort)0, hm = (ushort)0;   // Q4_K super-block: reloaded per sb
+    uint s0 = 0u, s1 = 0u, s2 = 0u;
 
     for (uint off = 0u; off < cnt; off += 32u) {
+        // Real prefill chunks have mean cnt = B*topk/NEXP <= 16 (99%+ of
+        // experts): tiles with rem <= 16 active cols run a 32x16 MMA (one
+        // accumulator per warp, half the tgX loads / matrix ops / epilogue);
+        // bigger buckets keep the full 32x32 width.
+        const bool narrow = (cnt - off) <= 16u;
+        const uint sg_row = narrow ? warp * 8u : (warp >> 1u) * 16u;
+        const uint sg_col = narrow ? 0u : (warp & 1u) * 16u;
+
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid < 32u) {
             const bool valid = (off + tid) < cnt;
@@ -1732,60 +1837,77 @@ static inline void m64_moe_grouped_sg_q_impl(
             tgOutP[tid] = valid ? p : 0xFFFFFFFFu;
         }
         simdgroup_float8x8 acc[2][2];
+        simdgroup_float8x8 accn[2];
         #pragma unroll
-        for (int r = 0; r < 2; r++)
+        for (int r = 0; r < 2; r++) {
             #pragma unroll
             for (int c = 0; c < 2; c++)
                 acc[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            accn[r] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint blk = 0u; blk < nb; blk++) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (QT == 1)
-                dequant_q4_k_tile32x32_to_tg(wmat, m0, A.nout, blk, nb, tid, tgW, M64_SG_LD);
-            else if (QT == 2)
-                dequant_q5_0_tile32x32_to_tg(wmat, m0, A.nout, blk, nb, tid, tgW, M64_SG_LD);
-            else
-                dequant_q5_1_tile32x32_to_tg(wmat, m0, A.nout, blk, nb, tid, tgW, M64_SG_LD);
-            {
-                const uint p_out = tgOutP[bcol];
-                threadgroup half * dx = tgX + kseg * 8u * M64_SG_LD + bcol;
-                if (p_out != 0xFFFFFFFFu) {
-                    const device float * xb = SCR + A.xoff +
-                        (size_t)tgIn[bcol] * A.x_stride + (size_t)blk * 32u + kseg * 8u;
+            threadgroup half * dw = tgW + wrow * M64_SG_LD + wseg * 8u;
+            if (QT == 1) {
+                const device uchar * sbp = q4k_rp + (blk >> 3u) * 144ull;
+                if ((blk & 7u) == 0u && wvalid) m64_q4k_hdr(sbp, wr4, hd, hm, s0, s1, s2);
+                if (wvalid)
+                    dequant_q4_k_sub_to_tg(sbp, blk & 7u, wseg, wr4,
+                                           hd, hm, s0, s1, s2, dw);
+                else {
                     #pragma unroll
-                    for (uint i = 0; i < 8u; i++) dx[i * M64_SG_LD] = half(xb[i]);
-                } else {
-                    #pragma unroll
-                    for (uint i = 0; i < 8u; i++) dx[i * M64_SG_LD] = half(0.0f);
+                    for (uint i = 0; i < 8u; i++) dw[i] = half(0.0f);
                 }
+            } else if (QT == 2) {
+                dequant_q5_0_tile32x32_to_tg(wmat, m0, A.nout, blk, nb, tid, tgW, M64_SG_LD);
+            } else {
+                dequant_q5_1_tile32x32_to_tg(wmat, m0, A.nout, blk, nb, tid, tgW, M64_SG_LD);
             }
+            m64_fill_tgX_tile(SCR, A, tgIn, tgOutP, blk, tid, narrow, x16, tgX);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             #pragma unroll
             for (uint kk = 0u; kk < 32u; kk += 8u) {
-                simdgroup_half8x8 a0, a1, b0m, b1m;
-                simdgroup_load(a0, tgW + (sg_row + 0u) * M64_SG_LD + kk, M64_SG_LD);
-                simdgroup_load(a1, tgW + (sg_row + 8u) * M64_SG_LD + kk, M64_SG_LD);
-                simdgroup_load(b0m, tgX + kk * M64_SG_LD + sg_col, M64_SG_LD);
-                simdgroup_load(b1m, tgX + kk * M64_SG_LD + sg_col + 8u, M64_SG_LD);
-                simdgroup_multiply_accumulate(acc[0][0], a0, b0m, acc[0][0]);
-                simdgroup_multiply_accumulate(acc[0][1], a0, b1m, acc[0][1]);
-                simdgroup_multiply_accumulate(acc[1][0], a1, b0m, acc[1][0]);
-                simdgroup_multiply_accumulate(acc[1][1], a1, b1m, acc[1][1]);
+                if (narrow) {
+                    simdgroup_half8x8 a0, b0m, b1m;
+                    simdgroup_load(a0, tgW + sg_row * M64_SG_LD + kk, M64_SG_LD);
+                    simdgroup_load(b0m, tgX + kk * M64_SG_LD, M64_SG_LD);
+                    simdgroup_load(b1m, tgX + kk * M64_SG_LD + 8u, M64_SG_LD);
+                    simdgroup_multiply_accumulate(accn[0], a0, b0m, accn[0]);
+                    simdgroup_multiply_accumulate(accn[1], a0, b1m, accn[1]);
+                } else {
+                    simdgroup_half8x8 a0, a1, b0m, b1m;
+                    simdgroup_load(a0, tgW + (sg_row + 0u) * M64_SG_LD + kk, M64_SG_LD);
+                    simdgroup_load(a1, tgW + (sg_row + 8u) * M64_SG_LD + kk, M64_SG_LD);
+                    simdgroup_load(b0m, tgX + kk * M64_SG_LD + sg_col, M64_SG_LD);
+                    simdgroup_load(b1m, tgX + kk * M64_SG_LD + sg_col + 8u, M64_SG_LD);
+                    simdgroup_multiply_accumulate(acc[0][0], a0, b0m, acc[0][0]);
+                    simdgroup_multiply_accumulate(acc[0][1], a0, b1m, acc[0][1]);
+                    simdgroup_multiply_accumulate(acc[1][0], a1, b0m, acc[1][0]);
+                    simdgroup_multiply_accumulate(acc[1][1], a1, b1m, acc[1][1]);
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        #pragma unroll
-        for (int r = 0; r < 2; r++)
+        if (narrow) {
             #pragma unroll
             for (int c = 0; c < 2; c++)
-                simdgroup_store(acc[r][c], tgO + (sg_row + (uint)r * 8u) * M64_SG_LD +
-                                         sg_col + (uint)c * 8u, M64_SG_LD);
+                simdgroup_store(accn[c], tgO + sg_row * M64_SG_LD + (uint)c * 8u,
+                                M64_SG_LD);
+        } else {
+            #pragma unroll
+            for (int r = 0; r < 2; r++)
+                #pragma unroll
+                for (int c = 0; c < 2; c++)
+                    simdgroup_store(acc[r][c], tgO + (sg_row + (uint)r * 8u) * M64_SG_LD +
+                                             sg_col + (uint)c * 8u, M64_SG_LD);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint m = m0 + (tid >> 2u);
-        if (m < A.nout) {
-            const uint cbase = (tid & 3u) * 8u;
-            const threadgroup float * src = tgO + (tid >> 2u) * M64_SG_LD + cbase;
+        const uint m = m0 + wrow;
+        const uint cbase = wseg * 8u;
+        if (m < A.nout && !(narrow && cbase >= 16u)) {
+            const threadgroup float * src = tgO + wrow * M64_SG_LD + cbase;
             #pragma unroll
             for (uint i = 0; i < 8u; i++) {
                 const uint outp = tgOutP[cbase + i];
@@ -1839,3 +1961,234 @@ kernel void k_moe_grouped_f32in_sg_q5_1(device float * SCR [[buffer(0)]],
     m64_moe_grouped_sg_q_impl<3>(SCR, A, PACK, M64_TITG, M64_TGPG,
                                     tgW, tgX, tgO, tgIn, tgOutP);
 }
+
+// ==========================================================================
+// Milestone 9B: batched (grid.y/.z = token) clones of the tiny per-token
+// prefill helpers k_xfer / k_rms+k_mix_fused / k_ctrl_down+k_ctrl_up.
+// Element/reduction shapes are copied VERBATIM from the single-token
+// kernels in m64_p2a.metal so a batch dispatch is bitwise-identical to the
+// old per-token for(b=0..B) dispatch loop.
+// ==========================================================================
+static_assert(sizeof(XferBatchArgs) == 72, "XferBatchArgs");
+static_assert(sizeof(MixRmsBatchArgs) == 40, "MixRmsBatchArgs");
+static_assert(sizeof(MixFusedBatchArgs) == 48, "MixFusedBatchArgs");
+static_assert(sizeof(CtrlBatchSplitArgs) == 192, "CtrlBatchSplitArgs");
+
+// grid = (ceil(nmax/256), B, npairs) x 256. is_copy=1: c = a; else a += b
+// (same `a = a + b` shape as k_xfer).
+kernel void k_xfer_batch(device float * SCR [[buffer(0)]],
+                         constant XferBatchArgs & A [[buffer(1)]],
+                         uint3 M64_TGPG [[threadgroup_position_in_grid]],
+                         uint3 M64_TITG [[thread_position_in_threadgroup]]) {
+    const uint pair = M64_TGPG.z, b = M64_TGPG.y;
+    if (pair >= A.npairs || b >= A.B) return;
+    const uint i = M64_TGPG.x * 256u + M64_TITG.x;
+    if (i >= A.n[pair]) return;
+    if (A.is_copy) {
+        SCR[A.c[pair] + b * A.c_stride[pair] + i] =
+            SCR[A.a[pair] + b * A.a_stride[pair] + i];
+    } else {
+        const uint ai = A.a[pair] + b * A.a_stride[pair] + i;
+        SCR[ai] = SCR[ai] + SCR[A.b[pair] + b * A.b_stride[pair] + i];
+    }
+}
+
+// grid = (n+1, B) x 256. Row r<n: states + b*states_stride + (n-1-r)*k
+// (slot 0 = newest, do_mix's xr order); row n: extra + b*extra_stride.
+// Reduction is k_rms' hasw=0 path verbatim -> bitwise vs per-token k_rms.
+kernel void k_mix_rms_batch(device float * SCR [[buffer(0)]],
+                            constant MixRmsBatchArgs & A [[buffer(1)]],
+                            uint3 M64_TGPG [[threadgroup_position_in_grid]],
+                            uint3 M64_TITG [[thread_position_in_threadgroup]],
+                            uint3 M64_NPTG [[threads_per_threadgroup]]) {
+    const uint r = M64_TGPG.x, b = M64_TGPG.y;
+    if (r > A.n || b >= A.B) return;
+    const uint xcur = (r < A.n)
+        ? (A.states + b * A.states_stride + (A.n - 1u - r) * A.k)
+        : (A.extra + b * A.extra_stride);
+    const uint ycur = A.stn + b * A.stn_stride + r * A.k;
+    device float * x = SCR + xcur;
+    device float * y = SCR + ycur;
+    uint tid = M64_TITG.x;
+    const uint nth = M64_NPTG.x;
+    threadgroup float red[256];
+    const bool vec4_in = ((A.k & 3u) == 0u) && ((xcur & 3u) == 0u);
+    float s;
+    if (vec4_in) {
+        const device float4 * x4 = (const device float4 *)x;
+        float4 av = float4(0.0f);
+        for (uint i = tid; i < (A.k >> 2); i += nth) { float4 v = x4[i]; av += v * v; }
+        s = (av.x + av.y) + (av.z + av.w);
+    } else {
+        s = 0.0f;
+        for (uint i = tid; i < A.k; i += nth) { float v = x[i]; s += v * v; }
+    }
+    // Same SIMD reduction shape as k_rms / k_rms_batch (bitwise).
+    s = simd_sum(s);
+    uint lane0 = tid & 31u;
+    if (lane0 == 0u) red[tid >> 5u] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32u) {
+        float t = (lane0 < 8u) ? red[lane0] : 0.0f;
+        t = simd_sum(t);
+        if (tid == 0u) red[0] = 1.0f / (float)(sqrt((float)(t / float(A.k)) + 1e-6f));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = (float)red[0];
+    if (vec4_in && (ycur & 3u) == 0u) {
+        const device float4 * x4 = (const device float4 *)x;
+        device float4 * y4 = (device float4 *)y;
+        const float4 inv4 = float4(inv);
+        for (uint i = tid; i < (A.k >> 2); i += nth) y4[i] = x4[i] * inv4;
+    } else {
+        for (uint i = tid; i < A.k; i += nth) y[i] = x[i] * inv;
+    }
+}
+
+// grid = (nq, B) x 256. k_mix_fused verbatim with per-token stn/out rows.
+kernel void k_mix_fused_batch(device float * SCR [[buffer(0)]],
+                              constant MixFusedBatchArgs & A [[buffer(1)]],
+                              const device uchar * PACK [[buffer(2)]],
+                              uint3 M64_TITG [[thread_position_in_threadgroup]],
+                              uint3 M64_TGPG [[threadgroup_position_in_grid]]) {
+    uint j = M64_TGPG.x;
+    uint b = M64_TGPG.y;
+    if (b >= A.B) return;
+    uint tid = M64_TITG.x;
+    uint lane = tid & 31u;
+    uint sg = tid >> 5;
+    threadgroup float red[8];
+    threadgroup float wt[M64_MAXS];
+    const uint stn = A.stnoff + b * A.stn_stride;
+    const uint outoff = A.outoff + b * A.out_stride;
+    const bool vec4 = ((A.stnoff & 3u) == 0u) && ((A.outoff & 3u) == 0u) && ((A.qpack & 15ul) == 0ul);
+    const device float * qp = ((const device float *)(PACK + A.qpack)) + (size_t)j * M64_NE;
+    const device float4 * q4 = (const device float4 *)qp;
+    for (uint i = 0u; i < A.S; i++) {
+        float a = 0.0f;
+        if (vec4) {
+            const device float4 * s4 = (const device float4 *)(SCR + stn + (size_t)i * M64_NE);
+            float4 av = float4(0.0f);
+            for (uint k = tid; k < M64_NE / 4u; k += 256u) av += s4[k] * q4[k];
+            a = (av.x + av.y) + (av.z + av.w);
+        } else {
+            const device float * sp = SCR + stn + (size_t)i * M64_NE;
+            for (uint k = tid; k < M64_NE; k += 256u) a = fma(sp[k], qp[k], a);
+        }
+        a = simd_sum(a);
+        if (lane == 0u) red[sg] = a;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 32u) {
+            float t = (lane < 8u) ? red[lane] : 0.0f;
+            t = simd_sum(t);
+            if (tid == 0u) wt[i] = t * A.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        float mx = -INFINITY;
+        for (uint i = 0u; i < A.S; i++) mx = wt[i] > mx ? wt[i] : mx;
+        float sum = 0.0f;
+        for (uint i = 0u; i < A.S; i++) { wt[i] = metal::exp(wt[i] - mx); sum += wt[i]; }
+        float recip = (float)(1.0 / sum);
+        for (uint i = 0u; i < A.S; i++) wt[i] = wt[i] * recip;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (vec4) {
+        device float4 * out4 = (device float4 *)(SCR + outoff + (size_t)j * M64_NE);
+        for (uint k = tid; k < M64_NE / 4u; k += 256u) {
+            float4 a = float4(0.0f);
+            for (uint i = 0u; i < A.S; i++)
+                a = fma(float4(wt[i]), ((const device float4 *)(SCR + stn + (size_t)i * M64_NE))[k], a);
+            out4[k] = a;
+        }
+    } else {
+        device float * out = SCR + outoff + (size_t)j * M64_NE;
+        for (uint k = tid; k < M64_NE; k += 256u) {
+            float a = 0.0f;
+            for (uint i = 0u; i < A.S; i++)
+                a = fma(wt[i], SCR[stn + (size_t)i * M64_NE + k], a);
+            out[k] = a;
+        }
+    }
+}
+
+// grid = (64, nc, B) x 256. k_ctrl_down verbatim + token dimension; hh is
+// a per-token B*4*64 SCR region (hh_stride = 4*64) so all tokens coexist.
+kernel void k_ctrl_down_batch(device float * SCR [[buffer(0)]],
+                              constant CtrlBatchSplitArgs & A [[buffer(1)]],
+                              const device uchar * PACK [[buffer(2)]],
+                              uint3 M64_TGPG [[threadgroup_position_in_grid]],
+                              uint3 M64_TITG [[thread_position_in_threadgroup]]) {
+    uint r = M64_TGPG.x;
+    uint cg = M64_TGPG.y;
+    uint b = M64_TGPG.z;
+    if (cg >= A.nc || b >= A.B) return;
+    uint tid = M64_TITG.x;
+    threadgroup float red[8];
+    const uint nk = 2u * A.ne;
+    const device float * wr = ((const device float *)(PACK + A.wdown[cg])) + (size_t)r * nk;
+    const device float * gc = SCR + A.gcat + (size_t)b * A.gcat_stride + (size_t)cg * nk;
+    float a;
+    if ((A.ne & 1u) == 0u && (A.gcat & 3u) == 0u && (A.wdown[cg] & 15ul) == 0ul) {
+        const device float4 * w4 = (const device float4 *)wr;
+        const device float4 * g4 = (const device float4 *)gc;
+        float4 av = float4(0.0f);
+        for (uint k = tid; k < nk / 4u; k += 256u) av += w4[k] * g4[k];
+        a = (av.x + av.y) + (av.z + av.w);
+    } else {
+        a = 0.0f;
+        for (uint k = tid; k < nk; k += 256u) a = fma(wr[k], gc[k], a);
+    }
+    a = simd_sum(a);
+    if ((tid & 31u) == 0u) red[tid >> 5u] = a;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32u) {
+        float t = ((tid & 31u) < 8u) ? red[tid & 31u] : 0.0f;
+        t = simd_sum(t);
+        if (tid == 0u) SCR[A.hh + b * A.hh_stride + cg * 64u + r] = tanh(t);
+    }
+}
+
+// grid = (ceil(ne/32), nc, B) x 32. k_ctrl_up verbatim + token dimension.
+kernel void k_ctrl_up_batch(device float * SCR [[buffer(0)]],
+                            constant CtrlBatchSplitArgs & A [[buffer(1)]],
+                            const device uchar * PACK [[buffer(2)]],
+                            uint3 M64_TGPG [[threadgroup_position_in_grid]],
+                            uint3 M64_TITG [[thread_position_in_threadgroup]]) {
+    uint row = M64_TGPG.x * 32u + M64_TITG.x;
+    uint cg = M64_TGPG.y;
+    uint b = M64_TGPG.z;
+    uint tid = M64_TITG.x;
+    if (cg >= A.nc || b >= A.B) return;
+    threadgroup float hh[64];
+    hh[tid] = SCR[A.hh + b * A.hh_stride + cg * 64u + tid];
+    hh[tid + 32u] = SCR[A.hh + b * A.hh_stride + cg * 64u + tid + 32u];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= A.ne) return;
+    const device float * wg = ((const device float *)(PACK + A.wgain[cg])) + (size_t)row * 64u;
+    const device float * wf = ((const device float *)(PACK + A.wforg[cg])) + (size_t)row * 64u;
+    float gs, fs;
+    if ((A.wgain[cg] & 15ul) == 0ul && (A.wforg[cg] & 15ul) == 0ul) {
+        const device float4 * wg4 = (const device float4 *)wg;
+        const device float4 * wf4 = (const device float4 *)wf;
+        float4 gv = float4(0.0f), fv = float4(0.0f);
+        #pragma unroll
+        for (uint t = 0u; t < 16u; t++) {
+            float4 hv = float4(hh[4u * t], hh[4u * t + 1u], hh[4u * t + 2u], hh[4u * t + 3u]);
+            gv += wg4[t] * hv;
+            fv += wf4[t] * hv;
+        }
+        gs = (gv.x + gv.y) + (gv.z + gv.w);
+        fs = (fv.x + fv.y) + (fv.z + fv.w);
+    } else {
+        gs = 0.0f; fs = 0.0f;
+        #pragma unroll
+        for (uint t = 0u; t < 64u; t++) { float hv = hh[t]; gs = fma(wg[t], hv, gs); fs = fma(wf[t], hv, fs); }
+    }
+    float g = tanh(gs), fg = tanh(fs);
+    float c = SCR[A.in[cg] + b * A.in_stride + row];
+    float m = SCR[A.msg[cg] + b * A.msg_stride + row];
+    SCR[A.out[cg] + b * A.out_stride + row] = (c - fg * c) + g * m;
+}
+

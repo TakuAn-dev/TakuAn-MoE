@@ -167,6 +167,10 @@ class BPE:
                              if "<0x%02X>" % b in self.id_of}
         self._id_to_byte = {tid: bytes([b])
                             for b, tid in self._byte_tokens.items()}
+        # Milestone 14: per-piece encode memo (piece str -> tuple of ids).
+        # Repeated system prompts / tool decls re-tokenize at zero cost;
+        # capped so a pathological stream can't grow it unbounded.
+        self._piece_cache = {}
 
     def _split_pieces(self, part):
         """Chunk raw text into BPE pieces (never cuts inside a word)."""
@@ -206,6 +210,9 @@ class BPE:
         return word
 
     def _encode_piece(self, piece):
+        cached = self._piece_cache.get(piece)
+        if cached is not None:
+            return cached
         if self.is_spm_bpe:
             piece = piece.replace(" ", "\u2581")
             word = []
@@ -227,6 +234,8 @@ class BPE:
                                    for b in w.encode("utf-8"))
                     except KeyError:
                         raise ValueError(f"BPE: unknown token {w!r}")
+            if len(self._piece_cache) < 65536:
+                self._piece_cache[piece] = tuple(out)
             return out
         s = "".join(self.b2u[b] for b in piece.encode("utf8"))
         word = self._merge(list(s))
@@ -236,6 +245,8 @@ class BPE:
             if i is None:
                 raise ValueError(f"BPE: unknown token {w!r}")
             out.append(i)
+        if len(self._piece_cache) < 65536:
+            self._piece_cache[piece] = tuple(out)
         return out
 
     def token_bytes(self, tid):

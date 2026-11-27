@@ -116,6 +116,15 @@ struct Gemma4ForwardMetal::Impl {
     uint32_t off_logits = 0, off_argmax_arena = 0, off_argmax_out = 0;
     uint32_t off_zero = 0;  // SCR slot that stays all-zero (GPU-side memset source)
 
+    // ---- Milestone 8A: batched-prefill slots ([G4_BMAX][stride] row-major) ----
+    int64_t chunk_ = 0;  // rows per chunk (0 => G4_BMAX); set_prefill_chunk clamps
+    uint32_t b_inp = 0, b_cur = 0, b_normed = 0, b_attn_out = 0;
+    uint32_t b_mlp = 0, b_moe = 0, b_eacc = 0, b_zero = 0;
+    uint32_t b_q = 0, b_k = 0, b_v = 0, b_attn = 0;
+    uint32_t b_wa = 0, b_wb = 0, b_ea = 0, b_eb = 0;
+    uint32_t b_router = 0, b_sel_ids = 0, b_sel_w = 0;
+    id<MTLBuffer> stg_k_ = nil, stg_v_ = nil;  // in-chunk KV staging (ring layout)
+
     std::vector<float> logits_;  // host copy backing StepResult::logits
 
     uint64_t woff(const TensorInfo * t) const {
@@ -375,8 +384,46 @@ struct Gemma4ForwardMetal::Impl {
         off_logits  = slot(vocab_rows);
         off_argmax_arena = slot(64);   // legacy argmax arena slot (unused)
         off_argmax_out   = slot(4);    // int32 result (+ padding)
+
+        // ---- Milestone 8A batched-prefill slots (row-major [rows][stride]) ----
+        // Strides equal the single-token slot widths (n_embd, n_head*hd, ...) so
+        // g4_rms_norm / g4_add / g4_copy / g4_scale_scalar_buf — which address
+        // rows as base + row * k or run flat over n = rows * stride — replay on
+        // the batch slots with no stride-aware variants.
+        const int64_t ne = n_embd, B = G4_BMAX;
+        b_inp      = slot(ne * B);
+        b_cur      = slot(ne * B);
+        b_normed   = slot(ne * B);
+        b_attn_out = slot(ne * B);
+        b_mlp      = slot(ne * B);
+        b_moe      = slot(ne * B);
+        b_eacc     = slot(ne * B);
+        b_q       = slot(n_head * maxhk * B);
+        b_k       = slot(maxnk * maxhk * B);
+        b_v       = slot(maxnk * maxhv * B);
+        b_attn    = slot(n_head * maxhv * B);
+        b_wa      = slot(n_ff * B);
+        b_wb      = slot(n_ff * B);
+        b_ea      = slot(n_ff_exp * B);
+        b_eb      = slot(n_ff_exp * B);
+        b_router  = slot(std::max(n_expert, (int64_t)1) * B);
+        b_sel_ids = slot(std::max(top_k, (int64_t)1) * B);  // ints, float-sized
+        b_sel_w   = slot(std::max(top_k, (int64_t)1) * B);
+        b_zero    = slot(ne * B);  // never written: alloc_shared zeros it once
         SCR_ = rt_.alloc_shared(scr_bytes, @"gemma4_scr");
         if (!SCR_) { err = "gemma4_forward_metal: SCR allocation failed"; return false; }
+
+        // In-chunk KV staging: same byte layout as a ring slice, G4_BMAX slots,
+        // sized for the widest layer (shared across layers, serialized use).
+        const size_t stg_bytes = kv_q8
+            ? (size_t)G4_BMAX * maxnk * (maxhk / 32u) * 34u
+            : (size_t)G4_BMAX * maxnk * maxhk * sizeof(uint16_t);
+        stg_k_ = rt_.alloc_shared(stg_bytes, @"gemma4_stg_k");
+        stg_v_ = rt_.alloc_shared(stg_bytes, @"gemma4_stg_v");
+        if (!stg_k_ || !stg_v_) {
+            err = "gemma4_forward_metal: staging KV allocation failed"; return false;
+        }
+        kv_bytes += 2 * stg_bytes;
 
         // Per-layer KV rings (fp16 or Q8_0)
         kv_k_.assign(n_layer, nil);
@@ -423,10 +470,41 @@ struct Gemma4ForwardMetal::Impl {
         if (output) fns.push_back(dense_gemv_kernel(output->dtype));
         else fns.push_back(dense_gemv_kernel(tok_embd->dtype));  // tied LM head
         if (cap > 0.0f) fns.push_back("g4_softcap");
+        // Milestone 8A: batched prefill kernels (same set, *_b variants).
+        std::vector<std::string> bnames;  // owned strings; validated in a separate
+                                          // loop below (never c_str() into fns here)
+        auto need_b = [&](const char * base) {
+            bnames.push_back(std::string(base) + "_b");
+        };
+        need_b(emb_dt == G4_DT_Q8_0 ? "g4_emb_gather_q8_0" : "g4_emb_gather_f32");
+        need_b("g4_rope_neox");
+        need_b(kv_q8 ? "g4_kv_write_q8" : "g4_kv_write_f16");
+        need_b(kv_q8 ? "g4_attn_q8" : "g4_attn_f16");
+        need_b("g4_geglu");
+        for (int64_t il = 0; il < n_layer; il++) {
+            const LT & t = lt[il];
+            const TensorInfo * gm[] = {t.wq, t.wk, t.wv, t.wo, t.ffn_gate, t.ffn_up, t.ffn_down, t.router_w};
+            for (const TensorInfo * g : gm)
+                if (g) need_b(dense_gemv_kernel(g->dtype));
+            if (t.router_w) {
+                need_b("g4_router_topk");
+                const TensorInfo * ex = t.experts;
+                need_b(moe_gemv_kernel(ex->part_dtype(ex->dtype, 0)));
+                need_b(moe_gemv_kernel(ex->part_dtype(ex->dtype, 1)));
+                need_b(moe_gemv_kernel(ex->part_dtype(ex->dtype, 2)));
+            }
+        }
+        need_b(output ? dense_gemv_kernel(output->dtype) : dense_gemv_kernel(tok_embd->dtype));
         for (const char * fn : fns) {
             if (!fn || !rt_.pipeline(fn)) {
                 err = std::string("gemma4_forward_metal: kernel '") + (fn ? fn : "(null)") +
                       "' missing from Metal library";
+                return false;
+            }
+        }
+        for (const std::string & bn : bnames) {
+            if (!rt_.pipeline(bn.c_str())) {
+                err = "gemma4_forward_metal: kernel '" + bn + "' missing from Metal library";
                 return false;
             }
         }
@@ -497,6 +575,154 @@ struct Gemma4ForwardMetal::Impl {
         [enc dispatchThreadgroups:MTLSizeMake((pairs + 7) / 8, (heads + 7) / 8, 1)
             threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
     }
+
+    // ===================== Milestone 8A batch dispatchers =====================
+    // All _b kernels take token positions as pos0 + row (never set_pos) and
+    // rows-major SCR batch slots. Grids mirror the single-token grids with the
+    // extra rows dimension; see engine/kernels/m64_gemma4_args.h for the PODs.
+    static std::string bname(const char * base) { return std::string(base) + "_b"; }
+    void enc_b(id<MTLComputeCommandEncoder> enc, const std::string & fn) {
+        [enc setComputePipelineState:rt_.pipeline(fn.c_str())];
+        [enc setBuffer:SCR_ offset:0 atIndex:0];
+        [enc setBuffer:PACK_ offset:0 atIndex:1];
+    }
+    static uint64_t ceil_div(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
+    void dispatch_emb_b(id<MTLComputeCommandEncoder> enc, const int32_t * toks, uint32_t rows) {
+        G4EmbBArgs A;
+        A.woff = woff(tok_embd);
+        A.dst_off = b_inp; A.dst_stride = (unsigned int)n_embd;
+        A.n_embd = (unsigned int)n_embd;
+        A.row_bytes = (unsigned int)(n_embd / (int64_t)dtype_block_elems(tok_embd->dtype) *
+                                     (int64_t)dtype_type_size(tok_embd->dtype));
+        A.dtype = (unsigned int)g4_dtype_code(tok_embd->dtype);
+        A.scale = sqrtf((float)n_embd);
+        A.rows = rows; A.pad0 = 0;
+        enc_b(enc, bname(A.dtype == (unsigned int)G4_DT_Q8_0 ? "g4_emb_gather_q8_0"
+                                                              : "g4_emb_gather_f32"));
+        set_args(enc, &A, sizeof(A));
+        [enc setBytes:toks length:rows * sizeof(int32_t) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(ceil_div(n_embd, kTG), rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(kTG, 1, 1)];
+    }
+    void dispatch_gemv_b(id<MTLComputeCommandEncoder> enc, const TensorInfo * t,
+                         uint32_t x_off, uint32_t x_stride, uint32_t y_off, uint32_t y_stride,
+                         uint64_t nout, uint64_t nin, uint32_t rows) {
+        G4GemvBArgs A;
+        A.woff = woff(t);
+        A.x_off = x_off; A.y_off = y_off;
+        A.x_stride = x_stride; A.y_stride = y_stride;
+        A.nout = (unsigned int)nout; A.nin = (unsigned int)nin;
+        A.rbytes = (unsigned int)(nin / (uint64_t)dtype_block_elems(t->dtype) *
+                                  (uint64_t)dtype_type_size(t->dtype));
+        A.rows = rows;
+        enc_b(enc, bname(dense_gemv_kernel(t->dtype)));
+        set_args(enc, &A, sizeof(A));
+        [enc dispatchThreadgroups:MTLSizeMake(ceil_div(nout, 4u), ceil_div(rows, G4_RTILE), 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+    void dispatch_rope_b(id<MTLComputeCommandEncoder> enc, uint32_t off, uint32_t stride,
+                         uint32_t heads, uint32_t head_dim, uint32_t nrot, uint64_t freq_off,
+                         float freq_base, bool has_freqs, int pos0, uint32_t rows) {
+        if (heads == 0u || nrot < 2u) return;  // nothing to rotate
+        G4RopeBArgs A;
+        A.off = off; A.stride = stride;
+        A.n_heads = heads; A.head_dim = head_dim; A.n_rot = nrot;
+        A.freq_off = freq_off; A.freq_base = freq_base; A.has_freqs = has_freqs ? 1 : 0;
+        A.pos0 = pos0; A.rows = rows;
+        enc_b(enc, bname("g4_rope_neox"));
+        set_args(enc, &A, sizeof(A));
+        const uint64_t pairs = nrot / 2;
+        [enc dispatchThreadgroups:MTLSizeMake(ceil_div(pairs, 8u), ceil_div(heads, 8u), rows)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    }
+    // KV write to either the layer ring (swa/pos0 from the layer) or the chunk
+    // staging (swa=false, pos0=0) which mirrors the ring byte layout.
+    void dispatch_kv_write_b(id<MTLComputeCommandEncoder> enc, uint32_t k_off, uint32_t v_off,
+                             uint32_t k_stride, uint32_t v_stride, int64_t il,
+                             bool swa, int pos0, uint32_t rows, bool to_staging) {
+        const uint32_t hk = (uint32_t)hd_k[il], nk = (uint32_t)n_kv[il];
+        G4KvBArgs A;
+        A.k_off = k_off; A.v_off = v_off;
+        A.k_stride = k_stride; A.v_stride = v_stride;
+        A.n_kv = nk; A.hd = hk;
+        A.ring_cap = kv_cap_[il]; A.rows = rows;
+        A.is_swa = swa ? 1 : 0; A.pos0 = pos0;
+        enc_b(enc, bname(kv_q8 ? "g4_kv_write_q8" : "g4_kv_write_f16"));
+        set_args(enc, &A, sizeof(A));
+        [enc setBuffer:(to_staging ? stg_k_ : kv_k_[il]) offset:0 atIndex:4];
+        [enc setBuffer:(to_staging ? stg_v_ : kv_v_[il]) offset:0 atIndex:5];
+        const uint64_t total = kv_q8 ? (uint64_t)nk * hk / 32u : (uint64_t)nk * hk;
+        [enc dispatchThreadgroups:MTLSizeMake(ceil_div(total, kTG), rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(kTG, 1, 1)];
+    }
+    void dispatch_attn_b(id<MTLComputeCommandEncoder> enc, int64_t il, int pos0, uint32_t rows) {
+        const uint32_t hk = (uint32_t)hd_k[il], nk = (uint32_t)n_kv[il];
+        G4AttnBArgs A;
+        A.q_off = b_q; A.q_stride = (unsigned int)(n_head * hk);
+        A.out_off = b_attn; A.out_stride = (unsigned int)(n_head * hk);
+        A.n_head = (unsigned int)n_head; A.n_kv = nk;
+        A.hd = hk; A.gqa_group = (unsigned int)(n_head / nk);
+        A.ring_cap = kv_cap_[il]; A.rows = rows;
+        A.is_swa = is_swa[il] ? 1 : 0; A.n_swa = (int)n_swa; A.pos0 = pos0;
+        enc_b(enc, bname(kv_q8 ? "g4_attn_q8" : "g4_attn_f16"));
+        set_args(enc, &A, sizeof(A));
+        [enc setBuffer:kv_k_[il] offset:0 atIndex:4];
+        [enc setBuffer:kv_v_[il] offset:0 atIndex:5];
+        [enc setBuffer:stg_k_ offset:0 atIndex:6];
+        [enc setBuffer:stg_v_ offset:0 atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake((uint64_t)n_head, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(kTG, 1, 1)];
+    }
+    void dispatch_geglu_b(id<MTLComputeCommandEncoder> enc, uint32_t g_off, uint32_t u_off,
+                          uint32_t dst_off, uint32_t n, uint32_t rows) {
+        G4GeGLUBArgs A;
+        A.g_off = g_off; A.u_off = u_off; A.dst_off = dst_off;
+        A.g_stride = n; A.u_stride = n; A.dst_stride = n;  // slots are [rows][n]
+        A.n = n; A.rows = rows;
+        enc_b(enc, bname("g4_geglu"));
+        set_args(enc, &A, sizeof(A));
+        [enc dispatchThreadgroups:MTLSizeMake(ceil_div(n, kTG), rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(kTG, 1, 1)];
+    }
+    void dispatch_moe_gemv_b(id<MTLComputeCommandEncoder> enc, DType dt, uint64_t layer_base,
+                             uint64_t estr, uint64_t part_off, uint32_t x_off, uint32_t x_stride,
+                             uint32_t y_off, uint32_t y_stride, uint32_t nout, uint32_t nin,
+                             uint32_t rbytes, uint32_t k_slot, uint32_t rows, uint32_t accum) {
+        G4MoeGemvBArgs A;
+        A.layer_base = layer_base; A.expert_stride = estr; A.part_off = part_off;
+        A.x_off = x_off; A.y_off = y_off;
+        A.x_stride = x_stride; A.y_stride = y_stride;
+        A.sel_ids_off = b_sel_ids; A.sel_w_off = b_sel_w;
+        A.k_slot = k_slot; A.k_slots = (unsigned int)top_k;
+        A.nout = nout; A.nin = nin; A.rbytes = rbytes;
+        A.rows = rows; A.accum = accum;
+        enc_b(enc, bname(moe_gemv_kernel(dt)));
+        set_args(enc, &A, sizeof(A));
+        [enc dispatchThreadgroups:MTLSizeMake(ceil_div(nout, 4u), ceil_div(rows, G4_MTILE), 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+    // rms/add/copy/scale replay on batch slots by growing rows: g4_rms_norm
+    // addresses row r as base + r * k (batch stride == k) and the flat kernels
+    // just take n = rows * stride.
+    void dispatch_rms_rows(id<MTLComputeCommandEncoder> enc, uint32_t src_off, uint32_t dst_off,
+                           uint64_t w_off, uint32_t k, uint32_t rows, bool has_w, float post_scale) {
+        dispatch_rms(enc, src_off, dst_off, w_off, k, rows, has_w, post_scale);
+    }
+    void dispatch_flat(id<MTLComputeCommandEncoder> enc, const char * fn, uint32_t a_off,
+                       uint32_t b_off, uint32_t c_off, uint64_t n) {
+        // a_off/b_off/c_off used per-kernel: add = (a,b)->c, copy = a->b.
+        if (strcmp(fn, "g4_copy") == 0) {
+            G4CopyArgs A{a_off, b_off, (unsigned int)n};
+            enc_base(enc, fn);
+            set_args(enc, &A, sizeof(A));
+        } else {
+            G4AddArgs A{a_off, b_off, c_off, (unsigned int)n};
+            enc_base(enc, fn);
+            set_args(enc, &A, sizeof(A));
+        }
+        [enc dispatchThreadgroups:tg_ceil(n, kTG) threadsPerThreadgroup:MTLSizeMake(kTG, 1, 1)];
+    }
+
 
     // ===================== one token, one command buffer =====================
     StepResult forward_token(int32_t token, bool want_logits) {
@@ -745,6 +971,182 @@ private:
             [enc dispatchThreadgroups:tg_ceil((uint64_t)n_embd, kTG) threadsPerThreadgroup:MTLSizeMake(kTG, 1, 1)];
         }
     }
+
+    // ===================== Milestone 8A: one batched chunk =====================
+    // (public within Impl: Gemma4ForwardMetal::prefill drives it directly)
+public:
+    // Mirrors layer() row-for-row. Every batch slot is [rows][stride] with the
+    // stride equal to the layer's vector width, so rms/add/copy/scale run flat
+    // over rows * stride and each row replays the single-token arithmetic.
+    void layer_b(id<MTLComputeCommandEncoder> enc, int64_t il, int pos0, uint32_t rows) {
+        const LT & t = lt[il];
+        const uint32_t hk = (uint32_t)hd_k[il], nk = (uint32_t)n_kv[il], nrot = (uint32_t)n_rot[il];
+        const bool swa = is_swa[il];
+        const uint64_t ne = (uint64_t)n_embd;
+
+        // ----- attention -----
+        dispatch_rms(enc, b_inp, b_normed, woff(t.attn_norm), (uint32_t)n_embd, rows, true, 1.0f);
+        dispatch_gemv_b(enc, t.wq, b_normed, n_embd, b_q, n_head * hk, n_head * hk, ne, rows);
+        dispatch_rms(enc, b_q, b_q, woff(t.q_norm), hk, rows * n_head, true, 1.0f);
+        const TensorInfo * rft = nullptr;
+        if (!swa) rft = t.rope_freqs ? t.rope_freqs : rope_freqs_root;
+        const float freq_base = swa ? freq_base_swa : freq_base_full;
+        const uint64_t freq_off = rft ? woff(rft) : 0;
+        dispatch_rope_b(enc, b_q, n_head * hk, n_head, hk, nrot, freq_off, freq_base,
+                        rft != nullptr, pos0, rows);
+        dispatch_gemv_b(enc, t.wk, b_normed, n_embd, b_k, nk * hk, nk * hk, ne, rows);
+        if (t.wv) {
+            dispatch_gemv_b(enc, t.wv, b_normed, n_embd, b_v, nk * hk, nk * hk, ne, rows);
+        } else {  // tied V = K BEFORE norm/RoPE
+            dispatch_flat(enc, "g4_copy", b_k, b_v, 0, rows * (uint64_t)nk * hk);
+        }
+        dispatch_rms(enc, b_k, b_k, woff(t.k_norm), hk, rows * nk, true, 1.0f);
+        dispatch_rope_b(enc, b_k, nk * hk, nk, hk, nrot, freq_off, freq_base,
+                        rft != nullptr, pos0, rows);
+        dispatch_rms(enc, b_v, b_v, 0, hk, rows * nk, false, 1.0f);  // V: UNWEIGHTED norm
+
+        // Staging first (visible to this chunk's attention), then attention
+        // (ring j < pos0 | staging pos0 <= j), and only AFTER attention the
+        // rows land in the ring — a tight SWA ring (cap = n_swa + 1) must not
+        // be stomped mid-chunk.
+        dispatch_kv_write_b(enc, b_k, b_v, nk * hk, nk * hk, il, false, 0, rows, true);
+        dispatch_attn_b(enc, il, pos0, rows);
+        // Ring commit: only the last ring_cap rows for SWA layers. Earlier rows
+        // share slots with later ones (pos % cap); writing both would be a race
+        // with undefined winner, and no future row can reference them anyway.
+        // Within the kept range slot = pos % cap is unique, so writes are safe.
+        if (!swa) {
+            dispatch_kv_write_b(enc, b_k, b_v, nk * hk, nk * hk, il, swa, pos0, rows, false);
+        } else {
+            const uint32_t cap = kv_cap_[il];
+            const uint32_t keep = rows < cap ? rows : cap;
+            const uint32_t skip = rows - keep;   // staging rows not committed
+            dispatch_kv_write_b(enc, b_k + skip * nk * hk, b_v + skip * nk * hk,
+                                nk * hk, nk * hk, il, swa, pos0 + (int)skip, keep, false);
+        }
+
+        dispatch_gemv_b(enc, t.wo, b_attn, n_head * hk, b_cur, n_embd, ne, n_head * hk, rows);
+        dispatch_rms(enc, b_cur, b_cur, woff(t.post_attn_norm), (uint32_t)n_embd, rows, true, 1.0f);
+        dispatch_flat(enc, "g4_add", b_cur, b_inp, b_attn_out, rows * ne);
+
+        // ----- parallel shared MLP + routed MoE FFN -----
+        dispatch_rms(enc, b_attn_out, b_normed, woff(t.ffn_norm), (uint32_t)n_embd, rows, true, 1.0f);
+        dispatch_gemv_b(enc, t.ffn_gate, b_normed, n_embd, b_wa, n_ff, n_ff, ne, rows);
+        dispatch_gemv_b(enc, t.ffn_up, b_normed, n_embd, b_wb, n_ff, n_ff, ne, rows);
+        dispatch_geglu_b(enc, b_wa, b_wb, b_wa, n_ff, rows);
+        dispatch_gemv_b(enc, t.ffn_down, b_wa, n_ff, b_mlp, n_embd, ne, n_ff, rows);
+        dispatch_rms(enc, b_mlp, b_mlp, woff(t.post_ffw_norm_1), (uint32_t)n_embd, rows, true, 1.0f);
+
+        if (t.router_w) {
+            dispatch_rms(enc, b_attn_out, b_normed,
+                         t.router_scale ? woff(t.router_scale) : 0,
+                         (uint32_t)n_embd, rows, t.router_scale != nullptr,
+                         1.0f / sqrtf((float)n_embd));
+            dispatch_gemv_b(enc, t.router_w, b_normed, n_embd, b_router, n_expert,
+                            n_expert, ne, rows);
+            {
+                G4RouterBArgs A;
+                A.logits_off = b_router; A.logits_stride = (unsigned int)n_expert;
+                A.sel_ids_off = b_sel_ids; A.sel_w_off = b_sel_w;
+                A.n_expert = (unsigned int)n_expert; A.top_k = (unsigned int)top_k;
+                A.down_scale_off = t.down_scale ? woff(t.down_scale) : 0;
+                A.has_down_scale = t.down_scale ? 1 : 0;
+                A.rows = rows;
+                enc_b(enc, bname("g4_router_topk"));
+                set_args(enc, &A, sizeof(A));
+                [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
+            dispatch_rms(enc, b_attn_out, b_normed, woff(t.pre_ffw_norm_2),
+                         (uint32_t)n_embd, rows, true, 1.0f);
+            dispatch_flat(enc, "g4_copy", b_zero, b_eacc, 0, rows * ne);
+            const TensorInfo * ex = t.experts;
+            const int64_t pg = ex->part_bytes((n_ff_exp * n_embd / 256) * 144, 0);
+            const int64_t pu = ex->part_bytes((n_ff_exp * n_embd / 256) * 144, 1);
+            const DType dg = ex->part_dtype(ex->dtype, 0), du = ex->part_dtype(ex->dtype, 1),
+                        dd = ex->part_dtype(ex->dtype, 2);
+            const uint64_t exb = woff(ex), estr = (uint64_t)ex->expert_stride;
+            const unsigned int rb_g = (unsigned int)((uint64_t)n_embd / dtype_block_elems(dg) * dtype_type_size(dg));
+            const unsigned int rb_u = (unsigned int)((uint64_t)n_embd / dtype_block_elems(du) * dtype_type_size(du));
+            const unsigned int rb_d = (unsigned int)((uint64_t)n_ff_exp / dtype_block_elems(dd) * dtype_type_size(dd));
+            for (uint32_t e = 0; e < (uint32_t)top_k; e++) {
+                dispatch_moe_gemv_b(enc, dg, exb, estr, 0,
+                                    b_normed, n_embd, b_ea, n_ff_exp,
+                                    n_ff_exp, n_embd, rb_g, e, rows, 0u);
+                dispatch_moe_gemv_b(enc, du, exb, estr, (unsigned long)pg,
+                                    b_normed, n_embd, b_eb, n_ff_exp,
+                                    n_ff_exp, n_embd, rb_u, e, rows, 0u);
+                dispatch_geglu_b(enc, b_ea, b_eb, b_ea, n_ff_exp, rows);
+                dispatch_moe_gemv_b(enc, dd, exb, estr, (unsigned long)(pg + pu),
+                                    b_ea, n_ff_exp, b_eacc, n_embd,
+                                    n_embd, n_ff_exp, rb_d, e, rows, 1u);
+            }
+            dispatch_rms(enc, b_eacc, b_moe, woff(t.post_ffw_norm_2),
+                         (uint32_t)n_embd, rows, true, 1.0f);
+            dispatch_flat(enc, "g4_add", b_mlp, b_moe, b_cur, rows * ne);
+        } else {
+            dispatch_flat(enc, "g4_copy", b_mlp, b_cur, 0, rows * ne);
+        }
+        dispatch_rms(enc, b_cur, b_cur, woff(t.post_ffw_norm), (uint32_t)n_embd, rows, true, 1.0f);
+        dispatch_flat(enc, "g4_add", b_cur, b_attn_out, b_inp, rows * ne);
+        if (t.layer_scale) {
+            G4ScaleArgs A;
+            A.dst_off = b_inp; A.n = (unsigned int)(rows * ne); A.woff = woff(t.layer_scale);
+            enc_base(enc, "g4_scale_scalar_buf");
+            set_args(enc, &A, sizeof(A));
+            [enc dispatchThreadgroups:tg_ceil(rows * ne, kTG) threadsPerThreadgroup:MTLSizeMake(kTG, 1, 1)];
+        }
+    }
+
+    StepResult forward_chunk(const int32_t * toks, uint32_t rows, bool want_logits) {
+        StepResult r{nullptr, 0, -1};
+        if (rows == 0u) return r;
+        if (pos_ >= ctx) reset();
+        const int pos0 = (int)pos_;
+
+        id<MTLCommandBuffer> cmd = [rt_.queue() commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        dispatch_emb_b(enc, toks, rows);
+        for (int64_t il = 0; il < n_layer; il++) layer_b(enc, il, pos0, rows);
+
+        if (want_logits) {
+            // final norm + LM head on the LAST chunk row only (into the
+            // single-token slots so softcap/argmax/readback are byte-identical)
+            dispatch_rms(enc, b_inp + (rows - 1) * n_embd, off_cur,
+                         woff(output_norm), (uint32_t)n_embd, 1u, true, 1.0f);
+            const TensorInfo * lm = output ? output : tok_embd;
+            dispatch_gemv(enc, lm, off_cur, off_logits, (uint64_t)vocab_rows, (uint64_t)n_embd);
+            if (cap > 0.0f) {
+                G4SoftcapArgs A;
+                A.src_off = off_logits; A.dst_off = off_logits;
+                A.n = (unsigned int)vocab_rows; A.cap = cap;
+                enc_base(enc, "g4_softcap");
+                set_args(enc, &A, sizeof(A));
+                [enc dispatchThreadgroups:tg_ceil((uint64_t)vocab_rows, kTG)
+                    threadsPerThreadgroup:MTLSizeMake(kTG, 1, 1)];
+            }
+            G4ArgmaxArgs A;
+            A.src_off = off_logits; A.out_off = off_argmax_out;
+            A.arena_off = off_argmax_arena; A.n = (unsigned int)vocab_eff;
+            enc_base(enc, "g4_argmax");
+            set_args(enc, &A, sizeof(A));
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(kTG, 1, 1)];
+        }
+
+        [enc endEncoding];
+        rt_.wait(cmd);
+
+        if (want_logits) {
+            const float * s = (const float *)SCR_.contents;
+            logits_.assign(s + off_logits, s + off_logits + vocab_rows);
+            r.logits = logits_.data();
+            r.n_logits = vocab_eff;
+            r.argmax = ((const int32_t *)(s + off_argmax_out))[0];
+        }
+        pos_ += rows;
+        return r;
+    }
 };
 
 Gemma4ForwardMetal::Gemma4ForwardMetal() = default;
@@ -762,9 +1164,32 @@ StepResult Gemma4ForwardMetal::step(int32_t token) { return impl_->forward_token
 
 StepResult Gemma4ForwardMetal::prefill(const std::vector<int32_t> & prompt) {
     StepResult r{nullptr, 0, -1};
-    for (size_t i = 0; i + 1 < prompt.size(); i++) r = impl_->forward_token(prompt[i], false);
-    r = impl_->forward_token(prompt.back(), true);
+    if (prompt.empty()) return r;
+    if (prompt.size() == 1) return impl_->forward_token(prompt[0], true);
+    // Any out-of-range token keeps the legacy per-token semantics (error step,
+    // tokens consumed until then), so bail to the old loop.
+    for (int32_t t : prompt)
+        if (t < 0 || (int64_t)t >= impl_->vocab_eff) {
+            for (size_t i = 0; i + 1 < prompt.size(); i++) r = impl_->forward_token(prompt[i], false);
+            return impl_->forward_token(prompt.back(), true);
+        }
+    const uint32_t chunk = impl_->chunk_ > 0
+        ? (uint32_t)std::min<int64_t>(impl_->chunk_, (int64_t)G4_BMAX) : (uint32_t)G4_BMAX;
+    size_t i = 0;
+    while (i < prompt.size()) {
+        if (impl_->pos_ >= impl_->ctx) impl_->reset();
+        uint32_t rows = (uint32_t)std::min<uint64_t>(chunk, prompt.size() - i);
+        const int64_t room = impl_->ctx - impl_->pos_;
+        if ((int64_t)rows > room) rows = (uint32_t)room;  // next round trips the reset
+        r = impl_->forward_chunk(prompt.data() + i, rows, i + rows >= prompt.size());
+        i += rows;
+    }
     return r;
+}
+
+void Gemma4ForwardMetal::set_prefill_chunk(int n) {
+    if (!impl_) return;
+    impl_->chunk_ = n > 0 ? std::min<int64_t>(n, (int64_t)G4_BMAX) : 0;  // 0 => G4_BMAX
 }
 
 void Gemma4ForwardMetal::reset() { if (impl_) impl_->reset(); }

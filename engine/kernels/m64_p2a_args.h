@@ -450,3 +450,84 @@ struct MoeDownQ5F32Args {
     unsigned int wtab_off, pad0;                // SCR uint32 arena slot table (0 = direct)
     unsigned int nout, k, stride, pad1;         // k % 32 == 0; stride = expert blob bytes
 };
+// ===================== Milestone 9B: batched small prefill helpers =====================
+// Batched (grid.y/.z = token b in [0,B)) clones of the tiny per-token prefill
+// kernels k_xfer / k_rms+k_mix_fused / k_ctrl_down+k_ctrl_up. Element shapes
+// are copied verbatim from the single-token kernels so batch results are
+// bitwise-identical to the old for(b=0..B) dispatch loops.
+
+// grid = (ceil(nmax/256), B, npairs) threadgroups of 256.
+// is_copy=1: c[pair] = a[pair];  is_copy=0: a[pair] += b[pair] (same
+// `a = a + b` shape as k_xfer). Strides are float offsets per token.
+// sizeof == 72.
+struct XferBatchArgs {
+    unsigned int a[2], b[2], c[2], n[2];
+    unsigned int a_stride[2], b_stride[2], c_stride[2];
+    unsigned int B, npairs, is_copy, pad0;
+};
+
+// Batched RMS rows feeding k_mix_fused_batch. grid = (n+1, B) of 256.
+// Rows r < n read states + b*states_stride + (n-1-r)*k (slot 0 = NEWEST
+// block, matching do_mix's xr ordering); row n reads extra + b*extra_stride.
+// Reduction is k_rms' verbatim (hasw=0 path) -> bitwise vs the per-token
+// k_rms dispatches. sizeof == 40.
+struct MixRmsBatchArgs {
+    unsigned int states, states_stride;
+    unsigned int extra, extra_stride;
+    unsigned int stn, stn_stride;               // y = stn + b*stn_stride + r*k
+    unsigned int n, B, k, pad0;
+};
+
+// Batched k_mix_fused. grid = (nq, B) of 256; qpack rows shared across b.
+// sizeof == 48.
+struct MixFusedBatchArgs {
+    unsigned long qpack;                        // PACK q rows [j][M64_NE] fp32
+    unsigned int stnoff, stn_stride, outoff, out_stride;
+    unsigned int S, nq, B, pad0;
+    float scale;                                // 1/sqrt(kNE)
+};
+
+// Batched k_ctrl_down (grid (64, nc, B) x 256) / k_ctrl_up (grid
+// (ceil(ne/32), nc, B) x 32). in/msg/out hold TOKEN-0 offsets; per-token
+// stride comes from *_stride. hh points at a B*4*64 SCR region (NOT the
+// shared single-token o.ctrl_hh) so all B tokens run concurrently.
+// gcat rows per token = 2*nc*kNE (rms pairs at +2j*kNE / +kNE+2j*kNE).
+// sizeof == 192.
+struct CtrlBatchSplitArgs {
+    unsigned long wdown[4], wgain[4], wforg[4];
+    unsigned int in[4], msg[4], out[4];
+    unsigned int in_stride, msg_stride, out_stride;
+    unsigned int gcat, gcat_stride;
+    unsigned int hh, hh_stride;
+    unsigned int grank, ne, nc, B;
+    float eps;                                  // documented-only (split path)
+};
+
+// ---------------- Milestone 11: decode dispatch fusion ----------------
+// k_qkv_prep_kv_write_{q8,f16}: one 64-threadgroup dispatch (grid=(64,1,1),
+// tg=(32,1,1)) replaces clip(Q)+clip(K)+rms(V)+clip(Rr)+k_kv_write_{q8,f16}.
+// wg 0..23: Q heads clip (qclip PACK scale or M64_NOFF, in-place SCR);
+// wg 24..31: K heads clip -> direct KV write; wg 32..39: V heads per-head
+// rmsnorm -> direct KV write (o.emb staging eliminated); wg 40..63: Rr heads
+// clip (relclip PACK scale or M64_NOFF, in-place SCR). dst_k/dst_v keep the
+// KVWriteF16Args HALF-element units (*2 for the Q8 byte base).
+// sizeof == 64.
+struct QkvPrepKvArgs {
+    unsigned long qclip_off, relclip_off, dst_k, dst_v;   // PACK / half-units
+    unsigned int qoff, koff, voff, roff;                  // SCR float offsets
+    float qk_thresh, rel_thresh, eps;
+    unsigned int pad0;
+};
+
+// k_postconv_residual: flat (n=kNE)x128 dispatch replaces
+// k_conv_slot + k_xfer (2 dispatches). push=1 snapshots cur -> blkoff then
+// cur = y (ip%6==0 block push); push=0 folds cur += y (thread-local c, so
+// the read/write of the same element is race-free).
+// sizeof == 40.
+struct PostConvResArgs {
+    unsigned long wconv;                        // PACK wconv [kNE][4] f32
+    unsigned int rsoff, xoff, curoff, blkoff, n, push;
+    float scale;
+    unsigned int pad0;
+};
+

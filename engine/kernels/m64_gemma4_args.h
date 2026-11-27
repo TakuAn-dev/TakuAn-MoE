@@ -189,3 +189,124 @@ struct G4ArgmaxArgs {
     unsigned int  n;
 };
 static_assert(sizeof(G4ArgmaxArgs) == 16, "G4ArgmaxArgs layout");
+
+// ==== Milestone 8A: chunked batched prefill =================================
+// Every _b kernel computes EXACTLY the same arithmetic, in the same order,
+// for `rows` consecutive tokens as its single-token counterpart: batch slots
+// are row-major [rows][stride] float regions of SCR, per-token positions are
+// pos0+row, and dense GEMVs stream each weight row once per G4_RTILE batch
+// rows (MoE: per G4_MTILE rows, where each row may select a different
+// expert). Result: a batched chunk is bit-for-bit equal to replaying
+// forward_token() once per token.
+
+#define G4_BMAX 64u   // hard cap on rows per prefill chunk (scratch sizing)
+#define G4_RTILE 8u   // dense GEMV: rows handled per simdgroup pass
+#define G4_MTILE 4u   // MoE GEMV: (row, slot) pairs per simdgroup pass
+
+// Token ids arrive as buffer(3): a `constant int *` array of `rows` entries.
+struct G4EmbBArgs {
+    unsigned long woff;          // PACK: embedding table row 0
+    unsigned int  dst_off;       // SCR float offset of batch row 0
+    unsigned int  dst_stride;    // floats per batch row (= n_embd)
+    unsigned int  n_embd, row_bytes, dtype;   // as G4EmbArgs
+    float         scale;
+    unsigned int  rows;
+    unsigned int  pad0;              // keeps sizeof 8-byte aligned (40)
+};
+static_assert(sizeof(G4EmbBArgs) == 40, "G4EmbBArgs layout");
+
+struct G4GemvBArgs {
+    unsigned long woff;
+    unsigned int  x_off, y_off;
+    unsigned int  x_stride, y_stride;  // floats per batch row of x / y
+    unsigned int  nout, nin;
+    unsigned int  rbytes;
+    unsigned int  rows;
+};
+static_assert(sizeof(G4GemvBArgs) == 40, "G4GemvBArgs layout");
+
+struct G4RopeBArgs {
+    unsigned long freq_off;
+    unsigned int  off, stride;         // SCR batch slot base + floats / row
+    unsigned int  n_heads, head_dim;
+    unsigned int  n_rot;
+    float         freq_base;
+    int           has_freqs;
+    int           pos0;                // position of batch row 0
+    unsigned int  rows;
+};
+static_assert(sizeof(G4RopeBArgs) == 48, "G4RopeBArgs layout");
+
+// Batch KV write. Same PACK-free layout as G4KvArgs plus per-row strides and
+// a base position: token position of batch row r is pos0 + r, and
+//   slot = is_swa ? ((pos0+r) % ring_cap) : (pos0 + r)
+// The SAME kernel writes the in-chunk staging buffer (is_swa=0, pos0=0,
+// ring_cap ignored) which mirrors the ring byte layout for rows 0..rows-1.
+struct G4KvBArgs {
+    unsigned int  k_off, v_off;
+    unsigned int  k_stride, v_stride;  // floats per batch row
+    unsigned int  n_kv, hd;
+    unsigned int  ring_cap, rows;
+    int           is_swa;
+    int           pos0;
+};
+static_assert(sizeof(G4KvBArgs) == 40, "G4KvBArgs layout");
+
+// Batch causal attention: threadgroup (x = Q head, y = batch row).
+// Positions j < pos0 are read from the ring (KBUF/VBUF, buffer(4)/(5));
+// positions pos0 <= j <= pos0+row are read from the staging copy
+// (SBUF/SVBUF, buffer(6)/(7)) written by g4_kv_write_*_b earlier in the same
+// encoder — the ring write for the chunk happens only AFTER attention so the
+// tight SWA rings (cap = n_swa+1) are never clobbered mid-chunk.
+struct G4AttnBArgs {
+    unsigned int  q_off, q_stride;
+    unsigned int  out_off, out_stride;
+    unsigned int  n_head, n_kv;
+    unsigned int  hd, gqa_group;
+    unsigned int  ring_cap;
+    unsigned int  rows;
+    int           is_swa;
+    int           n_swa;
+    int           pos0;
+};
+static_assert(sizeof(G4AttnBArgs) == 52, "G4AttnBArgs layout");
+
+// One row per threadgroup (tid==0 runs the same single-thread algorithm).
+struct G4RouterBArgs {
+    unsigned long down_scale_off;
+    unsigned int  logits_off, logits_stride;
+    unsigned int  sel_ids_off, sel_w_off;  // row-major [rows][top_k]
+    unsigned int  n_expert, top_k;
+    unsigned int  rows;
+    int           has_down_scale;
+};
+static_assert(sizeof(G4RouterBArgs) == 40, "G4RouterBArgs layout");
+
+// GeGLU with independent row strides (work_a/work_b slots are wide-shared
+// between the shared MLP (n_ff) and the experts (n_ff_exp), so a flat
+// B*n mapping does not apply).
+struct G4GeGLUBArgs {
+    unsigned int  g_off, u_off, dst_off;
+    unsigned int  g_stride, u_stride, dst_stride;
+    unsigned int  n, rows;
+};
+static_assert(sizeof(G4GeGLUBArgs) == 32, "G4GeGLUBArgs layout");
+
+// MoE expert GEMV for a chunk: batch row r uses expert
+// sel_ids[sel_ids_off + r * k_slots + k_slot]. With G4_MTILE rows per
+// simdgroup pass the weight row is streamed per row (experts differ), while
+// parallelism over all rows x nout replaces the old sequential top_k chain.
+struct G4MoeGemvBArgs {
+    unsigned long layer_base;
+    unsigned long expert_stride;
+    unsigned long part_off;
+    unsigned int  x_off, y_off;
+    unsigned int  x_stride, y_stride;
+    unsigned int  sel_ids_off, sel_w_off;
+    unsigned int  k_slot, k_slots;
+    unsigned int  nout, nin;
+    unsigned int  rbytes;
+    unsigned int  rows;
+    unsigned int  accum;         // 1: y[row] += sel_w[row,k_slot] * dot
+};
+static_assert(sizeof(G4MoeGemvBArgs) == 80, "G4MoeGemvBArgs layout");

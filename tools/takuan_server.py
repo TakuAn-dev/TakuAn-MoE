@@ -269,18 +269,13 @@ def format_chat_prompt(messages, bpe, reasoning_effort="none", tools=None):
     return "".join(out)
 
 
-def split_static_chat_prefix(messages, bpe, reasoning_effort="none", tools=None):
-    """Static head of the Inkling prompt: tool_declare + leading system
-    messages + thinking-effort line — everything before the FIRST non-system
-    message. Returns ("", []) when the GGUF has no Inkling template or the
-    head fails to tokenize.
-
-    This is an exact string prefix of format_chat_prompt's output, so the
-    server can WARM-pin it in the worker and every turn of every conversation
-    reuses it bitwise-exactly (KV + ShortConv prefix caching).
-    """
+def format_static_chat_prefix_text(messages, bpe, reasoning_effort="none", tools=None):
+    """Static head STRING of the Inkling prompt (see split_static_chat_prefix)
+    WITHOUT tokenizing — plain concatenation only. Returns "" when the GGUF
+    has no Inkling template. Milestone 14: lets the warm path skip every
+    bpe.encode() call for an unchanged prefix."""
     if not has_inkling_template(bpe):
-        return "", []
+        return ""
     out = []
     if tools and has_inkling_tools(bpe):
         decl = _tool_declare_segment(tools)
@@ -296,7 +291,23 @@ def split_static_chat_prefix(messages, bpe, reasoning_effort="none", tools=None)
         out.append(INKLING_ROLE_TOKEN["system"] + "<|content_text|>" + text
                    + "<|end_message|>")
     out.append(effort_line)
-    prefix = "".join(out)
+    return "".join(out)
+
+
+def split_static_chat_prefix(messages, bpe, reasoning_effort="none", tools=None):
+    """Static head of the Inkling prompt: tool_declare + leading system
+    messages + thinking-effort line — everything before the FIRST non-system
+    message. Returns ("", []) when the GGUF has no Inkling template or the
+    head fails to tokenize.
+
+    This is an exact string prefix of format_chat_prompt's output, so the
+    server can WARM-pin it in the worker and every turn of every conversation
+    reuses it bitwise-exactly (KV + ShortConv prefix caching).
+    """
+    if not has_inkling_template(bpe):
+        return "", []
+    prefix = format_static_chat_prefix_text(messages, bpe, reasoning_effort,
+                                            tools=tools)
     try:
         ids = bpe.encode(prefix)
     except ValueError:
@@ -363,7 +374,9 @@ class EngineWorker:
                 % (rc, " ".join(cmd[:4]), (" | " + tail) if tail else ""))
         self.ready = line.strip()
 
-    def generate(self, prompt_ids, max_tokens, temperature, top_p, seed, eos_ids):
+    def generate(self, prompt_ids, max_tokens, temperature, top_p, seed,
+                 eos_ids, presence_penalty=0.0, frequency_penalty=0.0,
+                 repetition_penalty=1.0, penalty_last_n=256):
         """Yield ("tok", id) then ("done", n_gen, elapsed_ms, finish_reason).
 
         The worker lock is held for the whole exchange. If the consumer
@@ -371,6 +384,10 @@ class EngineWorker:
         finally below cancels the GEN (SIGUSR1 on the real m64run) and drains
         stdout up to DONE/ERR *before* releasing the lock, so the worker is
         back at its command prompt and the pipe never fills up to deadlock.
+
+        Penalties (Milestone 8B) are appended as optional k=v tokens before
+        "--"; with all penalties disabled the line stays in the legacy
+        format byte-for-byte (backward compat with mock/old workers).
         """
         with self.lock:
             if self._closed or self.proc.poll() is not None:
@@ -379,9 +396,19 @@ class EngineWorker:
             if pipe is None:
                 raise RuntimeError("worker has no stdout pipe")
             eos = ",".join(str(i) for i in eos_ids) if eos_ids else "-1"
-            line = "GEN %d %s %s %d %s -- %s\n" % (
+            pen_opts = []
+            if presence_penalty:
+                pen_opts.append("presence_penalty=%r" % float(presence_penalty))
+            if frequency_penalty:
+                pen_opts.append("frequency_penalty=%r" % float(frequency_penalty))
+            if repetition_penalty != 1.0:
+                pen_opts.append("repetition_penalty=%r" % float(repetition_penalty))
+            if penalty_last_n != 256:
+                pen_opts.append("penalty_last_n=%d" % int(penalty_last_n))
+            pen_seg = (" ".join(pen_opts) + " ") if pen_opts else ""
+            line = "GEN %d %s %s %d %s %s-- %s\n" % (
                 int(max_tokens), repr(float(temperature)), repr(float(top_p)),
-                int(seed) & 0xFFFFFFFFFFFFFFFF, eos,
+                int(seed) & 0xFFFFFFFFFFFFFFFF, eos, pen_seg,
                 " ".join(str(i) for i in prompt_ids))
             try:
                 self.proc.stdin.write(line)
@@ -543,13 +570,21 @@ def _make_stream_fn(worker, bpe, ctx):
     tid_ch_close = bpe.id_of.get("<channel|>")
 
     def run(prompt_ids, max_tokens, temperature, top_p, seed, stop_strings,
-            yield_fn, structured=False):
+            yield_fn, structured=False, presence_penalty=0.0,
+            frequency_penalty=0.0, repetition_penalty=1.0):
         eos_ids = resolve_eos_ids(bpe, structured=structured)
         stops = [s for s in (stop_strings or []) if isinstance(s, str) and s]
         hold = max((len(s) for s in stops), default=0)
         dec = StreamDecoder(bpe, skip_special_tokens=False)
+        # Only forward penalties when active so legacy 6-arg worker objects
+        # (test mocks) keep working unchanged.
+        gen_kwargs = {}
+        if presence_penalty or frequency_penalty or repetition_penalty != 1.0:
+            gen_kwargs = {"presence_penalty": float(presence_penalty),
+                          "frequency_penalty": float(frequency_penalty),
+                          "repetition_penalty": float(repetition_penalty)}
         gen = worker.generate(prompt_ids, max_tokens, temperature, top_p,
-                              seed, eos_ids)
+                              seed, eos_ids, **gen_kwargs)
         text = []
         reasoning = []
         tool_calls = []
@@ -858,12 +893,27 @@ class Handler(BaseHTTPRequestHandler):
         raw_temp = body.get("temperature")
         raw_top_p = body.get("top_p")
         raw_seed = body.get("seed")
+        raw_presence = body.get("presence_penalty")
+        raw_frequency = body.get("frequency_penalty")
+        raw_repetition = body.get("repetition_penalty")
         top_p = float(0.95 if raw_top_p is None else raw_top_p)
         top_p = max(1e-6, min(1.0, top_p))
+        # Milestone 8B: penalties default from server flags (body wins; an
+        # explicit 0.0 in the body disables a server default too).
+        presence = float(getattr(self.cfg, "default_presence_penalty", 0.0)
+                         if raw_presence is None else raw_presence)
+        frequency = float(0.0 if raw_frequency is None else raw_frequency)
+        repetition = float(1.0 if raw_repetition is None else raw_repetition)
+        if repetition <= 0.0:
+            repetition = 1.0  # nonsensical <= 0 disables (worker rejects it)
         return {
             "max_tokens": max(1, int(32768 if raw_mt is None else raw_mt)),
-            "temperature": max(0.0, float(0.0 if raw_temp is None else raw_temp)),
+            "temperature": max(0.0, float(getattr(self.cfg, "default_temp", 0.0)
+                                          if raw_temp is None else raw_temp)),
             "top_p": top_p,
+            "presence_penalty": max(-2.0, min(2.0, presence)),
+            "frequency_penalty": max(-2.0, min(2.0, frequency)),
+            "repetition_penalty": repetition,
             "seed": int(0 if raw_seed is None else raw_seed),
             "stream": bool(body.get("stream", False)),
             "stop": _as_stop_list(body.get("stop")),
@@ -901,33 +951,49 @@ class Handler(BaseHTTPRequestHandler):
     def _maybe_warm_static_prefix(self, msgs, p, tools):
         """Pin the static tool_declare + system head in the worker. The GEN
         LRU only covers repeats of the SAME conversation; this warm_state
-        survives across brand-new conversations sharing one system prompt."""
-        if not has_inkling_template(self.cfg.bpe):
-            return
-        prefix_text, prefix_ids = split_static_chat_prefix(
+        survives across brand-new conversations sharing one system prompt.
+        Milestone 14: the unchanged-prefix fast path is a pure string compare
+        — zero bpe.encode() AND zero worker.warm() per turn."""
+        prefix_text = format_static_chat_prefix_text(
             msgs, self.cfg.bpe, p["reasoning_effort"], tools=tools)
-        if len(prefix_ids) < 64 or len(prefix_ids) >= self.cfg.ctx:
-            # Ultra-tiny prefixes bail before the <512 guard below; if a long
-            # static warm is pinned, flag re-sync anyway — this GEN resets
-            # the worker's warm_state, so the next long turn must re-WARM.
-            if len(prefix_ids) < 64 and \
-                    getattr(self.cfg, "last_warm_len", 0) >= 1024:
-                self.cfg.warm_needs_sync = True
-            return
+        if not prefix_text:
+            return  # no Inkling template
+        prefix_ids = None
         with self.cfg.warm_lock:
-            last_len = getattr(self.cfg, "last_warm_len", 0)
-            needs_sync = getattr(self.cfg, "warm_needs_sync", False)
-            # Don't let tiny background prompts (<512 tok) clobber an active
-            # long static warm prefix (>=1024 tok); re-sync on the next long turn.
-            if last_len >= 1024 and len(prefix_ids) < 512:
-                self.cfg.warm_needs_sync = True
+            if self.cfg.last_warm_prefix == prefix_text:
+                if not getattr(self.cfg, "warm_needs_sync", False):
+                    return  # pinned + in sync: nothing to do at all
+                ids = getattr(self.cfg, "last_warm_ids", None)
+                if ids and getattr(self.cfg, "last_warm_len", 0) >= 64:
+                    # Re-sync the worker with the cached ids — no re-tokenize.
+                    prefix_ids = ids
+                    self.cfg.warm_needs_sync = False
+        if prefix_ids is None:
+            try:
+                prefix_ids = self.cfg.bpe.encode(prefix_text)
+            except ValueError:
+                if getattr(self.cfg, "last_warm_len", 0) >= 1024:
+                    self.cfg.warm_needs_sync = True
                 return
-            if self.cfg.last_warm_prefix == prefix_text and not needs_sync:
+            if len(prefix_ids) < 64 or len(prefix_ids) >= self.cfg.ctx:
+                # Ultra-tiny prefixes bail before the <512 guard below; if a long
+                # static warm is pinned, flag re-sync anyway — this GEN resets
+                # the worker's warm_state, so the next long turn must re-WARM.
+                if len(prefix_ids) < 64 and \
+                        getattr(self.cfg, "last_warm_len", 0) >= 1024:
+                    self.cfg.warm_needs_sync = True
                 return
-            self.cfg.last_warm_prefix = prefix_text
-            self.cfg.last_warm_len = len(prefix_ids)
-            self.cfg.last_warm_ids = prefix_ids
-            self.cfg.warm_needs_sync = False
+            with self.cfg.warm_lock:
+                last_len = getattr(self.cfg, "last_warm_len", 0)
+                # Don't let tiny background prompts (<512 tok) clobber an active
+                # long static warm prefix (>=1024 tok); re-sync on the next long turn.
+                if last_len >= 1024 and len(prefix_ids) < 512:
+                    self.cfg.warm_needs_sync = True
+                    return
+                self.cfg.last_warm_prefix = prefix_text
+                self.cfg.last_warm_len = len(prefix_ids)
+                self.cfg.last_warm_ids = prefix_ids
+                self.cfg.warm_needs_sync = False
         try:
             self.cfg.worker.warm(prefix_ids)
         except RuntimeError:
@@ -1057,7 +1123,10 @@ class Handler(BaseHTTPRequestHandler):
                 prepare_warm()
                 res = self.cfg.run_stream(
                     ids, p["max_tokens"], p["temperature"], p["top_p"], p["seed"],
-                    p["stop"], yield_fn, structured=structured)
+                    p["stop"], yield_fn, structured=structured,
+                    presence_penalty=p["presence_penalty"],
+                    frequency_penalty=p["frequency_penalty"],
+                    repetition_penalty=p["repetition_penalty"])
             except Exception as e:
                 stop_ka.set()
                 if ka_thread is not None:
@@ -1092,7 +1161,10 @@ class Handler(BaseHTTPRequestHandler):
 
         res = self.cfg.run_stream(
             ids, p["max_tokens"], p["temperature"], p["top_p"], p["seed"],
-            p["stop"], yield_fn, structured=structured)
+            p["stop"], yield_fn, structured=structured,
+            presence_penalty=p["presence_penalty"],
+            frequency_penalty=p["frequency_penalty"],
+            repetition_penalty=p["repetition_penalty"])
         n_in, n_out = res["n_in"], res["n_out"]
         if chat:
             msg_obj = {
@@ -1170,6 +1242,13 @@ def main():
                     help="alias for --speculative (overrides it when > 0)")
     ap.add_argument("--worker-cmd",
                     help="override worker command (shlex-split; for mock testing)")
+    ap.add_argument("--default-temp", type=float, default=0.0,
+                    help="temperature used when the request body omits it "
+                         "(default 0.0 = greedy, legacy behavior)")
+    ap.add_argument("--default-presence-penalty", type=float, default=0.0,
+                    help="presence_penalty used when the request body omits "
+                         "it (default 0.0 = disabled); > 0 discourages "
+                         "repeats of recently generated tokens")
     a = ap.parse_args()
     if not a.worker_cmd and not a.pack:
         ap.error("--pack is required unless --worker-cmd is set")
@@ -1206,6 +1285,8 @@ def main():
 
     cfg = argparse.Namespace(model=a.model_name, ctx=a.ctx, bpe=bpe,
                              worker=worker, created=time.time(),
+                             default_temp=a.default_temp,
+                             default_presence_penalty=a.default_presence_penalty,
                              warm_lock=threading.Lock(), last_warm_prefix=None,
                              last_warm_len=0, last_warm_ids=None,
                              warm_needs_sync=False,
