@@ -57,6 +57,28 @@
 | `--arena-gb 8 --io mtlio` | 8.58 GB | **5.81 tok/s** | **0 MB** | エキスパートスロット 795、ヒット率 76.4% |
 | `--arena-gb 12 --io mtlio` | 12.88 GB | **26.48 tok/s** | **0 MB** | スロット 1,302、ヒット率 85.9%、SSD 34.59 GB/s、argmax 9/9 |
 
+## クイックスタート
+
+1. **エンジンのビルド**（Apple 純正 `clang++` + Metal のみ、外部依存ゼロ）:
+   ```sh
+   make
+   ```
+2. **対応 GGUF モデルの取得**（単一 `.gguf` ファイル）:
+   - `Inkling-2-Mini`（`Q8_0` または `Q4_K_S`、例：`Inkling-2-Mini-Q8_0.gguf`）
+   - `gemma-4-26B-A4B`（`Q8_0` / `Q4_K_M` / `Q4_K_S`、例：`gemma-4-26b-a4b.gguf`）
+3. **GGUF から `.m64pack` への変換**（手順 4 で `--pack` を省略して自動変換させることもできます）:
+   ```sh
+   python3 tools/m64pack.py pack <MODEL_DIR>/Inkling-2-Mini-Q8_0.gguf \
+     <MODEL_DIR>/inkling-2-mini-q8_0.m64pack
+   ```
+   `m64pack.py` は追加パッケージなし（Python 3 標準ライブラリのみ）で動作します（大容量モデルを高速変換したい場合のみ任意で `pip install xxhash` が使えます）。
+4. **サーバー起動**:
+   ```sh
+   # --pack を省略すると、初回起動時に <MODEL_DIR>/Inkling-2-Mini-Q8_0.m64pack を自動生成します:
+   python3 tools/takuan_server.py --gguf <MODEL_DIR>/Inkling-2-Mini-Q8_0.gguf \
+     --port 8080 --ctx 131072
+   ```
+
 ## ビルド
 
 ```sh

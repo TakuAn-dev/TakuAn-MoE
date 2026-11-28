@@ -1215,7 +1215,10 @@ def free_port():
 def main():
     ap = argparse.ArgumentParser(
         description="TakuAn-MoE OpenAI-compatible backend server (stdlib only).")
-    ap.add_argument("--pack", help="path to .m64pack (required unless --worker-cmd)")
+    ap.add_argument("--pack",
+                    help="path to .m64pack (if omitted, defaults to "
+                         "<gguf_stem>.m64pack next to --gguf and auto-packs "
+                         "via tools/m64pack.py when missing)")
     ap.add_argument("--gguf", required=True,
                     help="GGUF with tokenizer metadata for in-process BPE")
     ap.add_argument("--engine", default="build/m64run",
@@ -1250,10 +1253,31 @@ def main():
                          "it (default 0.0 = disabled); > 0 discourages "
                          "repeats of recently generated tokens")
     a = ap.parse_args()
-    if not a.worker_cmd and not a.pack:
-        ap.error("--pack is required unless --worker-cmd is set")
     if not os.path.exists(a.gguf):
         ap.error("--gguf not found: %s" % a.gguf)
+    if not a.worker_cmd and not a.pack:
+        stem = a.gguf[:-5] if a.gguf.lower().endswith(".gguf") else a.gguf
+        pack_path = stem + ".m64pack"
+        if not os.path.exists(pack_path):
+            m64pack = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "m64pack.py")
+            tmp_pack = pack_path + ".tmp"
+            cmd = [sys.executable, m64pack, "pack", a.gguf, tmp_pack]
+            sys.stderr.write("takuan: --pack omitted and %s missing; "
+                             "auto-packing via: %s\n"
+                             % (pack_path, " ".join(shlex.quote(c) for c in cmd)))
+            sys.stderr.flush()
+            try:
+                subprocess.run(cmd, check=True)
+                os.replace(tmp_pack, pack_path)
+            except BaseException:
+                if os.path.exists(tmp_pack):
+                    try:
+                        os.unlink(tmp_pack)
+                    except OSError:
+                        pass
+                raise
+        a.pack = pack_path
 
     bpe = BPE(a.gguf)
     prefix_extra = [] if a.prefix_cache is None \

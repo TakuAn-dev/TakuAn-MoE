@@ -111,6 +111,28 @@ Reference oracle: `llama.cpp` (Metal). Full data in
 | `--arena-gb 8 --io mtlio` | 8.58 GB | **5.81 tok/s** | **0 MB** | 795 expert slots, 76.4% hit rate |
 | `--arena-gb 12 --io mtlio` | 12.88 GB | **26.48 tok/s** | **0 MB** | 1,302 slots, 85.9% hit, 34.59 GB/s SSD, 9/9 argmax |
 
+## Quick Start
+
+1. **Build the engine** (Apple `clang++` + Metal only, no external dependencies):
+   ```sh
+   make
+   ```
+2. **Download a supported GGUF model** (single-file GGUF):
+   - `Inkling-2-Mini` (`Q8_0` or `Q4_K_S`, e.g. `Inkling-2-Mini-Q8_0.gguf`)
+   - `gemma-4-26B-A4B` (`Q8_0` / `Q4_K_M` / `Q4_K_S`, e.g. `gemma-4-26b-a4b.gguf`)
+3. **Convert GGUF to `.m64pack`** (or let `takuan_server.py` auto-pack on first launch by omitting `--pack`):
+   ```sh
+   python3 tools/m64pack.py pack <MODEL_DIR>/Inkling-2-Mini-Q8_0.gguf \
+     <MODEL_DIR>/inkling-2-mini-q8_0.m64pack
+   ```
+   `m64pack.py` runs with Python 3 stdlib out of the box (optional `pip install xxhash` speeds up hashing on multi-GB models).
+4. **Start the server**:
+   ```sh
+   # Auto-packs <MODEL_DIR>/Inkling-2-Mini-Q8_0.m64pack on first run if --pack is omitted:
+   python3 tools/takuan_server.py --gguf <MODEL_DIR>/Inkling-2-Mini-Q8_0.gguf \
+     --port 8080 --ctx 131072
+   ```
+
 ## Build
 
 ```sh

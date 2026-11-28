@@ -17,7 +17,127 @@ import argparse, fcntl, hashlib, json, math, os, re, struct, sys, time
 try:
     import xxhash
 except ImportError:
-    sys.exit("pip install xxhash into this interpreter (see tools/README)")
+    xxhash = None
+
+_MASK64 = 0xFFFFFFFFFFFFFFFF
+_XXH_P1 = 0x9E3779B185EBCA87
+_XXH_P2 = 0xC2B2AE3D27D4EB4F
+_XXH_P3 = 0x165667B19E3779F9
+_XXH_P4 = 0x85EBCA77C2B2AE63
+_XXH_P5 = 0x27D4EB2F165667C5
+_WARNED_PURE_XXH64 = False
+
+
+def _rotl64(x, r):
+    return ((x << r) | (x >> (64 - r))) & _MASK64
+
+
+def _xxh64_round(acc, inp):
+    acc = (acc + inp * _XXH_P2) & _MASK64
+    return (_rotl64(acc, 31) * _XXH_P1) & _MASK64
+
+
+def _xxh64_merge_round(acc, val):
+    acc ^= _xxh64_round(0, val)
+    return (acc * _XXH_P1 + _XXH_P4) & _MASK64
+
+
+class _PureXXH64:
+    """Streaming pure-Python fallback for xxhash.xxh64 (seed=0)."""
+
+    def __init__(self, seed=0):
+        self.seed = seed & _MASK64
+        self.v1 = (self.seed + _XXH_P1 + _XXH_P2) & _MASK64
+        self.v2 = (self.seed + _XXH_P2) & _MASK64
+        self.v3 = self.seed
+        self.v4 = (self.seed - _XXH_P1) & _MASK64
+        self.total_len = 0
+        self.buf = bytearray()
+
+    def update(self, data):
+        if not data:
+            return
+        mv = memoryview(data).cast("B")
+        n = len(mv)
+        self.total_len += n
+        off = 0
+        if self.buf:
+            need = 32 - len(self.buf)
+            if n < need:
+                self.buf.extend(mv)
+                return
+            self.buf.extend(mv[:need])
+            k1, k2, k3, k4 = struct.unpack_from("<4Q", self.buf, 0)
+            self.v1 = _xxh64_round(self.v1, k1)
+            self.v2 = _xxh64_round(self.v2, k2)
+            self.v3 = _xxh64_round(self.v3, k3)
+            self.v4 = _xxh64_round(self.v4, k4)
+            self.buf.clear()
+            off = need
+        v1, v2, v3, v4 = self.v1, self.v2, self.v3, self.v4
+        p1, p2, m = _XXH_P1, _XXH_P2, _MASK64
+        while off + 32 <= n:
+            k1, k2, k3, k4 = struct.unpack_from("<4Q", mv, off)
+            t = (v1 + k1 * p2) & m
+            v1 = (((t << 31) | (t >> 33)) & m) * p1 & m
+            t = (v2 + k2 * p2) & m
+            v2 = (((t << 31) | (t >> 33)) & m) * p1 & m
+            t = (v3 + k3 * p2) & m
+            v3 = (((t << 31) | (t >> 33)) & m) * p1 & m
+            t = (v4 + k4 * p2) & m
+            v4 = (((t << 31) | (t >> 33)) & m) * p1 & m
+            off += 32
+        self.v1, self.v2, self.v3, self.v4 = v1, v2, v3, v4
+        if off < n:
+            self.buf.extend(mv[off:])
+
+    def intdigest(self):
+        if self.total_len >= 32:
+            h = (_rotl64(self.v1, 1) + _rotl64(self.v2, 7) +
+                 _rotl64(self.v3, 12) + _rotl64(self.v4, 18)) & _MASK64
+            h = _xxh64_merge_round(h, self.v1)
+            h = _xxh64_merge_round(h, self.v2)
+            h = _xxh64_merge_round(h, self.v3)
+            h = _xxh64_merge_round(h, self.v4)
+        else:
+            h = (self.seed + _XXH_P5) & _MASK64
+        h = (h + self.total_len) & _MASK64
+        buf = self.buf
+        n = len(buf)
+        p = 0
+        while p + 8 <= n:
+            h ^= _xxh64_round(0, struct.unpack_from("<Q", buf, p)[0])
+            h = (_rotl64(h, 27) * _XXH_P1 + _XXH_P4) & _MASK64
+            p += 8
+        if p + 4 <= n:
+            h ^= (struct.unpack_from("<I", buf, p)[0] * _XXH_P1) & _MASK64
+            h = (_rotl64(h, 23) * _XXH_P2 + _XXH_P3) & _MASK64
+            p += 4
+        while p < n:
+            h ^= (buf[p] * _XXH_P5) & _MASK64
+            h = (_rotl64(h, 11) * _XXH_P1) & _MASK64
+            p += 1
+        h ^= h >> 33
+        h = (h * _XXH_P2) & _MASK64
+        h ^= h >> 29
+        h = (h * _XXH_P3) & _MASK64
+        h ^= h >> 32
+        return h
+
+    def hexdigest(self):
+        return f"{self.intdigest():016x}"
+
+
+def _new_xxh64():
+    """Return xxhash.xxh64() if installed, else the pure-Python fallback."""
+    global _WARNED_PURE_XXH64
+    if xxhash is not None:
+        return xxhash.xxh64()
+    if not _WARNED_PURE_XXH64:
+        _WARNED_PURE_XXH64 = True
+        print("note: 'xxhash' is not installed; using built-in pure-Python xxh64 "
+              "(install 'xxhash' for faster packing of large models)", file=sys.stderr)
+    return _PureXXH64()
 
 MAGIC = b"M64P"
 FMT_VERSION = 1
@@ -306,14 +426,13 @@ class SfInput:
 
 
 # ---------------------------------------------------------------- dequant reference (golden)
-import numpy as np
-
 def dequant_blocks(dt, raw):
     """Bit-exact ggml dequant for f32/f16/bf16/q8_0/q8_1/q4_k/q5_0/q5_1 blocks.
 
     All arithmetic stays in float32 with one IEEE op per C++ expression
     (engine/src/dequant.hpp is compiled with -ffp-contract=off), so results
     are bitwise identical to the C++ reference for the same block bytes."""
+    import numpy as np
     name, bs, ts = DTYPES[dt]
     if name == "f32":
         return np.frombuffer(raw, dtype="<f4")
@@ -433,11 +552,15 @@ class Packer:
             pass
         out.write(b"\x00" * HEADER_RESERVE)
         out.seek(HEADER_RESERVE)
-        rng = np.random.default_rng(seed)
+        rng = None
+        golden = None
+        if golden_dir:
+            import numpy as np
+            rng = np.random.default_rng(seed)
+            golden = GoldenWriter(golden_dir)
         records, expert_index, layer_bases = [], [], {}
-        blob_hash = xxhash.xxh64()
+        blob_hash = _new_xxh64()
         pos = HEADER_RESERVE
-        golden = GoldenWriter(golden_dir) if golden_dir else None
         for t in tensors:
             n = t["name"]
             lay = self._expert_key(n)
@@ -471,7 +594,7 @@ class Packer:
                 out.write(b"\x00" * pad); blob_hash.update(b"\x00" * pad)
                 pos += pad
             nbytes = tensor_nbytes(t["dims"], t["dtype"])
-            h = xxhash.xxh64()
+            h = _new_xxh64()
             CHUNK = 1 << 24
             done = 0
             while done < nbytes:
@@ -569,7 +692,7 @@ def _write_experts(self, out, pair, blob_hash, pos, golden, rng, golden_blocks):
     layer_base = align_up(pos, GPU_ALIGN)
     if layer_base != pos:
         out.write(b"\x00" * (layer_base - pos)); blob_hash.update(b"\x00" * (layer_base - pos))
-    h = xxhash.xxh64()
+    h = _new_xxh64()
     CHUNK = 1 << 24
     parts = [
         (gu, 0, gate_bytes, DTYPES[gu["dtype"]][0] + ".gate"),
@@ -617,6 +740,7 @@ class GoldenWriter:
             blocks = len(deq)
             self._emit(name, dt, raw[: 1 << 20], deq)
         elif DTYPES[dt][0] in ("q8_0", "q8_1", "q4_k", "q5_0", "q5_1"):
+            import numpy as np
             ts = DTYPES[dt][2]
             nb = len(raw) // ts
             k = min(max_blocks, nb)
@@ -659,7 +783,7 @@ def verify(path):
     except ValueError as e:
         print("VERIFY FAIL:", e); return 1
     ok = bad = 0
-    blobh = xxhash.xxh64()
+    blobh = _new_xxh64()
     blob_end = header["blob_start"] + header["blob_bytes"]
     blob_done = 0
     f.seek(header["blob_start"])
@@ -678,7 +802,7 @@ def verify(path):
             al = 1 << header["alignment_log2"][r["region"]]
             if r["offset"] % al != 0:
                 print(f"VERIFY FAIL: {r['name']} offset {r['offset']} not {al}-aligned"); return 1
-        h = xxhash.xxh64()
+        h = _new_xxh64()
         f.seek(r["offset"])
         rem = r["length"]
         while rem:
